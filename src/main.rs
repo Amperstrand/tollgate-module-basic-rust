@@ -1,58 +1,77 @@
-//! tollgate-module-basic-rust — Phase 0 scaffolding.
-//!
-//! Forces full CDK dependency tree into the release build for binary-size
-//! measurement. Exercises: Amount arithmetic, Proof serde, Wallet type.
+//! tollgate-module-basic-rust — main entry point.
 
-use cdk::amount::Amount;
-use cdk::nuts::Proof;
-use cdk::wallet::Wallet;
+use std::sync::Arc;
+use tollgate_module_basic_rust::{cli, config, http, identity, tracing_setup};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-const RUSTC_VERSION: &str = match option_env!("RUSTC_VERSION") {
-    Some(v) => v,
-    None => "unknown",
-};
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    // Initialize tracing — must happen before anything else
+    tracing_setup::init();
 
+    tracing::info!("RunInitialProbe: tollgate-module-basic-rust v{VERSION} starting");
+
+    // Load config
+    let config_obj = config::load_config().unwrap_or(None).unwrap_or_default();
     tracing::info!(
-        version = VERSION,
-        rustc = RUSTC_VERSION,
-        target = std::env::consts::ARCH,
-        "tollgate-module-basic-rust phase-0 scaffolding (smoke test)"
+        metric = %config_obj.metric,
+        mints = config_obj.accepted_mints.len(),
+        "config loaded"
     );
 
-    // Force CDK amount arithmetic code into the binary.
-    let amt = Amount::from(1000_u64);
-    let doubled = amt + Amount::from(500_u64);
-    tracing::info!("CDK smoke: {doubled}");
+    // Load or generate merchant identity
+    let identity = identity::MerchantIdentity::load_or_generate()
+        .expect("failed to load/generate merchant identity");
+    tracing::info!(pubkey = %identity.pubkey_hex(), "merchant identity loaded");
 
-    // Force CDK serde/Proof code path. This drags in all the NUT types,
-    // serde derives, and the cdk_common protocol layer.
-    let proof_json = r#"{"amount":1,"id":"00","secret":"0000000000000000000000000000000000000000000000000000000000000000","C":"0000000000000000000000000000000000000000000000000000000000000000"}"#;
-    match serde_json::from_str::<Proof>(proof_json) {
-        Ok(proof) => {
-            let reser = serde_json::to_string(&proof).unwrap_or_default();
-            tracing::info!("CDK smoke: proof reser length = {}", reser.len());
+    // Build app state
+    let state = http::AppState {
+        config: Arc::new(config_obj),
+        identity: Arc::new(identity),
+    };
+
+    // Start HTTP server + CLI socket
+    let http_state = state.clone();
+    let http_handle = tokio::spawn(async move {
+        let app = http::create_router(http_state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:2121")
+            .await
+            .expect("failed to bind 127.0.0.1:2121");
+        tracing::info!("HTTP server listening on 127.0.0.1:2121");
+        axum::serve(listener, app).await.expect("HTTP server error");
+    });
+
+    let cli_handle = tokio::spawn(async move {
+        if let Err(e) = cli::serve().await {
+            tracing::error!(error = %e, "CLI socket server error");
         }
-        Err(e) => {
-            // Parse failure is fine — the serde code is compiled regardless.
-            tracing::warn!("proof parse failed (ok for smoke test): {e}");
+    });
+
+    // Wait for shutdown signal
+    let shutdown_int = tokio::signal::ctrl_c();
+
+    tokio::pin!(shutdown_int);
+
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("failed to install SIGTERM handler");
+
+    tokio::select! {
+        _ = shutdown_int => {
+            tracing::info!("SIGINT received, shutting down");
+        }
+        _ = sigterm.recv() => {
+            tracing::info!("SIGTERM received, shutting down");
         }
     }
 
-    // Keep types alive so LTO doesn't strip the dependency.
-    let _ = std::any::TypeId::of::<Wallet>();
-    let _ = std::any::TypeId::of::<axum::body::Body>();
+    // Cleanup
+    let socket_path = cli::socket_path();
+    if socket_path.exists() {
+        let _ = std::fs::remove_file(&socket_path);
+    }
 
-    println!("tollgate-module-basic-rust v{VERSION} — phase 0 smoke build");
-    println!("rustc: {RUSTC_VERSION}");
-    println!("target: {}", std::env::consts::ARCH);
+    http_handle.abort();
+    cli_handle.abort();
+    tracing::info!("shutdown complete");
 }
