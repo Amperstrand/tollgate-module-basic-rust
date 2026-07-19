@@ -1,0 +1,10 @@
+[target.x86_64-unknown-linux-musl]
+linker = "musl-gcc"
+
+# ARM musl targets: use zig cc wrappers (deferred — produces feature warnings
+# but functions correctly). Uncomment when ready for ARM cross-builds.
+# [target.aarch64-unknown-linux-musl]
+# linker = "zigcc-aarch64-musl"
+#
+# [target.armv7-unknown-linux-musleabihf]
+# linker = "zigcc-armv7-musl"

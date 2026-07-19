@@ -1,0 +1,13 @@
+/target
+*.db
+*.db-wal
+*.db-jal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.swp
+*.swo
+*~
+.DS_Store
+.idea/
+.vscode/

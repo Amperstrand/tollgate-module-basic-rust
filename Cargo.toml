@@ -1,0 +1,40 @@
+[package]
+name = "tollgate-module-basic-rust"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Rust clone of tollgate-module-basic-go — drop-in replacement using CDK instead of gonuts"
+license = "MIT"
+repository = "https://github.com/felixfelix-bot/tollgate-module-basic-rust"
+publish = false
+
+[dependencies]
+# Async runtime + HTTP server
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "net", "time", "io-util"] }
+axum = { version = "0.8", features = ["ws"] }
+
+# Cashu Development Kit (wallet side — we are a wallet talking to mints)
+cdk = { version = "0.17", default-features = false, features = ["wallet"] }
+cdk-sqlite = "0.17"
+
+# Serde / JSON
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# HTTP client (rustls — no OpenSSL for musl compat)
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+# Nostr identity signing
+secp256k1 = "0.29"
+
+[profile.release]
+# Aggressive size optimization — tollgate ships on resource-constrained OpenWrt routers
+panic = "abort"
+strip = true
+opt-level = "z"
+lto = true
+codegen-units = 1
