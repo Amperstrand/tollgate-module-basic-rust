@@ -4,7 +4,6 @@
 //! Mode 0660. Line-delimited JSON request/response.
 //!
 /// Commands: version, status, "wallet info", "wallet balance", "migrate <path>"
-
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -116,9 +115,7 @@ async fn handle_command(cmd: &str, state: &AppState) -> String {
                 let balances = wallet.get_balance_by_mint().await.unwrap_or_default();
                 let mints: Vec<serde_json::Value> = balances
                     .iter()
-                    .map(|(url, bal)| {
-                        serde_json::json!({"url": url, "balance": bal})
-                    })
+                    .map(|(url, bal)| serde_json::json!({"url": url, "balance": bal}))
                     .collect();
                 drop(wallet_guard);
                 serde_json::json!({
@@ -171,14 +168,22 @@ async fn handle_command(cmd: &str, state: &AppState) -> String {
         cmd if cmd.starts_with("migrate ") => {
             let tokens_path = cmd.strip_prefix("migrate ").unwrap().trim();
             match run_migration(tokens_path, state).await {
-                Ok(report) => serde_json::json!({
-                    "success": true,
-                    "message": report
-                }).to_string() + "\n",
-                Err(e) => serde_json::json!({
-                    "success": false,
-                    "error": format!("migration failed: {e}")
-                }).to_string() + "\n",
+                Ok(report) => {
+                    serde_json::json!({
+                        "success": true,
+                        "message": report
+                    })
+                    .to_string()
+                        + "\n"
+                }
+                Err(e) => {
+                    serde_json::json!({
+                        "success": false,
+                        "error": format!("migration failed: {e}")
+                    })
+                    .to_string()
+                        + "\n"
+                }
             }
         }
         _ => {
@@ -255,9 +260,11 @@ mod tests {
     fn make_test_state() -> Arc<AppState> {
         let config = Arc::new(Config::new_default());
         let identity = Arc::new(MerchantIdentity::load_or_generate().unwrap());
-        let wallet = Arc::new(tokio::sync::Mutex::new(Some(
-            TollWallet::new([0u8; 64], vec![], std::path::PathBuf::from("/tmp")),
-        )));
+        let wallet = Arc::new(tokio::sync::Mutex::new(Some(TollWallet::new(
+            [0u8; 64],
+            vec![],
+            std::path::PathBuf::from("/tmp"),
+        ))));
         let sessions = Arc::new(tokio::sync::Mutex::new(SessionManager::new()));
         Arc::new(AppState {
             config,
@@ -334,7 +341,8 @@ mod tests {
         let resp = handle_command(&format!("migrate {path_str}"), &state).await;
         let json: serde_json::Value = serde_json::from_str(resp.trim()).unwrap();
         assert_eq!(json["success"], true);
-        let report: serde_json::Value = serde_json::from_str(json["message"].as_str().unwrap()).unwrap();
+        let report: serde_json::Value =
+            serde_json::from_str(json["message"].as_str().unwrap()).unwrap();
         assert_eq!(report["total"], 0);
         assert_eq!(report["imported"], 0);
         assert_eq!(report["failed"], 0);
@@ -352,7 +360,8 @@ mod tests {
         let resp = handle_command(&format!("migrate {path_str}"), &state).await;
         let json: serde_json::Value = serde_json::from_str(resp.trim()).unwrap();
         assert_eq!(json["success"], true);
-        let report: serde_json::Value = serde_json::from_str(json["message"].as_str().unwrap()).unwrap();
+        let report: serde_json::Value =
+            serde_json::from_str(json["message"].as_str().unwrap()).unwrap();
         assert_eq!(report["total"], 2);
         assert_eq!(report["failed"], 2);
     }

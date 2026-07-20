@@ -1,10 +1,10 @@
 [target.x86_64-unknown-linux-musl]
 linker = "musl-gcc"
 
+# ARM musl targets: zig cc wrappers must be on PATH (or set via CC_* env).
+# CI sets CC_aarch64_unknown_linux_musl / CC_armv7_unknown_linux_musleabihf.
 [target.aarch64-unknown-linux-musl]
 linker = "zigcc-aarch64-musl"
-cc = "zigcc-aarch64-musl"
 
 [target.armv7-unknown-linux-musleabihf]
 linker = "zigcc-armv7-musl"
-cc = "zigcc-armv7-musl"

@@ -79,9 +79,10 @@ impl TollWallet {
 
     fn is_mint_accepted(&self, mint_url: &str) -> bool {
         self.accepted_mints.is_empty()
-            || self.accepted_mints.iter().any(|m| {
-                m.trim_end_matches('/') == mint_url.trim_end_matches('/')
-            })
+            || self
+                .accepted_mints
+                .iter()
+                .any(|m| m.trim_end_matches('/') == mint_url.trim_end_matches('/'))
     }
 
     /// Register a mint and open a CDK wallet for it.
@@ -120,7 +121,8 @@ impl TollWallet {
                 compensated = recovery.compensated,
                 skipped = recovery.skipped,
                 failed = recovery.failed,
-                "recovered incomplete sagas for {}", normalized
+                "recovered incomplete sagas for {}",
+                normalized
             );
         }
 
@@ -193,8 +195,10 @@ impl TollWallet {
             .ok_or_else(|| WalletError::WalletNotFound(normalized.to_string()))?
             .clone();
 
-        let mut opts = SendOptions::default();
-        opts.include_fee = include_fee;
+        let opts = SendOptions {
+            include_fee,
+            ..Default::default()
+        };
 
         let result = timeout(OP_TIMEOUT, async {
             let w = wallet.lock().await;
@@ -248,8 +252,13 @@ impl TollWallet {
 
         let result = timeout(OP_TIMEOUT, async {
             let w = wallet.lock().await;
-            w.mint_quote(PaymentMethod::BOLT11, Some(Amount::from(amount_sat)), None, None)
-                .await
+            w.mint_quote(
+                PaymentMethod::BOLT11,
+                Some(Amount::from(amount_sat)),
+                None,
+                None,
+            )
+            .await
         })
         .await;
 
@@ -293,11 +302,7 @@ impl TollWallet {
 
     /// Mint tokens from a paid quote (NUT-04, maps gonuts `MintTokens`).
     /// CDK API: `wallet.mint(quote_id, SplitTarget, Option<SpendingConditions>)`.
-    pub async fn mint_tokens(
-        &self,
-        mint_url: &str,
-        quote_id: &str,
-    ) -> Result<u64, WalletError> {
+    pub async fn mint_tokens(&self, mint_url: &str, quote_id: &str) -> Result<u64, WalletError> {
         let normalized = mint_url.trim_end_matches('/');
         let wallet = self
             .wallets
@@ -322,11 +327,7 @@ impl TollWallet {
 
     /// Request a melt quote + prepare melt (NUT-05, maps gonuts `RequestMeltQuote` + `Melt`).
     /// CDK flow: `melt_quote(BOLT11, invoice)` → `prepare_melt(quote_id, meta)` → `confirm()`.
-    pub async fn melt(
-        &self,
-        mint_url: &str,
-        invoice: &str,
-    ) -> Result<MeltQuoteInfo, WalletError> {
+    pub async fn melt(&self, mint_url: &str, invoice: &str) -> Result<MeltQuoteInfo, WalletError> {
         let normalized = mint_url.trim_end_matches('/');
         let wallet = self
             .wallets
@@ -428,7 +429,10 @@ mod tests {
         let dir = tmp.path();
 
         let mut wallet = make_test_wallet(dir, vec![]);
-        wallet.ensure_mint("https://test-mint.example").await.unwrap();
+        wallet
+            .ensure_mint("https://test-mint.example")
+            .await
+            .unwrap();
         assert!(wallet.wallets.contains_key("https://test-mint.example"));
 
         wallet.shutdown().await;
@@ -560,11 +564,7 @@ mod tests {
             .unwrap();
 
         let token = "cashuBo2FteBtodHRwczovL25vbmV4aXN0ZW50LmxvY2FsaG9zdC5pbnZhbGlkYXVjc2F0YQ==";
-        let result = tokio::time::timeout(
-            Duration::from_secs(35),
-            wallet.receive(token),
-        )
-        .await;
+        let result = tokio::time::timeout(Duration::from_secs(35), wallet.receive(token)).await;
 
         assert!(result.is_ok(), "receive should not hang forever");
     }

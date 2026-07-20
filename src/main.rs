@@ -85,7 +85,11 @@ async fn main() {
         .expect("failed to load/create wallet seed");
 
     // Build wallet with accepted mints from config
-    let mint_urls: Vec<String> = config_obj.accepted_mints.iter().map(|m| m.url.clone()).collect();
+    let mint_urls: Vec<String> = config_obj
+        .accepted_mints
+        .iter()
+        .map(|m| m.url.clone())
+        .collect();
     let mut toll_wallet = wallet::TollWallet::new(seed, mint_urls, db_dir.clone());
     for mint in &config_obj.accepted_mints {
         match toll_wallet.ensure_mint(&mint.url).await {

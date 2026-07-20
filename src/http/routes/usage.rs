@@ -9,10 +9,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 
-pub async fn handle_usage(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
+pub async fn handle_usage(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     // Try to get client MAC from X-Forwarded-For or other headers.
     // In production, nodogsplash provides the client IP, which we'd resolve
     // to MAC via ARP. For now, we use the IP as a session key proxy.
@@ -39,7 +36,7 @@ pub async fn handle_usage(
             let used = session.used;
             let total = session.allotment;
             drop(sessions);
-            usage_response(&format!("{used}/{total}"))
+            usage_response(format!("{used}/{total}"))
         }
         Some(_) => {
             // Session exists but expired or exhausted
@@ -53,7 +50,9 @@ pub async fn handle_usage(
     }
 }
 
-fn usage_response(body: impl Into<String>) -> (StatusCode, [(&'static str, &'static str); 2], String) {
+fn usage_response(
+    body: impl Into<String>,
+) -> (StatusCode, [(&'static str, &'static str); 2], String) {
     (
         StatusCode::OK,
         [
@@ -66,7 +65,6 @@ fn usage_response(body: impl Into<String>) -> (StatusCode, [(&'static str, &'sta
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::session::SessionManager;
     use std::sync::Arc;
 

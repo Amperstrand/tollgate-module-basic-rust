@@ -20,10 +20,8 @@ fn extract_token_from_nostr_event(body: &str) -> Option<String> {
     let tags = v.get("tags")?.as_array()?;
     for tag in tags {
         if let Some(arr) = tag.as_array() {
-            if arr.len() >= 2 {
-                if arr.first().and_then(|s| s.as_str()) == Some("payment") {
-                    return arr.get(1).and_then(|s| s.as_str()).map(|s| s.to_string());
-                }
+            if arr.len() >= 2 && arr.first().and_then(|s| s.as_str()) == Some("payment") {
+                return arr.get(1).and_then(|s| s.as_str()).map(|s| s.to_string());
             }
         }
     }

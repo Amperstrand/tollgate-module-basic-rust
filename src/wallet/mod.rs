@@ -34,6 +34,7 @@
 //! | `wallet.Melt`           | `prepared_melt.confirm()`                         |
 
 pub mod verify;
+#[allow(clippy::module_inception)]
 pub mod wallet;
 
 pub use wallet::TollWallet;

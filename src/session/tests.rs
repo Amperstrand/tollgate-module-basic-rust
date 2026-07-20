@@ -19,7 +19,9 @@ fn create_session_stores_and_returns_clone() {
     assert_eq!(s.metric, "bytes");
     assert_eq!(s.expiry, s.granted_at + 3600);
     // Stored in map
-    let got = mgr.get_session("aa:bb:cc:dd:ee:ff").expect("session exists");
+    let got = mgr
+        .get_session("aa:bb:cc:dd:ee:ff")
+        .expect("session exists");
     assert_eq!(got.allotment, 1_000_000);
 }
 
