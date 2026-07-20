@@ -1,7 +1,7 @@
 # tollgate-module-basic-rust
 
-> **Status: WIP — Phase 0 (scaffolding + binary-size smoke test).**
-> Not functional yet. The Go original at
+> **Status: WIP — Phase 4 (session management + metering + payment wiring).**
+> Not production-ready yet. The Go original at
 > [`tollgate-module-basic-go`](https://github.com/OpenTollGate/tollgate-module-basic-go)
 > remains the production binary until this repo reaches feature parity.
 
