@@ -11,6 +11,7 @@ use tower_http::cors::{Any, CorsLayer};
 pub struct AppState {
     pub config: Arc<crate::config::Config>,
     pub identity: Arc<crate::identity::MerchantIdentity>,
+    pub wallet: Arc<tokio::sync::Mutex<Option<crate::wallet::wallet::TollWallet>>>,
 }
 
 /// Build the main HTTP router with all routes.

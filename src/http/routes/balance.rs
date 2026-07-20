@@ -19,12 +19,39 @@ struct MintBalance {
     balance: u64,
 }
 
-pub async fn handle_balance(State(_state): State<AppState>) -> impl IntoResponse {
-    // Phase 1 stub: zero balance. Phase 3 wires to CDK.
-    let resp = BalanceResponse {
-        balance: 0,
-        mint_balances: vec![],
+pub async fn handle_balance(State(state): State<AppState>) -> impl IntoResponse {
+    let wallet_guard = state.wallet.lock().await;
+    let resp = if let Some(ref wallet) = *wallet_guard {
+        match wallet.get_balance().await {
+            Ok(balance) => {
+                let mint_balances = wallet
+                    .get_balance_by_mint()
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(url, bal)| MintBalance { url, balance: bal })
+                    .collect();
+                BalanceResponse {
+                    balance,
+                    mint_balances,
+                }
+            }
+            Err(e) => {
+                tracing::error!("balance query failed: {e}");
+                BalanceResponse {
+                    balance: 0,
+                    mint_balances: vec![],
+                }
+            }
+        }
+    } else {
+        // Wallet not initialized
+        BalanceResponse {
+            balance: 0,
+            mint_balances: vec![],
+        }
     };
+
     let json = serde_json::to_string(&resp).unwrap_or_default();
     (
         StatusCode::OK,

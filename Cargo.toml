@@ -17,7 +17,7 @@ name = "tollgate-module-basic-rust"
 path = "src/main.rs"
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "net", "time", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "net", "time", "io-util", "fs"] }
 axum = { version = "0.8", features = ["ws"] }
 
 # HTTP middleware (CORS, timeouts, tracing) — versions compatible with axum 0.8 / hyper 1.x
@@ -50,6 +50,9 @@ rand = "0.8"
 # Hex / hashing for Nostr event IDs
 hex = "0.4"
 sha2 = "0.10"
+
+# Error derive macro
+thiserror = "1"
 
 [dev-dependencies]
 tempfile = "3"

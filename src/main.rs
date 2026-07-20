@@ -1,7 +1,8 @@
 //! tollgate-module-basic-rust — main entry point.
 
+use std::path::PathBuf;
 use std::sync::Arc;
-use tollgate_module_basic_rust::{cli, config, http, identity, tracing_setup};
+use tollgate_module_basic_rust::{cli, config, http, identity, tracing_setup, wallet};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -25,10 +26,31 @@ async fn main() {
         .expect("failed to load/generate merchant identity");
     tracing::info!(pubkey = %identity.pubkey_hex(), "merchant identity loaded");
 
+    // Load or generate wallet seed
+    let db_dir = PathBuf::from("/etc/tollgate");
+    let seed_path = db_dir.join("wallet_seed.bin");
+    if let Some(parent) = seed_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let seed = wallet::TollWallet::load_or_create_seed(&seed_path)
+        .await
+        .expect("failed to load/create wallet seed");
+
+    // Build wallet with accepted mints from config
+    let mint_urls: Vec<String> = config_obj.accepted_mints.iter().map(|m| m.url.clone()).collect();
+    let mut toll_wallet = wallet::TollWallet::new(seed, mint_urls, db_dir.clone());
+    for mint in &config_obj.accepted_mints {
+        match toll_wallet.ensure_mint(&mint.url).await {
+            Ok(()) => tracing::info!(mint = %mint.url, "wallet registered for mint"),
+            Err(e) => tracing::warn!(mint = %mint.url, error = %e, "failed to register mint"),
+        }
+    }
+
     // Build app state
     let state = http::AppState {
         config: Arc::new(config_obj),
         identity: Arc::new(identity),
+        wallet: Arc::new(tokio::sync::Mutex::new(Some(toll_wallet))),
     };
 
     // Start HTTP server + CLI socket
