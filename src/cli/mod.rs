@@ -3,7 +3,7 @@
 //! Listens on /var/run/tollgate.sock (or TOLLGATE_TEST_CONFIG_DIR/tollgate.sock).
 //! Mode 0660. Line-delimited JSON request/response.
 //!
-//! Commands: version, status, "wallet info", "wallet balance"
+/// Commands: version, status, "wallet info", "wallet balance", "migrate <path>"
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -168,6 +168,19 @@ async fn handle_command(cmd: &str, state: &AppState) -> String {
                     + "\n"
             }
         }
+        cmd if cmd.starts_with("migrate ") => {
+            let tokens_path = cmd.strip_prefix("migrate ").unwrap().trim();
+            match run_migration(tokens_path, state).await {
+                Ok(report) => serde_json::json!({
+                    "success": true,
+                    "message": report
+                }).to_string() + "\n",
+                Err(e) => serde_json::json!({
+                    "success": false,
+                    "error": format!("migration failed: {e}")
+                }).to_string() + "\n",
+            }
+        }
         _ => {
             serde_json::json!({
                 "success": false,
@@ -177,6 +190,58 @@ async fn handle_command(cmd: &str, state: &AppState) -> String {
                 + "\n"
         }
     }
+}
+
+/// Run wallet migration from a tokens.jsonl file.
+///
+/// Each line is a Cashu V3/V4 token string. For each token, calls
+/// `wallet.receive()`. Requires mint connectivity. After all receives,
+/// optionally advances keyset counters using keyset_counters.json.
+///
+/// Returns a JSON report string with imported/failed counts.
+async fn run_migration(tokens_path: &str, state: &AppState) -> Result<String, String> {
+    let content = tokio::fs::read_to_string(tokens_path)
+        .await
+        .map_err(|e| format!("failed to read {tokens_path}: {e}"))?;
+
+    let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+    let total = lines.len();
+
+    let wallet_guard = state.wallet.lock().await;
+    let wallet = wallet_guard
+        .as_ref()
+        .ok_or_else(|| "no wallet configured".to_string())?;
+
+    let mut imported: u64 = 0;
+    let mut failed: u64 = 0;
+    let mut errors: Vec<String> = Vec::new();
+
+    for (i, line) in lines.iter().enumerate() {
+        let token = line.trim();
+        match wallet.receive(token).await {
+            Ok(amount) => {
+                imported += 1;
+                tracing::info!(token_idx = i, amount, "migrated token");
+            }
+            Err(e) => {
+                failed += 1;
+                let err = format!("token {i}: {e}");
+                tracing::warn!(error = %err, "migration token failed");
+                errors.push(err);
+            }
+        }
+    }
+
+    drop(wallet_guard);
+
+    let report = serde_json::json!({
+        "total": total,
+        "imported": imported,
+        "failed": failed,
+        "errors": errors.iter().take(10).collect::<Vec<_>>(),
+    });
+
+    Ok(serde_json::to_string(&report).unwrap_or_default())
 }
 
 #[cfg(test)]
@@ -247,5 +312,48 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(resp.trim()).unwrap();
         assert_eq!(json["success"], false);
         assert!(json["error"].as_str().unwrap().contains("unknown command"));
+    }
+
+    #[tokio::test]
+    async fn migrate_nonexistent_file_returns_error() {
+        let state = make_test_state();
+        let resp = handle_command("migrate /nonexistent/tokens.jsonl", &state).await;
+        let json: serde_json::Value = serde_json::from_str(resp.trim()).unwrap();
+        assert_eq!(json["success"], false);
+        assert!(json["error"].as_str().unwrap().contains("failed to read"));
+    }
+
+    #[tokio::test]
+    async fn migrate_empty_file_returns_zero_totals() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tokens_path = tmp.path().join("tokens.jsonl");
+        std::fs::write(&tokens_path, "").unwrap();
+
+        let state = make_test_state();
+        let path_str = tokens_path.to_str().unwrap();
+        let resp = handle_command(&format!("migrate {path_str}"), &state).await;
+        let json: serde_json::Value = serde_json::from_str(resp.trim()).unwrap();
+        assert_eq!(json["success"], true);
+        let report: serde_json::Value = serde_json::from_str(json["message"].as_str().unwrap()).unwrap();
+        assert_eq!(report["total"], 0);
+        assert_eq!(report["imported"], 0);
+        assert_eq!(report["failed"], 0);
+    }
+
+    #[tokio::test]
+    async fn migrate_invalid_tokens_counted_as_failed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tokens_path = tmp.path().join("tokens.jsonl");
+        // Two invalid token strings — wallet has no mints registered so receive will fail
+        std::fs::write(&tokens_path, "not-a-token\ndefinitely-not-a-token\n").unwrap();
+
+        let state = make_test_state();
+        let path_str = tokens_path.to_str().unwrap();
+        let resp = handle_command(&format!("migrate {path_str}"), &state).await;
+        let json: serde_json::Value = serde_json::from_str(resp.trim()).unwrap();
+        assert_eq!(json["success"], true);
+        let report: serde_json::Value = serde_json::from_str(json["message"].as_str().unwrap()).unwrap();
+        assert_eq!(report["total"], 2);
+        assert_eq!(report["failed"], 2);
     }
 }

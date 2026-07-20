@@ -1,0 +1,99 @@
+name: Cross-compile + Package
+
+on:
+  push:
+    branches: [main, "phase-*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: fmt + clippy + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: fmt check
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: test
+        run: cargo test --verbose
+
+  cross-build:
+    name: cross ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+          - armv7-unknown-linux-musleabihf
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # Zig provides a universal cross-linker for all musl targets.
+      - name: Install Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.14.0
+
+      - name: Create zig cc wrappers
+        run: |
+          mkdir -p ~/.local/bin
+          cat > ~/.local/bin/zigcc-aarch64-musl << 'EOF'
+          #!/bin/bash
+          exec zig cc -target aarch64-linux-musl "$@"
+          EOF
+          cat > ~/.local/bin/zigcc-armv7-musl << 'EOF'
+          #!/bin/bash
+          exec zig cc -target arm-linux-musleabihf "$@"
+          EOF
+          chmod +x ~/.local/bin/zigcc-*
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      # x86_64-musl uses musl-gcc (from musl-tools).
+      - name: Install musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        env:
+          CC_aarch64_unknown_linux_musl: zigcc-aarch64-musl
+          CC_armv7_unknown_linux_musleabihf: zigcc-armv7-musl
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Binary size
+        run: |
+          BIN=target/${{ matrix.target }}/release/tollgate-module-basic-rust
+          ls -lh "$BIN"
+          strip "$BIN" 2>/dev/null || true
+          ls -lh "$BIN"
+          echo "SIZE_BYTES=$(stat -c %s "$BIN")" >> $GITHUB_ENV
+
+      - name: Stage binary for packaging
+        run: |
+          mkdir -p openwrt
+          cp target/${{ matrix.target }}/release/tollgate-module-basic-rust \
+             openwrt/tollgate-module-basic-rust-${{ matrix.target }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tollgate-${{ matrix.target }}
+          path: openwrt/tollgate-module-basic-rust-${{ matrix.target }}
+          if-no-files-found: error
