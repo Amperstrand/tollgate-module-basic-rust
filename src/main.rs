@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use tollgate_module_basic_rust::{cli, config, http, identity, tracing_setup, wallet};
+use tollgate_module_basic_rust::{cli, config, http, identity, session, tracing_setup, wallet};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -51,6 +51,7 @@ async fn main() {
         config: Arc::new(config_obj),
         identity: Arc::new(identity),
         wallet: Arc::new(tokio::sync::Mutex::new(Some(toll_wallet))),
+        sessions: Arc::new(tokio::sync::Mutex::new(session::SessionManager::new())),
     };
 
     // Start HTTP server + CLI socket
