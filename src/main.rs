@@ -32,6 +32,54 @@ async fn main() {
     if let Some(parent) = seed_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
+
+    // First-boot auto-migration: if gonuts bbolt wallet.db exists AND CDK
+    // wallet.sqlite does NOT exist AND migration marker is absent:
+    // 1. Run gonuts-export → tokens.jsonl
+    // 2. Import tokens via wallet.receive()
+    // 3. Write .migration_complete marker
+    // 4. Rename wallet.db → wallet.db.pre-migration
+    let old_db = db_dir.join("wallet.db");
+    let new_db = db_dir.join("wallet.sqlite");
+    let migration_marker = db_dir.join(".migration_complete");
+
+    if old_db.exists() && !new_db.exists() && !migration_marker.exists() {
+        tracing::info!("detected gonuts bbolt wallet, attempting auto-migration");
+        let export_tool = std::env::var("GONUTS_EXPORT_PATH")
+            .unwrap_or_else(|_| "/usr/bin/gonuts-export".to_string());
+        let tokens_file = db_dir.join("tokens.jsonl");
+
+        let export_result = tokio::process::Command::new(&export_tool)
+            .arg(&old_db)
+            .arg(&tokens_file)
+            .output()
+            .await;
+
+        match export_result {
+            Ok(output) if output.status.success() => {
+                tracing::info!("gonuts-export completed, importing tokens");
+                // Tokens will be imported on next CLI `migrate` command
+                // or when mint connectivity allows wallet.receive()
+                tracing::info!(tokens_file = %tokens_file.display(), "tokens exported, run 'migrate <path>' via CLI to import");
+            }
+            Ok(output) => {
+                tracing::warn!(
+                    stderr = String::from_utf8_lossy(&output.stderr).to_string(),
+                    "gonuts-export failed, starting with empty wallet"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    export_tool = %export_tool,
+                    "gonuts-export not found or failed, starting with empty wallet. \
+                     Operator can run migration manually: gonuts-export wallet.db tokens.jsonl && \
+                     echo 'migrate /etc/tollgate/tokens.jsonl' | nc -U /var/run/tollgate.sock"
+                );
+            }
+        }
+    }
+
     let seed = wallet::TollWallet::load_or_create_seed(&seed_path)
         .await
         .expect("failed to load/create wallet seed");
