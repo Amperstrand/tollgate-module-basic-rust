@@ -47,17 +47,17 @@ async fn main() {
     }
 
     // Build app state
-    let state = http::AppState {
+    let state = Arc::new(http::AppState {
         config: Arc::new(config_obj),
         identity: Arc::new(identity),
         wallet: Arc::new(tokio::sync::Mutex::new(Some(toll_wallet))),
         sessions: Arc::new(tokio::sync::Mutex::new(session::SessionManager::new())),
-    };
+    });
 
     // Start HTTP server + CLI socket
     let http_state = state.clone();
     let http_handle = tokio::spawn(async move {
-        let app = http::create_router(http_state);
+        let app = http::create_router((*http_state).clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:2121")
             .await
             .expect("failed to bind 127.0.0.1:2121");
@@ -65,8 +65,9 @@ async fn main() {
         axum::serve(listener, app).await.expect("HTTP server error");
     });
 
+    let cli_state = state.clone();
     let cli_handle = tokio::spawn(async move {
-        if let Err(e) = cli::serve().await {
+        if let Err(e) = cli::serve(cli_state).await {
             tracing::error!(error = %e, "CLI socket server error");
         }
     });
