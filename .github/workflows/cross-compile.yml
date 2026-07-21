@@ -77,11 +77,6 @@ jobs:
       - name: Cross build (Docker)
         if: matrix.use-cross == true
         run: cross build --release --target ${{ matrix.target }}
-        env:
-          CROSS_CMD: build
-          # Override .cargo/config.toml linker — cross provides its own
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: ""
-          CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_LINKER: ""
 
       - name: Binary size
         run: |
