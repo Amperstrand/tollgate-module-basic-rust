@@ -255,10 +255,10 @@ The HTTP server listens on `127.0.0.1:2121`. All routes set
 | Method | Path | Status | Description |
 |--------|------|--------|-------------|
 | `GET` | `/` | ✅ Implemented | **Discovery** — Returns Nostr kind 10021 event with metric, step_size, price, mint URL, and purchase minimums. |
-| `POST` | `/` | ✅ Implemented | **Payment** — Accepts `text/plain` (Cashu token) or `application/json` (Nostr kind 21000). Verifies token via NUT-07, receives into wallet, creates session, returns kind 1022 on success or kind 21023 + HTTP 402 on failure. |
-| `GET` | `/whoami` | ⚠️ Partial | Returns `mac=<MAC>` as plain text. **Currently returns placeholder MAC `00:00:00:00:00:00`** — not yet wired to ARP/remote_addr lookup. |
+| `POST` | `/` | ✅ Implemented | **Payment** — Accepts `text/plain` (Cashu token) or `application/json` (Nostr kind 21000). Verifies token via NUT-07, receives into wallet, creates session, returns kind 1022 on success or kind 21023 + HTTP 400 on failure. |
+| `GET` | `/whoami` | ✅ Implemented | Returns mac=<MAC> as plain text. Resolves MAC from /tmp/dhcp.leases then /proc/net/arp. Returns HTTP 500 on lookup failure. |
 | `GET` | `/usage` | ✅ Implemented | Returns `used/total` plain text for the requesting client's session. Returns `-1/-1` if no active session. Client identified via `X-Forwarded-For` or `X-Real-IP`. |
-| `GET` | `/balance` | ✅ Implemented | Returns JSON `{"balance": <total>, "mintBalances": [{"url": "...", "balance": N}]}`. |
+| `GET` | `/balance` | ✅ Implemented | Returns JSON with Go-compatible session-state schema: {"status": <int>, "session_active": <bool>, "usage": <int>, "allotment": <int>, "remaining": <int>} (with optional metric/start_time/error fields omitted via Go's omitempty semantics). |
 | `POST` | `/ln-invoice` | ⚠️ **Stub** | Returns hardcoded `stub-quote-*` / `stub-invoice` / `stub-pubkey`. **Not wired to CDK mint quotes.** |
 | `GET` | `/ln-invoice?quote=<id>` | ⚠️ **Stub** | Returns `state: "unpaid"`, `checkState: "UNPAID"`, `expiry: 0`. **Not wired to CDK quote status.** |
 
@@ -269,7 +269,7 @@ The HTTP server listens on `127.0.0.1:2121`. All routes set
 | 10021 | Merchant → Client | Discovery event (GET `/`) with pricing and metric tags. |
 | 1022 | Merchant → Client | Session granted (POST `/` success) with allotment tags. |
 | 21000 | Client → Merchant | Payment event (POST `/` body) wrapping a Cashu token. |
-| 21023 | Merchant → Client | Payment rejected (POST `/` failure, HTTP 402) with error content. |
+| 21023 | Merchant → Client | Payment rejected (POST `/` failure, HTTP 400) with error content. |
 
 > **Note:** The kind 1022 response in the payment handler currently uses
 > placeholder `id` and empty `sig` fields. Full Nostr signing of session
