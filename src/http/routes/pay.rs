@@ -5,10 +5,12 @@
 //! kind 1022 on success or kind 21023 + HTTP 400 on failure.
 
 use crate::http::AppState;
+use crate::mac_resolver::{get_client_ip, get_mac_address};
 use crate::wallet::verify::TokenVerifier;
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
+use std::net::SocketAddr;
 
 /// Extract a Cashu token from a Nostr kind 21000 event JSON body.
 /// Looks for a tag ["payment", "<token>"].
@@ -31,6 +33,7 @@ fn extract_token_from_nostr_event(body: &str) -> Option<String> {
 pub async fn handle_pay(
     State(state): State<AppState>,
     headers: HeaderMap,
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
     body: String,
 ) -> impl IntoResponse {
     let content_type = headers
@@ -71,6 +74,26 @@ pub async fn handle_pay(
             ],
             "unsupported content-type".to_string(),
         );
+    };
+
+    let client_ip = get_client_ip(&headers, Some(remote_addr));
+    let mac = match get_mac_address(&client_ip) {
+        Some(m) => m,
+        None => {
+            let resp = serde_json::json!({
+                "kind": 21023,
+                "content": "payment rejected: mac-address-lookup-failed",
+            });
+            let json = serde_json::to_string(&resp).unwrap_or_default();
+            return (
+                StatusCode::BAD_REQUEST,
+                [
+                    ("content-type", "application/json"),
+                    ("access-control-allow-origin", "*"),
+                ],
+                json,
+            );
+        }
     };
 
     // Step 1: verify token via NUT-07 checkstate
@@ -153,7 +176,7 @@ pub async fn handle_pay(
 
     let mut sessions = state.sessions.lock().await;
     let _session = sessions.create_session(
-        "00:00:00:00:00:00",
+        &mac,
         allotment,
         &state.config.metric,
         duration_secs,

@@ -1,7 +1,7 @@
 # tollgate-module-basic-rust
 
 > **Status: WIP — Phase 7 (test parity on physical hardware) in progress.**
-> Phases 0–6 are complete (58 unit tests passing). The Go original remains
+> Phases 0–6 are complete (78 unit tests passing). The Go original remains
 > the production binary until this Rust clone passes full test-parity on
 > real OpenWrt hardware.
 
@@ -74,7 +74,7 @@ A single Rust binary that is a **drop-in replacement** for
 | 6 | Wallet migration (gonuts-export → CDK receive) | ✅ Complete |
 | 7 | **Test parity on physical hardware** | **🔄 In progress** |
 
-**58 unit tests pass** (`cargo test`). What remains is validation on real
+**78 unit tests pass** (`cargo test`). What remains is validation on real
 OpenWrt routers — verifying end-to-end payment flows, ndsctl integration,
 and migration of production wallets under live network conditions.
 
@@ -302,7 +302,7 @@ echo "migrate /etc/tollgate/tokens.jsonl" | socat - UNIX-CONNECT:/var/run/tollga
 ## Testing
 
 ```bash
-# Run all 58 unit tests
+# Run all 78 unit tests
 cargo test
 
 # Run with output visible
@@ -326,7 +326,7 @@ cargo test cli
 | `metering` | 6 | ndsctl output parsing (download+upload sum, missing fields, empty, garbage, non-numeric, whitespace). |
 | `wallet::wallet` | 8 | Open/close cycle, mint acceptance, seed roundtrip, balance, per-mint balance, db path sanitization, receive errors, concurrency, timeout protection. |
 | `wallet::verify` | 6 | Token parsing, Y-value extraction, mint filtering, invalid tokens, milli-unit scaling. |
-| `http::routes::pay` | 6 | Nostr event token extraction (valid/wrong kind/missing tag/invalid JSON/multiple tags), session creation, 402 status. |
+| `http::routes::pay` | 7 | Nostr event token extraction (valid/wrong kind/missing tag/invalid JSON/multiple tags), session creation, MAC resolution, 400 status. |
 | `http::routes::usage` | 3 | No session, active session, expired session. |
 
 ### What is NOT tested
