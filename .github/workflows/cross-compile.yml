@@ -33,50 +33,55 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - x86_64-unknown-linux-musl
-          - aarch64-unknown-linux-musl
-          - armv7-unknown-linux-musleabihf
+        include:
+          - target: x86_64-unknown-linux-musl
+            use-cross: false
+          - target: aarch64-unknown-linux-musl
+            use-cross: true
+          - target: armv7-unknown-linux-musleabihf
+            use-cross: true
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
 
-      # Zig provides a universal cross-linker for all musl targets.
-      - name: Install Zig
-        uses: goto-bus-stop/setup-zig@v2
-        with:
-          version: 0.14.0
-
-      - name: Create zig cc wrappers
-        run: |
-          mkdir -p ~/.local/bin
-          cat > ~/.local/bin/zigcc-aarch64-musl << 'EOF'
-          #!/bin/bash
-          exec zig cc -target aarch64-linux-musl "$@"
-          EOF
-          cat > ~/.local/bin/zigcc-armv7-musl << 'EOF'
-          #!/bin/bash
-          exec zig cc -target arm-linux-musleabihf "$@"
-          EOF
-          chmod +x ~/.local/bin/zigcc-*
-          echo "$HOME/.local/bin" >> $GITHUB_PATH
-
-      # x86_64-musl uses musl-gcc (from musl-tools).
+      # --- x86_64: native musl-gcc (fast, no Docker needed) ---
       - name: Install musl tools
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: matrix.use-cross == false
+        with:
+          targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
 
-      - name: Build
-        env:
-          CC_aarch64_unknown_linux_musl: zigcc-aarch64-musl
-          CC_armv7_unknown_linux_musleabihf: zigcc-armv7-musl
+      - name: Build (musl-gcc)
+        if: matrix.use-cross == false
         run: cargo build --release --target ${{ matrix.target }}
+
+      # --- ARM: use cross (Docker-based, proper musl cross-toolchains) ---
+      # ring (used by rustls) compiles pregenerated assembly that zig cc
+      # and naive GCC cross-compilers can't handle. cross uses Docker images
+      # with full musl cross-toolchains that work correctly.
+      - uses: dtolnay/rust-toolchain@stable
+        if: matrix.use-cross == true
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.use-cross == true
+        run: cargo install cross
+
+      - name: Cross build (Docker)
+        if: matrix.use-cross == true
+        run: cross build --release --target ${{ matrix.target }}
+        env:
+          CROSS_CMD: build
+          # Override .cargo/config.toml linker — cross provides its own
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: ""
+          CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_LINKER: ""
 
       - name: Binary size
         run: |
