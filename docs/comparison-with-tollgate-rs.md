@@ -604,8 +604,7 @@ The immediate roadmap is completing Phase 7: test parity on physical OpenWrt har
 3. Validating ndsctl integration (poll_usage subprocess calls).
 4. Migrating production wallets under live network conditions.
 5. Completing the kind 1022 Nostr event signing (currently uses placeholder id and sig).
-6. Wiring `/whoami` to actual ARP/remote_addr lookup.
-7. Deciding whether to implement `/ln-invoice` endpoints or leave them as stubs.
+6. Deciding whether to implement `/ln-invoice` endpoints or leave them as stubs.
 
 Beyond Phase 7, the project could consider: adding Spilman channels (a major undertaking that would break v1 compatibility), supporting per-peer pricing, or adding dynamic pricing. However, any of these would move it away from being a drop-in replacement. The right approach for those features is tollgate-rs.
 
