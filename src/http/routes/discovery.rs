@@ -10,11 +10,6 @@ pub async fn handle_discovery(State(state): State<AppState>) -> impl IntoRespons
     let config = &state.config;
     let identity = &state.identity;
 
-    let metric = if config.metric == "bytes" {
-        "data"
-    } else {
-        "time"
-    };
     let first_mint = config.accepted_mints.first();
     let price = first_mint
         .map(|m| m.price_per_step.to_string())
@@ -25,19 +20,21 @@ pub async fn handle_discovery(State(state): State<AppState>) -> impl IntoRespons
         .map(|m| m.min_purchase_steps.to_string())
         .unwrap_or_default();
 
+    // Tag layout MUST match the Go binary's CreateAdvertisement
+    // (merchant.go:CreateAdvertisement). See PARITY test
+    // test_parity_discovery_tag_names.
     let tags = vec![
-        vec!["metric".to_string(), metric.to_string()],
+        vec!["metric".to_string(), config.metric.clone()],
         vec!["step_size".to_string(), config.step_size.to_string()],
-        vec!["price_per_step".to_string(), price.clone()],
+        vec!["tips".to_string(), "1".to_string(), "2".to_string()],
         vec![
-            "block".to_string(),
+            "price_per_step".to_string(),
             "cashu".to_string(),
             price,
             unit,
             url,
             min_steps,
         ],
-        vec!["tips".to_string()],
     ];
 
     let event = nostr_event::create_event(10021, tags, "", &identity.secret_key);

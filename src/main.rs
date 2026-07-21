@@ -1,6 +1,5 @@
 //! tollgate-module-basic-rust — main entry point.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 use tollgate_module_basic_rust::{cli, config, http, identity, session, tracing_setup, wallet};
 
@@ -27,7 +26,7 @@ async fn main() {
     tracing::info!(pubkey = %identity.pubkey_hex(), "merchant identity loaded");
 
     // Load or generate wallet seed
-    let db_dir = PathBuf::from("/etc/tollgate");
+    let db_dir = config::config_dir();
     let seed_path = db_dir.join("wallet_seed.bin");
     if let Some(parent) = seed_path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -114,7 +113,12 @@ async fn main() {
             .await
             .expect("failed to bind 127.0.0.1:2121");
         tracing::info!("HTTP server listening on 127.0.0.1:2121");
-        axum::serve(listener, app).await.expect("HTTP server error");
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .expect("HTTP server error");
     });
 
     let cli_state = state.clone();

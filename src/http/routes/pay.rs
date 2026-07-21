@@ -2,7 +2,7 @@
 //!
 //! Accepts text/plain (Cashu token) or application/json (Nostr kind 21000).
 //! Phase 4: verifies token, receives into wallet, creates session, returns
-//! kind 1022 on success or kind 21023 + HTTP 402 on failure.
+//! kind 1022 on success or kind 21023 + HTTP 400 on failure.
 
 use crate::http::AppState;
 use crate::wallet::verify::TokenVerifier;
@@ -53,7 +53,7 @@ pub async fn handle_pay(
                 });
                 let json = serde_json::to_string(&resp).unwrap_or_default();
                 return (
-                    StatusCode::PAYMENT_REQUIRED,
+                    StatusCode::BAD_REQUEST,
                     [
                         ("content-type", "application/json"),
                         ("access-control-allow-origin", "*"),
@@ -92,7 +92,7 @@ pub async fn handle_pay(
             });
             let json = serde_json::to_string(&resp).unwrap_or_default();
             return (
-                StatusCode::PAYMENT_REQUIRED,
+                StatusCode::BAD_REQUEST,
                 [
                     ("content-type", "application/json"),
                     ("access-control-allow-origin", "*"),
@@ -119,7 +119,7 @@ pub async fn handle_pay(
                 });
                 let json = serde_json::to_string(&resp).unwrap_or_default();
                 return (
-                    StatusCode::PAYMENT_REQUIRED,
+                    StatusCode::BAD_REQUEST,
                     [
                         ("content-type", "application/json"),
                         ("access-control-allow-origin", "*"),
@@ -137,7 +137,7 @@ pub async fn handle_pay(
         });
         let json = serde_json::to_string(&resp).unwrap_or_default();
         return (
-            StatusCode::PAYMENT_REQUIRED,
+            StatusCode::BAD_REQUEST,
             [
                 ("content-type", "application/json"),
                 ("access-control-allow-origin", "*"),
@@ -273,12 +273,12 @@ mod tests {
         assert!(mgr.is_active("test:mac"));
     }
 
-    /// Test that rejected tokens return 402 (simulated).
+    /// Test that rejected tokens return 400 (simulated).
     #[test]
-    fn rejected_token_returns_402() {
-        // The handler returns PAYMENT_REQUIRED for failed verification.
+    fn rejected_token_returns_400() {
+        // The handler returns BAD_REQUEST for failed verification.
         // We verify the status code constant matches.
-        let expected = StatusCode::PAYMENT_REQUIRED;
-        assert_eq!(expected.as_u16(), 402);
+        let expected = StatusCode::BAD_REQUEST;
+        assert_eq!(expected.as_u16(), 400);
     }
 }
