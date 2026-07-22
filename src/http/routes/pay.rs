@@ -6,6 +6,7 @@
 
 use crate::http::AppState;
 use crate::mac_resolver::{get_client_ip, get_mac_address};
+use crate::nostr_event;
 use crate::wallet::verify::TokenVerifier;
 use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -191,25 +192,12 @@ pub async fn handle_pay(
     );
 
     // Step 4: return kind 1022 session-granted event
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-
-    let resp = serde_json::json!({
-        "id": format!("{:064x}", rand::random::<u64>()),
-        "pubkey": state.identity.pubkey_hex(),
-        "created_at": now,
-        "kind": 1022,
-        "tags": [
-            ["allotment", allotment.to_string()],
-            ["metric", state.config.metric.clone()],
-        ],
-        "content": "",
-        "sig": ""
-    });
-
-    let json = serde_json::to_string(&resp).unwrap_or_default();
+    let tags = vec![
+        vec!["allotment".to_string(), allotment.to_string()],
+        vec!["metric".to_string(), state.config.metric.clone()],
+    ];
+    let event = nostr_event::create_event(1022, tags, "", &state.identity.secret_key);
+    let json = serde_json::to_string(&event).unwrap_or_default();
     (
         StatusCode::OK,
         [

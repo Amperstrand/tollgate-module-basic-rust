@@ -1,0 +1,58 @@
+name: Rust Basic CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust-basic-tests:
+    name: Rust basic + PRTA tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout tollgate-module-basic-rust
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Run cargo tests
+        run: cargo test --lib --release
+
+      - name: Checkout physical-router-test-automation
+        uses: actions/checkout@v4
+        with:
+          repository: tollgate/physical-router-test-automation
+          path: ../physical-router-test-automation
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: ../physical-router-test-automation/requirements.txt
+
+      - name: Install PRTA dependencies
+        working-directory: ../physical-router-test-automation
+        run: pip install -r requirements.txt
+
+      - name: Run rust-basic tests
+        env:
+          TOLLGATE_BACKEND: rust-basic
+          TOLLGATE_SSH_HOST: ''
+          TOLLGATE_VIRTUAL_LAB: ''
+          TOLLGATE_BINARY_PATH: ${{ github.workspace }}/target/release/tollgate-module-basic-rust
+        working-directory: ../physical-router-test-automation
+        run: |
+          pytest tests/api/test_rust_basic_*.py -v --tb=short
