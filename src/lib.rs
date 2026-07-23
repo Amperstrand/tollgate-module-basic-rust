@@ -9,4 +9,5 @@ pub mod metering;
 pub mod nostr_event;
 pub mod session;
 pub mod tracing_setup;
+pub mod valve;
 pub mod wallet;

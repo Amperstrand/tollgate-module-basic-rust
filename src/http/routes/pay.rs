@@ -53,7 +53,10 @@ pub async fn handle_pay(
             None => {
                 let event = nostr_event::create_event(
                     21023,
-                    vec![],
+                    vec![
+                        vec!["level".to_string(), "error".to_string()],
+                        vec!["code".to_string(), "invalid-nostr-event".to_string()],
+                    ],
                     "invalid Nostr kind 21000 event: no payment tag found",
                     &state.identity.secret_key,
                 );
@@ -85,7 +88,10 @@ pub async fn handle_pay(
         None => {
             let event = nostr_event::create_event(
                 21023,
-                vec![],
+                vec![
+                    vec!["level".to_string(), "error".to_string()],
+                    vec!["code".to_string(), "mac-address-lookup-failed".to_string()],
+                ],
                 "payment rejected: mac-address-lookup-failed",
                 &state.identity.secret_key,
             );
@@ -116,7 +122,10 @@ pub async fn handle_pay(
             tracing::warn!(error = %e, "token verification failed");
             let event = nostr_event::create_event(
                 21023,
-                vec![],
+                vec![
+                    vec!["level".to_string(), "error".to_string()],
+                    vec!["code".to_string(), "token-verification-failed".to_string()],
+                ],
                 &format!("payment rejected: {e}"),
                 &state.identity.secret_key,
             );
@@ -145,7 +154,10 @@ pub async fn handle_pay(
                 drop(wallet_guard);
                 let event = nostr_event::create_event(
                     21023,
-                    vec![],
+                    vec![
+                        vec!["level".to_string(), "error".to_string()],
+                        vec!["code".to_string(), "wallet-receive-failed".to_string()],
+                    ],
                     &format!("payment rejected: wallet receive failed: {e}"),
                     &state.identity.secret_key,
                 );
@@ -165,7 +177,10 @@ pub async fn handle_pay(
         drop(wallet_guard);
         let event = nostr_event::create_event(
             21023,
-            vec![],
+            vec![
+                vec!["level".to_string(), "error".to_string()],
+                vec!["code".to_string(), "wallet-not-initialized".to_string()],
+            ],
             "payment rejected: wallet not initialized",
             &state.identity.secret_key,
         );
@@ -181,9 +196,12 @@ pub async fn handle_pay(
     };
     drop(wallet_guard);
 
-    // Step 3: create session — allotment in millisatoshis
+    // Step 3: create session — allotment in the metric's unit (bytes or ms)
     let duration_secs = 3600u64; // default 1 hour session
-    let allotment = received_amount * 1000; // convert sat to millisat for allotment
+    let mint = state.config.accepted_mints.first();
+    let price_per_step = mint.map(|m| m.price_per_step).unwrap_or(1).max(1); // avoid div-by-zero
+    let step_size = state.config.step_size;
+    let allotment = (received_amount / price_per_step) * step_size;
 
     let mut sessions = state.sessions.lock().await;
     let _session = sessions.create_session(
@@ -197,17 +215,34 @@ pub async fn handle_pay(
     });
     drop(sessions);
 
+    // Open the gate to grant network access via ndsctl.
+    if let Err(e) = crate::valve::open_gate(&mac).await {
+        tracing::warn!(mac = %mac, error = %e, "failed to open gate");
+        // Continue anyway — session is created, gate may be opened manually.
+    }
+
     tracing::info!(
         verified_msat = verified_amount,
         received_sat = received_amount,
-        allotment_msat = allotment,
+        allotment = allotment,
         "session granted"
     );
 
     // Step 4: return kind 1022 session-granted event
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
     let tags = vec![
+        vec!["p".to_string(), state.identity.pubkey_hex()],
+        vec![
+            "device-identifier".to_string(),
+            "mac".to_string(),
+            mac.clone(),
+        ],
         vec!["allotment".to_string(), allotment.to_string()],
         vec!["metric".to_string(), state.config.metric.clone()],
+        vec!["start-time".to_string(), now.to_string()],
     ];
     let event = nostr_event::create_event(1022, tags, "", &state.identity.secret_key);
     let json = serde_json::to_string(&event).unwrap_or_default();

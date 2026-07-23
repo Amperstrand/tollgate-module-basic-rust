@@ -113,10 +113,10 @@ async fn main() {
     let http_state = state.clone();
     let http_handle = tokio::spawn(async move {
         let app = http::create_router((*http_state).clone());
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:2121")
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:2121")
             .await
-            .expect("failed to bind 127.0.0.1:2121");
-        tracing::info!("HTTP server listening on 127.0.0.1:2121");
+            .expect("failed to bind 0.0.0.0:2121");
+        tracing::info!("HTTP server listening on 0.0.0.0:2121");
         axum::serve(
             listener,
             app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
