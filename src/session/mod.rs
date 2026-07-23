@@ -1,12 +1,16 @@
-//! CustomerSession and SessionManager — in-memory session tracking.
+//! CustomerSession and SessionManager — session tracking with disk persistence.
 //!
-//! Sessions are in-memory only, matching Go behavior. Process restart
-//! loses all sessions. No persistence is attempted.
+//! Sessions are persisted to `sessions.json` in the config directory on every
+//! mutation, matching tollgate-module-basic-go's behavior. On startup the
+//! SessionManager loads existing sessions from disk so that sessions survive
+//! process restarts.
 
 use std::collections::HashMap;
+use std::io;
+use std::path::Path;
 
 /// A single customer session keyed by MAC address.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CustomerSession {
     /// Client MAC address — the primary key.
     pub mac: String,
@@ -22,8 +26,7 @@ pub struct CustomerSession {
     pub granted_at: u64,
 }
 
-/// In-memory session manager. No persistence — matches Go behavior.
-/// Process restart loses all sessions.
+/// Session manager with disk persistence to `sessions.json`.
 pub struct SessionManager {
     pub sessions: HashMap<String, CustomerSession>,
 }
@@ -107,6 +110,51 @@ impl SessionManager {
     pub fn update_usage(&mut self, mac: &str, used: u64) {
         if let Some(s) = self.sessions.get_mut(mac) {
             s.used = used;
+        }
+    }
+
+    /// Save all active sessions to disk as JSON (`sessions.json`).
+    ///
+    /// Expired sessions are filtered out before writing so the file does not
+    /// grow unbounded. The write is atomic: data goes to a `.tmp` file first,
+    /// then is renamed into place.
+    pub fn save_to_disk(&self, dir: &Path) -> io::Result<()> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let path = dir.join("sessions.json");
+        let data: Vec<&CustomerSession> = self
+            .sessions
+            .values()
+            .filter(|s| s.expiry > now)
+            .collect();
+        let json = serde_json::to_string_pretty(&data)?;
+        let tmp = dir.join("sessions.json.tmp");
+        std::fs::write(&tmp, json)?;
+        std::fs::rename(&tmp, &path)?;
+        Ok(())
+    }
+
+    /// Load sessions from disk. Returns an empty manager if the file does not
+    /// exist or cannot be parsed (a warning is logged in the latter case).
+    pub fn load_from_disk(dir: &Path) -> Self {
+        let path = dir.join("sessions.json");
+        match std::fs::read_to_string(&path) {
+            Ok(json) => match serde_json::from_str::<Vec<CustomerSession>>(&json) {
+                Ok(sessions) => {
+                    let mut mgr = SessionManager::new();
+                    for s in sessions {
+                        mgr.sessions.insert(s.mac.clone(), s);
+                    }
+                    mgr
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to parse sessions.json, starting fresh");
+                    SessionManager::new()
+                }
+            },
+            Err(_) => SessionManager::new(),
         }
     }
 }

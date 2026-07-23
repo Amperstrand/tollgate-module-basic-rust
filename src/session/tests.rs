@@ -106,3 +106,66 @@ fn create_session_overwrites_existing() {
     assert_eq!(s.allotment, 5000);
     assert_eq!(s.metric, "time");
 }
+
+#[test]
+fn test_save_and_load_roundtrip() {
+    let tmp = tempfile::tempdir().expect("failed to create temp dir");
+
+    let mut mgr = SessionManager::new();
+    mgr.create_session("aa:bb:cc:dd:ee:01", 1_000_000, "bytes", 3600);
+    mgr.create_session("aa:bb:cc:dd:ee:02", 2_000_000, "time", 7200);
+    mgr.create_session("aa:bb:cc:dd:ee:03", 3_000_000, "bytes", 1800);
+    mgr.update_usage("aa:bb:cc:dd:ee:01", 500_000);
+
+    mgr.save_to_disk(tmp.path()).expect("save should succeed");
+
+    let loaded = SessionManager::load_from_disk(tmp.path());
+
+    assert_eq!(loaded.sessions.len(), 3);
+    let s1 = loaded.get_session("aa:bb:cc:dd:ee:01").unwrap();
+    assert_eq!(s1.allotment, 1_000_000);
+    assert_eq!(s1.used, 500_000);
+    assert_eq!(s1.metric, "bytes");
+    let s2 = loaded.get_session("aa:bb:cc:dd:ee:02").unwrap();
+    assert_eq!(s2.allotment, 2_000_000);
+    assert_eq!(s2.metric, "time");
+    let s3 = loaded.get_session("aa:bb:cc:dd:ee:03").unwrap();
+    assert_eq!(s3.allotment, 3_000_000);
+}
+
+#[test]
+fn test_load_missing_file_returns_empty() {
+    let tmp = tempfile::tempdir().expect("failed to create temp dir");
+    let loaded = SessionManager::load_from_disk(tmp.path());
+    assert_eq!(loaded.sessions.len(), 0);
+}
+
+#[test]
+fn test_load_corrupt_json_returns_empty() {
+    let tmp = tempfile::tempdir().expect("failed to create temp dir");
+    let path = tmp.path().join("sessions.json");
+    std::fs::write(&path, "this is not valid json {{{{").expect("write failed");
+
+    let loaded = SessionManager::load_from_disk(tmp.path());
+    assert_eq!(loaded.sessions.len(), 0);
+}
+
+#[test]
+fn test_save_filters_expired_sessions() {
+    let tmp = tempfile::tempdir().expect("failed to create temp dir");
+
+    let mut mgr = SessionManager::new();
+    mgr.create_session("aa:bb:cc:dd:ee:01", 1_000_000, "bytes", 3600);
+    mgr.create_session("aa:bb:cc:dd:ee:02", 2_000_000, "bytes", 3600);
+    {
+        let s = mgr.sessions.get_mut("aa:bb:cc:dd:ee:02").unwrap();
+        s.expiry = now() - 10;
+    }
+
+    mgr.save_to_disk(tmp.path()).expect("save should succeed");
+
+    let loaded = SessionManager::load_from_disk(tmp.path());
+    assert_eq!(loaded.sessions.len(), 1);
+    assert!(loaded.get_session("aa:bb:cc:dd:ee:01").is_some());
+    assert!(loaded.get_session("aa:bb:cc:dd:ee:02").is_none());
+}

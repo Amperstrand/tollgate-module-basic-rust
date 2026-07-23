@@ -97,12 +97,16 @@ async fn main() {
         }
     }
 
+    // Load persisted sessions from disk (sessions.json) so sessions survive restarts
+    let sessions = session::SessionManager::load_from_disk(&config::config_dir());
+    tracing::info!(count = sessions.sessions.len(), "sessions loaded from disk");
+
     // Build app state
     let state = Arc::new(http::AppState {
         config: Arc::new(config_obj),
         identity: Arc::new(identity),
         wallet: Arc::new(tokio::sync::Mutex::new(Some(toll_wallet))),
-        sessions: Arc::new(tokio::sync::Mutex::new(session::SessionManager::new())),
+        sessions: Arc::new(tokio::sync::Mutex::new(sessions)),
     });
 
     // Start HTTP server + CLI socket

@@ -51,11 +51,13 @@ pub async fn handle_pay(
         match extract_token_from_nostr_event(&body) {
             Some(t) => t,
             None => {
-                let resp = serde_json::json!({
-                    "kind": 21023,
-                    "content": "invalid Nostr kind 21000 event: no payment tag found",
-                });
-                let json = serde_json::to_string(&resp).unwrap_or_default();
+                let event = nostr_event::create_event(
+                    21023,
+                    vec![],
+                    "invalid Nostr kind 21000 event: no payment tag found",
+                    &state.identity.secret_key,
+                );
+                let json = serde_json::to_string(&event).unwrap_or_default();
                 return (
                     StatusCode::BAD_REQUEST,
                     [
@@ -81,11 +83,13 @@ pub async fn handle_pay(
     let mac = match get_mac_address(&client_ip) {
         Some(m) => m,
         None => {
-            let resp = serde_json::json!({
-                "kind": 21023,
-                "content": "payment rejected: mac-address-lookup-failed",
-            });
-            let json = serde_json::to_string(&resp).unwrap_or_default();
+            let event = nostr_event::create_event(
+                21023,
+                vec![],
+                "payment rejected: mac-address-lookup-failed",
+                &state.identity.secret_key,
+            );
+            let json = serde_json::to_string(&event).unwrap_or_default();
             return (
                 StatusCode::BAD_REQUEST,
                 [
@@ -110,11 +114,13 @@ pub async fn handle_pay(
         Ok(amount_msat) => amount_msat,
         Err(e) => {
             tracing::warn!(error = %e, "token verification failed");
-            let resp = serde_json::json!({
-                "kind": 21023,
-                "content": format!("payment rejected: {e}"),
-            });
-            let json = serde_json::to_string(&resp).unwrap_or_default();
+            let event = nostr_event::create_event(
+                21023,
+                vec![],
+                &format!("payment rejected: {e}"),
+                &state.identity.secret_key,
+            );
+            let json = serde_json::to_string(&event).unwrap_or_default();
             return (
                 StatusCode::BAD_REQUEST,
                 [
@@ -137,11 +143,13 @@ pub async fn handle_pay(
             Err(e) => {
                 tracing::warn!(error = %e, "wallet receive failed");
                 drop(wallet_guard);
-                let resp = serde_json::json!({
-                    "kind": 21023,
-                    "content": format!("payment rejected: wallet receive failed: {e}"),
-                });
-                let json = serde_json::to_string(&resp).unwrap_or_default();
+                let event = nostr_event::create_event(
+                    21023,
+                    vec![],
+                    &format!("payment rejected: wallet receive failed: {e}"),
+                    &state.identity.secret_key,
+                );
+                let json = serde_json::to_string(&event).unwrap_or_default();
                 return (
                     StatusCode::BAD_REQUEST,
                     [
@@ -155,11 +163,13 @@ pub async fn handle_pay(
     } else {
         tracing::warn!("wallet not initialized");
         drop(wallet_guard);
-        let resp = serde_json::json!({
-            "kind": 21023,
-            "content": "payment rejected: wallet not initialized",
-        });
-        let json = serde_json::to_string(&resp).unwrap_or_default();
+        let event = nostr_event::create_event(
+            21023,
+            vec![],
+            "payment rejected: wallet not initialized",
+            &state.identity.secret_key,
+        );
+        let json = serde_json::to_string(&event).unwrap_or_default();
         return (
             StatusCode::BAD_REQUEST,
             [
@@ -182,6 +192,9 @@ pub async fn handle_pay(
         &state.config.metric,
         duration_secs,
     );
+    sessions.save_to_disk(&crate::config::config_dir()).unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "failed to save sessions to disk");
+    });
     drop(sessions);
 
     tracing::info!(
