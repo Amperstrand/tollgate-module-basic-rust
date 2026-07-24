@@ -40,16 +40,24 @@ jobs:
             use-cross: true
           - target: armv7-unknown-linux-musleabihf
             use-cross: true
+          - target: mips-unknown-linux-musl
+            use-cross: false
+            needs-build-std: true
+            zigbuild: true
+          - target: mipsel-unknown-linux-musl
+            use-cross: false
+            needs-build-std: true
+            zigbuild: true
     steps:
       - uses: actions/checkout@v4
 
-      # --- x86_64: native musl-gcc (fast, no Docker needed) ---
+      # --- x86_64: native musl-gcc ---
       - name: Install musl tools
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - uses: dtolnay/rust-toolchain@stable
-        if: matrix.use-cross == false
+        if: matrix.use-cross == false && matrix.needs-build-std != true
         with:
           targets: ${{ matrix.target }}
 
@@ -58,17 +66,12 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Build (musl-gcc)
-        if: matrix.use-cross == false
+        if: matrix.use-cross == false && matrix.needs-build-std != true
         run: cargo build --release --target ${{ matrix.target }}
 
-      # --- ARM: use cross (Docker-based, proper musl cross-toolchains) ---
-      # ring (used by rustls) compiles pregenerated assembly that zig cc
-      # and naive GCC cross-compilers can't handle. cross uses Docker images
-      # with full musl cross-toolchains that work correctly.
+      # --- ARM: cross (Docker) ---
       - uses: dtolnay/rust-toolchain@stable
         if: matrix.use-cross == true
-        with:
-          targets: ${{ matrix.target }}
 
       - name: Install cross
         if: matrix.use-cross == true
@@ -77,6 +80,30 @@ jobs:
       - name: Cross build (Docker)
         if: matrix.use-cross == true
         run: cross build --release --target ${{ matrix.target }}
+
+      # --- MIPS: cargo-zigbuild + nightly build-std ---
+      # Zig handles MIPS musl cross-compilation natively (no Docker).
+      # [patch.crates-io] resolves normally on the host.
+      - uses: dtolnay/rust-toolchain@nightly
+        if: matrix.zigbuild == true
+        with:
+          components: rust-src
+
+      - name: Install Zig + cargo-zigbuild
+        if: matrix.zigbuild == true
+        run: |
+          pip install ziglang
+          cargo install cargo-zigbuild
+
+      - name: Cargo fetch + update for CDK patch
+        if: matrix.zigbuild == true
+        run: |
+          cargo update -p cdk -p cdk-common
+          cargo fetch
+
+      - name: Zigbuild MIPS
+        if: matrix.zigbuild == true
+        run: cargo +nightly zigbuild --release --target ${{ matrix.target }} -Z build-std
 
       - name: Binary size
         run: |

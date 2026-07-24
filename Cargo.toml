@@ -57,6 +57,10 @@ thiserror = "1"
 [dev-dependencies]
 tempfile = "3"
 
+[patch.crates-io]
+cdk = { git = "https://github.com/Amperstrand/cdk.git", branch = "fix/mips-atomicusize" }
+cdk-common = { git = "https://github.com/Amperstrand/cdk.git", branch = "fix/mips-atomicusize" }
+
 [profile.release]
 # Aggressive size optimization — tollgate ships on resource-constrained OpenWrt routers
 panic = "abort"
