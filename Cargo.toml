@@ -61,8 +61,12 @@ lazy_static = "1.4"
 tempfile = "3"
 
 [patch.crates-io]
+cashu = { git = "https://github.com/Amperstrand/cdk.git", branch = "fix/mips-atomicusize" }
 cdk = { git = "https://github.com/Amperstrand/cdk.git", branch = "fix/mips-atomicusize" }
 cdk-common = { git = "https://github.com/Amperstrand/cdk.git", branch = "fix/mips-atomicusize" }
+cdk-sql-common = { git = "https://github.com/Amperstrand/cdk.git", branch = "fix/mips-atomicusize" }
+cdk-sqlite = { git = "https://github.com/Amperstrand/cdk.git", branch = "fix/mips-atomicusize" }
+cdk-http-client = { git = "https://github.com/Amperstrand/cdk.git", branch = "fix/mips-atomicusize" }
 
 [profile.release]
 # Aggressive size optimization — tollgate ships on resource-constrained OpenWrt routers
