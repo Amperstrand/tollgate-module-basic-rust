@@ -41,12 +41,16 @@ pub async fn handle_whoami(
             format!("mac={mac}"),
         )
             .into_response(),
-        None => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            [("access-control-allow-origin", "*")],
-            String::new(),
-        )
-            .into_response(),
+        None => {
+            let mut resp = (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [("access-control-allow-origin", "*")],
+                String::new(),
+            )
+                .into_response();
+            resp.headers_mut().remove("content-type");
+            resp
+        }
     }
 }
 
