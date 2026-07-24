@@ -54,6 +54,9 @@ sha2 = "0.10"
 # Error derive macro
 thiserror = "1"
 
+# Static initialization for quote store
+lazy_static = "1.4"
+
 [dev-dependencies]
 tempfile = "3"
 

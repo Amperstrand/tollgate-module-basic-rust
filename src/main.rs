@@ -57,6 +57,8 @@ async fn main() {
         match export_result {
             Ok(output) if output.status.success() => {
                 tracing::info!("gonuts-export completed, importing tokens");
+                let _ = std::fs::write(&migration_marker, b"");
+                tracing::info!("migration marker written");
                 // Tokens will be imported on next CLI `migrate` command
                 // or when mint connectivity allows wallet.receive()
                 tracing::info!(tokens_file = %tokens_file.display(), "tokens exported, run 'migrate <path>' via CLI to import");

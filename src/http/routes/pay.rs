@@ -200,6 +200,27 @@ pub async fn handle_pay(
     let duration_secs = 3600u64; // default 1 hour session
     let mint = state.config.accepted_mints.first();
     let price_per_step = mint.map(|m| m.price_per_step).unwrap_or(1).max(1); // avoid div-by-zero
+
+    // Validate minimum purchase (payment too small)
+    let steps = received_amount / price_per_step;
+    if steps == 0 {
+        let event = nostr_event::create_event(
+            21023,
+            vec![],
+            "payment rejected: amount below minimum purchase",
+            &state.identity.secret_key,
+        );
+        let json = serde_json::to_string(&event).unwrap_or_default();
+        return (
+            StatusCode::BAD_REQUEST,
+            [
+                ("content-type", "application/json"),
+                ("access-control-allow-origin", "*"),
+            ],
+            json,
+        );
+    }
+
     let step_size = state.config.step_size;
     let allotment = (received_amount / price_per_step) * step_size;
 
