@@ -40,16 +40,24 @@ jobs:
             use-cross: true
           - target: armv7-unknown-linux-musleabihf
             use-cross: true
+          - target: mips-unknown-linux-musl
+            use-cross: false
+            needs-build-std: true
+            musl-tc: mips-linux-muslsf
+          - target: mipsel-unknown-linux-musl
+            use-cross: false
+            needs-build-std: true
+            musl-tc: mipsel-linux-muslsf
     steps:
       - uses: actions/checkout@v4
 
-      # --- x86_64: native musl-gcc (fast, no Docker needed) ---
+      # --- x86_64: native musl-gcc ---
       - name: Install musl tools
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - uses: dtolnay/rust-toolchain@stable
-        if: matrix.use-cross == false
+        if: matrix.use-cross == false && matrix.needs-build-std != true
         with:
           targets: ${{ matrix.target }}
 
@@ -58,17 +66,12 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Build (musl-gcc)
-        if: matrix.use-cross == false
+        if: matrix.use-cross == false && matrix.needs-build-std != true
         run: cargo build --release --target ${{ matrix.target }}
 
-      # --- ARM: use cross (Docker-based, proper musl cross-toolchains) ---
-      # ring (used by rustls) compiles pregenerated assembly that zig cc
-      # and naive GCC cross-compilers can't handle. cross uses Docker images
-      # with full musl cross-toolchains that work correctly.
+      # --- ARM: cross (Docker) ---
       - uses: dtolnay/rust-toolchain@stable
         if: matrix.use-cross == true
-        with:
-          targets: ${{ matrix.target }}
 
       - name: Install cross
         if: matrix.use-cross == true
@@ -77,6 +80,32 @@ jobs:
       - name: Cross build (Docker)
         if: matrix.use-cross == true
         run: cross build --release --target ${{ matrix.target }}
+
+      # --- MIPS: musl.cc mirror + nightly build-std (production pattern from vnt-dev/vnt) ---
+      - name: Install MIPS musl cross-compiler
+        if: matrix.needs-build-std == true
+        run: |
+          wget -q "https://github.com/rustp2p/musl-cross/releases/download/0.0.1/${{ matrix.musl-tc }}-cross.tgz" -O /tmp/musl.tgz
+          tar xf /tmp/musl.tgz -C /opt/
+          cd /opt/${{ matrix.musl-tc }}-cross/lib/gcc/${{ matrix.musl-tc }}/11.2.1
+          cp libgcc_eh.a libunwind.a
+
+      - uses: dtolnay/rust-toolchain@nightly
+        if: matrix.needs-build-std == true
+        with:
+          components: rust-src
+
+      - name: Build MIPS (cargo +nightly, build-std)
+        if: matrix.needs-build-std == true
+        run: |
+          TC=/opt/${{ matrix.musl-tc }}-cross
+          TARGET_UPPER=$(echo "${{ matrix.target }}" | tr '[:lower:]' '[:upper:]' | tr '-' '_')
+          export CC_${TARGET_UPPER}="$TC/bin/${{ matrix.musl-tc }}-gcc"
+          export CARGO_TARGET_${TARGET_UPPER}_LINKER="$TC/bin/${{ matrix.musl-tc }}-gcc"
+          export AR_${TARGET_UPPER}="$TC/bin/${{ matrix.musl-tc }}-ar"
+          export PATH="$TC/bin:$PATH"
+          cargo +nightly update -p cdk -p cdk-common
+          cargo +nightly build -Z build-std --release --target ${{ matrix.target }}
 
       - name: Binary size
         run: |
