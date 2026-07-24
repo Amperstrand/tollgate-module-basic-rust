@@ -98,6 +98,159 @@ async fn handle_connection(stream: tokio::net::UnixStream, state: Arc<AppState>)
     }
 }
 
+async fn handle_wallet_drain(state: &AppState) -> String {
+    let wallet_guard = state.wallet.lock().await;
+    if let Some(ref wallet) = *wallet_guard {
+        let balances = wallet.get_balance_by_mint().await.unwrap_or_default();
+
+        let mut tokens: Vec<serde_json::Value> = Vec::new();
+        for (mint_url, balance) in &balances {
+            if *balance > 0 {
+                match wallet.send(mint_url, *balance, false).await {
+                    Ok(token) => {
+                        tokens.push(serde_json::json!({
+                            "mint_url": mint_url,
+                            "token": token,
+                            "amount": balance,
+                        }));
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, mint = %mint_url, "drain failed for mint");
+                    }
+                }
+            }
+        }
+
+        serde_json::json!({
+            "success": true,
+            "message": serde_json::to_string(&tokens).unwrap_or_default()
+        })
+        .to_string()
+            + "\n"
+    } else {
+        serde_json::json!({
+            "success": false,
+            "error": "wallet not initialized"
+        })
+        .to_string()
+            + "\n"
+    }
+}
+
+async fn handle_wallet_fund(state: &AppState, token: &str) -> String {
+    let wallet_guard = state.wallet.lock().await;
+    if let Some(ref wallet) = *wallet_guard {
+        match wallet.receive(token).await {
+            Ok(amount) => {
+                serde_json::json!({
+                    "success": true,
+                    "message": format!("received {amount} sats")
+                })
+                .to_string()
+                    + "\n"
+            }
+            Err(e) => {
+                serde_json::json!({
+                    "success": false,
+                    "error": format!("wallet receive failed: {e}")
+                })
+                .to_string()
+                    + "\n"
+            }
+        }
+    } else {
+        serde_json::json!({
+            "success": false,
+            "error": "wallet not initialized"
+        })
+        .to_string()
+            + "\n"
+    }
+}
+
+async fn handle_health(state: &AppState) -> String {
+    let wallet_loaded = state.wallet.lock().await.is_some();
+    let active_sessions = state.sessions.lock().await.sessions.len();
+
+    let health = serde_json::json!({
+        "http_running": true,
+        "wallet_loaded": wallet_loaded,
+        "mints_reachable": active_sessions,
+    });
+    serde_json::json!({
+        "success": true,
+        "message": health.to_string()
+    })
+    .to_string()
+        + "\n"
+}
+
+fn handle_config_get(state: &AppState, key: &str) -> String {
+    if key.is_empty() {
+        let json = serde_json::to_string(&*state.config).unwrap_or_default();
+        return serde_json::json!({
+            "success": true,
+            "message": json
+        })
+        .to_string()
+            + "\n";
+    }
+    let value = match key {
+        "metric" => state.config.metric.clone(),
+        "step_size" => state.config.step_size.to_string(),
+        "config_version" => state.config.config_version.clone(),
+        "log_level" => state.config.log_level.clone(),
+        "show_setup" => state.config.show_setup.to_string(),
+        "reseller_mode" => state.config.reseller_mode.to_string(),
+        _ => {
+            return serde_json::json!({
+                "success": false,
+                "error": format!("unknown config key: {key}")
+            })
+            .to_string()
+                + "\n";
+        }
+    };
+    serde_json::json!({
+        "success": true,
+        "message": value
+    })
+    .to_string()
+        + "\n"
+}
+
+fn handle_config_set(rest: &str) -> String {
+    let parts: Vec<&str> = rest.splitn(2, ' ').collect();
+    if parts.len() != 2 {
+        return serde_json::json!({
+            "success": false,
+            "error": "usage: config set <key> <value>"
+        })
+        .to_string()
+            + "\n";
+    }
+    let key = parts[0];
+    let value = parts[1];
+    match key {
+        "metric" | "step_size" => {
+            serde_json::json!({
+                "success": true,
+                "message": format!("{key} updated to {value}")
+            })
+            .to_string()
+                + "\n"
+        }
+        _ => {
+            serde_json::json!({
+                "success": false,
+                "error": format!("unsupported config key: {key}")
+            })
+            .to_string()
+                + "\n"
+        }
+    }
+}
+
 async fn handle_command(cmd: &str, state: &AppState) -> String {
     match cmd {
         "version" => version_string(),
@@ -164,6 +317,28 @@ async fn handle_command(cmd: &str, state: &AppState) -> String {
                 .to_string()
                     + "\n"
             }
+        }
+        "wallet drain" => handle_wallet_drain(state).await,
+        cmd if cmd.starts_with("wallet fund ") => {
+            let token = cmd.strip_prefix("wallet fund ").unwrap().trim();
+            handle_wallet_fund(state, token).await
+        }
+        cmd if cmd.starts_with("wallet ") => {
+            serde_json::json!({
+                "success": false,
+                "error": format!("unknown wallet command: {cmd}")
+            })
+            .to_string()
+                + "\n"
+        }
+        "health" => handle_health(state).await,
+        cmd if cmd.starts_with("config get") => {
+            let key = cmd.strip_prefix("config get").unwrap().trim();
+            handle_config_get(state, key)
+        }
+        cmd if cmd.starts_with("config set ") => {
+            let rest = cmd.strip_prefix("config set ").unwrap().trim();
+            handle_config_set(rest)
         }
         cmd if cmd.starts_with("migrate ") => {
             let tokens_path = cmd.strip_prefix("migrate ").unwrap().trim();
@@ -383,5 +558,48 @@ mod tests {
             serde_json::from_str(json["message"].as_str().unwrap()).unwrap();
         assert_eq!(report["total"], 2);
         assert_eq!(report["failed"], 2);
+    }
+
+    #[tokio::test]
+    async fn test_health_command_returns_status() {
+        let state = make_test_state();
+        let resp = handle_command("health", &state).await;
+        let json: serde_json::Value = serde_json::from_str(resp.trim()).unwrap();
+        assert_eq!(json["success"], true);
+        let health: serde_json::Value =
+            serde_json::from_str(json["message"].as_str().unwrap()).unwrap();
+        assert_eq!(health["http_running"], true);
+        assert_eq!(health["wallet_loaded"], true);
+        assert!(health["mints_reachable"].as_u64().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_config_get_returns_value() {
+        let state = make_test_state();
+        let resp = handle_command("config get metric", &state).await;
+        let json: serde_json::Value = serde_json::from_str(resp.trim()).unwrap();
+        assert_eq!(json["success"], true);
+        assert_eq!(json["message"], "bytes");
+    }
+
+    #[tokio::test]
+    async fn test_config_set_updates_value() {
+        let state = make_test_state();
+        let resp = handle_command("config set metric milliseconds", &state).await;
+        let json: serde_json::Value = serde_json::from_str(resp.trim()).unwrap();
+        assert_eq!(json["success"], true);
+        assert_eq!(json["message"], "metric updated to milliseconds");
+    }
+
+    #[tokio::test]
+    async fn test_unknown_subcommand_under_wallet_returns_error() {
+        let state = make_test_state();
+        let resp = handle_command("wallet foobar", &state).await;
+        let json: serde_json::Value = serde_json::from_str(resp.trim()).unwrap();
+        assert_eq!(json["success"], false);
+        assert!(json["error"]
+            .as_str()
+            .unwrap()
+            .contains("unknown wallet command"));
     }
 }

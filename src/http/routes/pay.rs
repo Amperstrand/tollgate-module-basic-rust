@@ -204,15 +204,12 @@ pub async fn handle_pay(
     let allotment = (received_amount / price_per_step) * step_size;
 
     let mut sessions = state.sessions.lock().await;
-    let _session = sessions.create_session(
-        &mac,
-        allotment,
-        &state.config.metric,
-        duration_secs,
-    );
-    sessions.save_to_disk(&crate::config::config_dir()).unwrap_or_else(|e| {
-        tracing::warn!(error = %e, "failed to save sessions to disk");
-    });
+    let _extended = sessions.add_allotment(&mac, &state.config.metric, allotment, duration_secs);
+    sessions
+        .save_to_disk(&crate::config::config_dir())
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "failed to save sessions to disk");
+        });
     drop(sessions);
 
     // Open the gate to grant network access via ndsctl.

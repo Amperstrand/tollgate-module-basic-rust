@@ -22,14 +22,14 @@ use crate::http::AppState;
 use crate::mac_resolver::{get_client_ip, get_mac_address};
 use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use std::net::SocketAddr;
 
 pub async fn handle_whoami(
     State(_state): State<AppState>,
     headers: HeaderMap,
     ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
-) -> impl IntoResponse {
+) -> Response {
     let client_ip = get_client_ip(&headers, Some(remote_addr));
     match get_mac_address(&client_ip) {
         Some(mac) => (
@@ -39,18 +39,14 @@ pub async fn handle_whoami(
                 ("access-control-allow-origin", "*"),
             ],
             format!("mac={mac}"),
-        ),
-        None => {
-            // Go writes only the status header, no body.
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                [
-                    ("content-type", "text/plain"),
-                    ("access-control-allow-origin", "*"),
-                ],
-                String::new(),
-            )
-        }
+        )
+            .into_response(),
+        None => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            [("access-control-allow-origin", "*")],
+            String::new(),
+        )
+            .into_response(),
     }
 }
 

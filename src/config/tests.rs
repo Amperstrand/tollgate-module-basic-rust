@@ -9,7 +9,7 @@ use super::schema::{
 };
 use super::{
     config_dir, config_path, identities_path, install_path, load_config, load_identities,
-    load_install,
+    load_install, migrate_config, validate_profit_share,
 };
 use std::fs;
 
@@ -309,4 +309,88 @@ fn deserializes_upstream_detector_and_session_defaults() {
     let cfg: Config = serde_json::from_str(minimal).expect("minimal config should parse");
     let _: &UpstreamDetectorConfig = &cfg.upstream_detector;
     let _: &UpstreamWifiConfig = &cfg.upstream_wifi;
+}
+
+// ─ Migration tests ──────────────────────────────────────────────────
+
+#[test]
+fn test_migrate_populates_missing_upstream_wifi() {
+    let defaults = Config::new_default();
+    let mut config = Config {
+        upstream_wifi: UpstreamWifiConfig {
+            scan_interval_seconds: 0,
+            ..UpstreamWifiConfig::default()
+        },
+        config_version: "v0.0.1".to_string(),
+        ..Config::new_default()
+    };
+
+    migrate_config(&mut config, &defaults);
+
+    assert_eq!(
+        config.upstream_wifi.scan_interval_seconds,
+        defaults.upstream_wifi.scan_interval_seconds
+    );
+    assert_eq!(
+        config.upstream_wifi.signal_floor,
+        defaults.upstream_wifi.signal_floor
+    );
+    assert_eq!(config.config_version, defaults.config_version);
+}
+
+#[test]
+fn test_validate_profit_share_valid() {
+    let ps = vec![
+        ProfitShareConfig {
+            factor: 0.79,
+            identity: "owner".into(),
+        },
+        ProfitShareConfig {
+            factor: 0.21,
+            identity: "ops".into(),
+        },
+    ];
+    assert!(validate_profit_share(&ps).is_ok());
+}
+
+#[test]
+fn test_validate_profit_share_empty_fails() {
+    assert_eq!(
+        validate_profit_share(&[]),
+        Err("profit_share is empty".to_string())
+    );
+}
+
+#[test]
+fn test_validate_profit_share_negative_factor_fails() {
+    let ps = vec![
+        ProfitShareConfig {
+            factor: -0.1,
+            identity: "a".into(),
+        },
+        ProfitShareConfig {
+            factor: 1.1,
+            identity: "b".into(),
+        },
+    ];
+    let err = validate_profit_share(&ps).unwrap_err();
+    assert!(err.contains("negative factor"));
+    assert!(err.contains("profit_share[0]"));
+}
+
+#[test]
+fn test_validate_profit_share_sum_not_one_fails() {
+    let ps = vec![
+        ProfitShareConfig {
+            factor: 0.5,
+            identity: "a".into(),
+        },
+        ProfitShareConfig {
+            factor: 0.3,
+            identity: "b".into(),
+        },
+    ];
+    let err = validate_profit_share(&ps).unwrap_err();
+    assert!(err.contains("sum to 0.8"));
+    assert!(err.contains("expected 1.0"));
 }

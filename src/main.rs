@@ -1,7 +1,10 @@
 //! tollgate-module-basic-rust — main entry point.
 
 use std::sync::Arc;
-use tollgate_module_basic_rust::{cli, config, http, identity, session, tracing_setup, wallet};
+use tollgate_module_basic_rust::{
+    cli, config, degraded, http, identity, mint_health, monitor, payout, session,
+    tracing_setup, wallet,
+};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -89,7 +92,7 @@ async fn main() {
         .iter()
         .map(|m| m.url.clone())
         .collect();
-    let mut toll_wallet = wallet::TollWallet::new(seed, mint_urls, db_dir.clone());
+    let mut toll_wallet = wallet::TollWallet::new(seed, mint_urls.clone(), db_dir.clone());
     for mint in &config_obj.accepted_mints {
         match toll_wallet.ensure_mint(&mint.url).await {
             Ok(()) => tracing::info!(mint = %mint.url, "wallet registered for mint"),
@@ -100,6 +103,8 @@ async fn main() {
     // Load persisted sessions from disk (sessions.json) so sessions survive restarts
     let sessions = session::SessionManager::load_from_disk(&config::config_dir());
     tracing::info!(count = sessions.sessions.len(), "sessions loaded from disk");
+
+    let mint_health_tracker = Arc::new(mint_health::MintHealthTracker::new());
 
     // Build app state
     let state = Arc::new(http::AppState {
@@ -132,6 +137,66 @@ async fn main() {
         }
     });
 
+    let monitor_handle = {
+        let m = monitor::Monitor::new(Arc::clone(&state.sessions));
+        m.start()
+    };
+    tracing::info!("background usage monitor started (2s interval)");
+
+    {
+        let mh = Arc::clone(&mint_health_tracker);
+        let urls = mint_urls.clone();
+        let wallet = Arc::clone(&state.wallet);
+        let config = Arc::clone(&state.config);
+
+        tokio::spawn(async move {
+            let any_reachable = mh.initial_probe(&urls).await;
+            tracing::info!(any_reachable, "mint health initial probe complete");
+
+            if !any_reachable {
+                tracing::warn!("starting in degraded mode — no reachable mints");
+                let mh2 = Arc::clone(&mh);
+                let urls2 = urls.clone();
+                tokio::spawn(async move {
+                    mh2.aggressive_retry(&urls2, 300).await;
+                });
+            }
+
+            let payout_configs: Vec<payout::PayoutConfig> = config
+                .accepted_mints
+                .iter()
+                .map(|m| payout::PayoutConfig {
+                    mint_url: m.url.clone(),
+                    min_balance: m.min_balance,
+                    min_payout_amount: m.min_payout_amount,
+                    balance_tolerance_percent: m.balance_tolerance_percent,
+                    payout_interval_secs: m.payout_interval_seconds,
+                })
+                .collect();
+            let payout_shares: Vec<payout::ProfitShareEntry> = config
+                .profit_share
+                .iter()
+                .map(|ps| payout::ProfitShareEntry {
+                    factor: ps.factor,
+                    identity: ps.identity.clone(),
+                    lightning_address: None,
+                })
+                .collect();
+            if any_reachable {
+                let routine = payout::PayoutRoutine::new(payout_configs, payout_shares);
+                routine.start(wallet, Arc::clone(&mh));
+                tracing::info!("payout routine started");
+            }
+
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+            loop {
+                interval.tick().await;
+                mh.proactive_check(&urls).await;
+            }
+        });
+        tracing::info!("mint health probe + payout routine scheduled (background)");
+    }
+
     // Wait for shutdown signal
     let shutdown_int = tokio::signal::ctrl_c();
 
@@ -157,5 +222,12 @@ async fn main() {
 
     http_handle.abort();
     cli_handle.abort();
+    monitor_handle.abort();
+
+    if let Ok(mut mgr) = state.sessions.try_lock() {
+        if let Err(e) = mgr.save_to_disk(&config::config_dir()) {
+            tracing::warn!(error = %e, "failed to save sessions on shutdown");
+        }
+    }
     tracing::info!("shutdown complete");
 }
