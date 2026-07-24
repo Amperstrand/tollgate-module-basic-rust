@@ -80,12 +80,17 @@ pub fn load_install() -> Result<Option<InstallConfig>, String> {
 pub fn save_config(config: &Config) -> Result<(), String> {
     let path = config_path();
     let data = serde_json::to_vec_pretty(config).map_err(|e| e.to_string())?;
-    std::fs::write(&path, data).map_err(|e| e.to_string())?;
+
+    // Atomic write: write to temp file, then rename
+    let temp_path = path.with_extension("tmp");
+    std::fs::write(&temp_path, &data).map_err(|e| e.to_string())?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        std::fs::set_permissions(&temp_path, std::fs::Permissions::from_mode(0o600))
             .map_err(|e| e.to_string())?;
     }
+    std::fs::rename(&temp_path, &path).map_err(|e| e.to_string())?;
+
     Ok(())
 }

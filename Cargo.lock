@@ -2772,6 +2772,7 @@ dependencies = [
  "cdk-sqlite",
  "hex",
  "http-body-util",
+ "lazy_static",
  "rand 0.8.7",
  "reqwest",
  "secp256k1",
@@ -3446,3 +3447,13 @@ dependencies = [
  "cc",
  "pkg-config",
 ]
+
+[[patch.unused]]
+name = "cdk"
+version = "0.17.0"
+source = "git+https://github.com/Amperstrand/cdk.git?branch=fix%2Fmips-atomicusize#52caa4d2f3e22b8430bac07eb485554f8f67eba9"
+
+[[patch.unused]]
+name = "cdk-common"
+version = "0.17.0"
+source = "git+https://github.com/Amperstrand/cdk.git?branch=fix%2Fmips-atomicusize#52caa4d2f3e22b8430bac07eb485554f8f67eba9"

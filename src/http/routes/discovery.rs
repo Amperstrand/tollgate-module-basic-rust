@@ -42,7 +42,7 @@ pub async fn handle_discovery(State(state): State<AppState>) -> impl IntoRespons
     (
         StatusCode::OK,
         [
-            ("content-type", "application/json"),
+            ("content-type", "text/plain"),
             ("access-control-allow-origin", "*"),
         ],
         json,

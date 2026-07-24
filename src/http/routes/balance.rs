@@ -121,15 +121,10 @@ pub async fn handle_balance(
 fn balance_json(
     status: StatusCode,
     resp: BalanceResponse,
-) -> (
-    StatusCode,
-    [(&'static str, &'static str); 2],
-    String,
-) {
+) -> (StatusCode, [(&'static str, &'static str); 2], String) {
     let body = serde_json::to_string(&resp).unwrap_or_else(|_| {
         // Last-resort fallback — should never trigger for this struct.
-        r#"{"status":0,"session_active":false,"error":"serialization failed"}"#
-            .to_string()
+        r#"{"status":0,"session_active":false,"error":"serialization failed"}"#.to_string()
     });
     (
         status,
@@ -153,8 +148,7 @@ mod tests {
         // metric/start_time/error MUST be absent.
         let resp = BalanceResponse::no_session();
         let json = serde_json::to_string(&resp).expect("serialize");
-        let parsed: serde_json::Value =
-            serde_json::from_str(&json).expect("valid JSON");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
         let obj = parsed.as_object().expect("object");
         assert_eq!(obj.len(), 5, "exactly 5 fields, got {obj:?}");
         assert_eq!(obj["status"], 1);

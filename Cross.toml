@@ -1,0 +1,8 @@
+[build.env]
+passthrough = ["RUSTUP_TOOLCHAIN"]
+
+[target.mips-unknown-linux-musl]
+build-std = true
+
+[target.mipsel-unknown-linux-musl]
+build-std = true
