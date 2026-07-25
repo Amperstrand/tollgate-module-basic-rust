@@ -313,7 +313,7 @@ mod tests {
     #[tokio::test]
     async fn test_all_mints_reachable() {
         let tracker = MintHealthTracker::new();
-        let mints = vec![
+        let mints = [
             "https://mint-a.example".to_string(),
             "https://mint-b.example".to_string(),
         ];

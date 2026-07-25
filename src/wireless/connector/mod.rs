@@ -210,7 +210,7 @@ impl Connector {
             let trimmed = line.trim();
 
             if trimmed.starts_with("wireless.") && trimmed.contains("=wifi-iface") {
-                if let Some(name) = &current_name {
+                if let Some(_name) = &current_name {
                     sections.push(current.clone());
                 }
                 let name = trimmed
@@ -251,10 +251,8 @@ impl Connector {
             }
         }
 
-        if let Some(_) = &current_name {
-            if current.encryption.is_empty() || !current.ssid.is_empty() {
-                sections.push(current);
-            }
+        if current_name.is_some() && (current.encryption.is_empty() || !current.ssid.is_empty()) {
+            sections.push(current);
         }
 
         sections

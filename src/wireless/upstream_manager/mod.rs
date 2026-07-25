@@ -4,10 +4,7 @@
 //! (UCI commands to connect), and UpstreamSession (payment + usage tracking).
 //! It runs as a background tokio task with periodic checks.
 
-use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::Mutex;
 
 use super::connector::Connector;
 use super::scanner::Scanner;
@@ -198,7 +195,7 @@ impl UpstreamManager {
 
         let iface = self.sta_interface.as_deref().unwrap_or("wlan0");
         let signal = Connector::get_signal(iface);
-        let now = SystemTime::now()
+        let _now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();

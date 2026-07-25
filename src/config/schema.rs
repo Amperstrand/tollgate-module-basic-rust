@@ -148,7 +148,7 @@ impl Config {
         }
 
         if let Some(margin) = self.margin {
-            if margin < 0.0 || margin > 1.0 {
+            if !(0.0..=1.0).contains(&margin) {
                 errors.push(format!(
                     "margin must be between 0.0 and 1.0, got {}",
                     margin

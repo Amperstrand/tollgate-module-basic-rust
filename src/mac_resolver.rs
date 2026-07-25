@@ -84,7 +84,7 @@ pub fn get_client_ip(headers: &HeaderMap, remote_addr: Option<SocketAddr>) -> St
     let is_local = remote_addr.map(|sa| sa.ip().is_loopback()).unwrap_or(false);
 
     if is_local {
-        if let Some(real_ip) = headers.get(&HeaderName::from_static("x-real-ip")) {
+        if let Some(real_ip) = headers.get(HeaderName::from_static("x-real-ip")) {
             if let Ok(s) = real_ip.to_str() {
                 let trimmed = s.trim();
                 if !trimmed.is_empty() {
@@ -92,7 +92,7 @@ pub fn get_client_ip(headers: &HeaderMap, remote_addr: Option<SocketAddr>) -> St
                 }
             }
         }
-        if let Some(xff) = headers.get(&HeaderName::from_static("x-forwarded-for")) {
+        if let Some(xff) = headers.get(HeaderName::from_static("x-forwarded-for")) {
             if let Ok(s) = xff.to_str() {
                 if let Some(first) = s.split(',').next() {
                     let trimmed = first.trim();
@@ -237,7 +237,7 @@ mod tests {
     fn client_ip_ipv6_loopback_is_treated_as_local() {
         let mut headers = HeaderMap::new();
         headers.insert("x-real-ip", "2001:db8::1".parse().unwrap());
-        let sa: SocketAddr = format!("[::1]:443").parse().unwrap();
+        let sa: SocketAddr = "[::1]:443".to_string().parse().unwrap();
         let ip = get_client_ip(&headers, Some(sa));
         assert_eq!(ip, "2001:db8::1");
         // Sanity: exercise an Ipv6Addr parse path.

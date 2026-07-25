@@ -230,7 +230,7 @@ fn handle_config_set(rest: &str) -> String {
             + "\n";
     }
     let key = parts[0];
-    let value = parts[1];
+    let _value = parts[1];
     match key {
         "metric" | "step_size" => {
             serde_json::json!({

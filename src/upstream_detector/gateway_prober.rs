@@ -73,11 +73,9 @@ impl GatewayProber {
                 "step_size" => {
                     info.step_size = tag[1].parse().unwrap_or(0);
                 }
-                "price_per_step" => {
-                    if tag.len() >= 5 {
-                        info.price_per_step = tag[2].parse().unwrap_or(0);
-                        info.mint_url = tag[4].clone();
-                    }
+                "price_per_step" if tag.len() >= 5 => {
+                    info.price_per_step = tag[2].parse().unwrap_or(0);
+                    info.mint_url = tag[4].clone();
                 }
                 _ => {}
             }

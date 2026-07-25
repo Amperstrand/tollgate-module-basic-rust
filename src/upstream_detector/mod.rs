@@ -9,7 +9,6 @@ pub mod types;
 
 use crate::config::schema::UpstreamDetectorConfig;
 use gateway_prober::GatewayProber;
-use types::{EventType, NetworkEvent};
 
 pub struct UpstreamDetector {
     config: UpstreamDetectorConfig,

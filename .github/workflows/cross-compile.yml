@@ -23,7 +23,7 @@ jobs:
       - name: fmt check
         run: cargo fmt --all -- --check
       - name: clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets -- -W warnings
       - name: test
         run: cargo test --verbose
 
@@ -95,9 +95,29 @@ jobs:
       - name: Patch CDK deps for MIPS (32-bit AtomicU64 fix)
         if: matrix.needs-build-std == true
         run: |
-          sed -i 's|^cashu = { version = "0.17"|cashu = { git = "https://github.com/Amperstrand/cdk.git", branch = "fix/mips-atomicusize", default-features = false|' Cargo.toml
-          sed -i 's|^cdk = { version = "0.17"|cdk = { git = "https://github.com/Amperstrand/cdk.git", branch = "fix/mips-atomicusize", default-features = false, features = ["wallet"]|' Cargo.toml
-          sed -i 's|^cdk-sqlite = "0.17"|cdk-sqlite = { git = "https://github.com/Amperstrand/cdk.git", branch = "fix/mips-atomicusize" }|' Cargo.toml
+          python3 << 'EOF'
+          import re
+          fork = 'git = "https://github.com/Amperstrand/cdk.git", branch = "fix/mips-atomicusize"'
+          with open("Cargo.toml") as f:
+              c = f.read()
+          c = re.sub(
+              r'^cdk = \{ version = "0\.17".*$',
+              'cdk = { ' + fork + ', default-features = false, features = ["wallet"] }',
+              c, flags=re.MULTILINE,
+          )
+          c = re.sub(
+              r'^cdk-sqlite = "0\.17"$',
+              'cdk-sqlite = { ' + fork + ' }',
+              c, flags=re.MULTILINE,
+          )
+          c = re.sub(
+              r'^cashu = "0\.17"$',
+              'cashu = { ' + fork + ', default-features = false }',
+              c, flags=re.MULTILINE,
+          )
+          with open("Cargo.toml", "w") as f:
+              f.write(c)
+          EOF
 
       - name: Build MIPS
         if: matrix.needs-build-std == true

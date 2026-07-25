@@ -3,6 +3,12 @@ use crate::valve;
 
 pub struct NdsPortal;
 
+impl Default for NdsPortal {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl NdsPortal {
     pub fn new() -> Self {
         NdsPortal
