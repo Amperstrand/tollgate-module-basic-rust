@@ -11,6 +11,7 @@ pub mod mint_health;
 pub mod monitor;
 pub mod nostr_event;
 pub mod payout;
+pub mod portal;
 pub mod session;
 pub mod tracing_setup;
 pub mod valve;
