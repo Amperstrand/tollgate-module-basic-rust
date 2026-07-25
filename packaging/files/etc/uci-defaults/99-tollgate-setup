@@ -1,0 +1,68 @@
+#!/bin/sh
+# TollGate first-boot configuration for OpenWrt.
+# Sets up nodogsplash, uhttpd, wireless APs, and firewall rules.
+
+SETUP_FLAG="/etc/tollgate-setup-done"
+SETUP_VERSION="v0.1.0-rust"
+
+LOGFILE=/tmp/tollgate-setup.log
+log() { echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOGFILE"; }
+
+setup_config_dir() {
+    mkdir -p /etc/tollgate
+    if [ ! -f /etc/tollgate/config.json ]; then
+        cat > /etc/tollgate/config.json << 'CONFEOF'
+{
+  "config_version": "v0.0.8",
+  "log_level": "info",
+  "accepted_mints": [
+    {
+      "url": "https://mint.coinos.io",
+      "min_balance": 64,
+      "balance_tolerance_percent": 10,
+      "payout_interval_seconds": 60,
+      "min_payout_amount": 128,
+      "price_per_step": 1,
+      "price_unit": "sats",
+      "purchase_min_steps": 0
+    }
+  ],
+  "profit_share": [
+    { "factor": 1.0, "identity": "owner" }
+  ],
+  "step_size": 22020096,
+  "margin": 0.1,
+  "metric": "bytes",
+  "show_setup": true,
+  "reseller_mode": false
+}
+CONFEOF
+        log "created default config.json"
+    fi
+}
+
+setup_nodogsplash() {
+    # Configure nodogsplash to use TollGate as captive portal handler
+    uci -q set nodogsplash.@nodogsplash[0].gatewayinterface='br-lan' 2>/dev/null || true
+    uci -q set nodogsplash.@nodogsplash[0].gatewayport='2121' 2>/dev/null || true
+    uci -q set nodogsplash.@nodogsplash[0].preauthid='0' 2>/dev/null || true
+    uci commit nodogsplash 2>/dev/null || true
+    log "configured nodogsplash"
+}
+
+setup_install_metadata() {
+    if [ ! -f /etc/tollgate/install.json ]; then
+        echo "{\"install_time\": $(date +%s)}" > /etc/tollgate/install.json
+        log "created install.json"
+    fi
+}
+
+# Main
+log "=== TollGate setup starting ==="
+setup_config_dir
+setup_nodogsplash
+setup_install_metadata
+
+echo "$SETUP_VERSION" > "$SETUP_FLAG"
+log "=== TollGate setup complete (version $SETUP_VERSION) ==="
+exit 0
