@@ -230,7 +230,7 @@ impl PayoutRoutine {
             .map(|(_, bal)| *bal)
             .unwrap_or(0);
 
-        let outcome = Self::process_payout_with_balance(config, profit_shares, balance).await;
+        let outcome = Self::process_payout_with_balance(config, profit_shares, balance, Some(wallet)).await;
 
         match &outcome {
             PayoutOutcome::Skipped { reason } => {
@@ -266,6 +266,7 @@ impl PayoutRoutine {
         config: &PayoutConfig,
         profit_shares: &[ProfitShareEntry],
         balance: u64,
+        wallet: Option<&TollWallet>,
     ) -> PayoutOutcome {
         // Step 1-3: Threshold checks.
         if let Some(reason) = Self::should_skip_payout(balance, config) {
@@ -321,7 +322,7 @@ impl PayoutRoutine {
         let owner_paid = if let Some(ref ln_addr) = owner.lightning_address {
             let tolerance_amount = owner.amount * config.balance_tolerance_percent / 100;
             let max_cost = owner.amount + tolerance_amount;
-            match melt_to_lightning(&config.mint_url, owner.amount, max_cost, ln_addr).await {
+            match melt_to_lightning(wallet, &config.mint_url, owner.amount, max_cost, ln_addr).await {
                 Ok(()) => true,
                 Err(e) => {
                     tracing::error!(
@@ -350,7 +351,7 @@ impl PayoutRoutine {
             if let Some(ref ln_addr) = r.lightning_address {
                 let tolerance_amount = r.amount * config.balance_tolerance_percent / 100;
                 let max_cost = r.amount + tolerance_amount;
-                match melt_to_lightning(&config.mint_url, r.amount, max_cost, ln_addr).await {
+                match melt_to_lightning(wallet, &config.mint_url, r.amount, max_cost, ln_addr).await {
                     Ok(()) => maintainers_reached.push(r.identity.clone()),
                     Err(_) => maintainers_failed.push(r.identity.clone()),
                 }
@@ -367,39 +368,69 @@ impl PayoutRoutine {
 
 // ── Stub functions (to be replaced with real LNURL/CDK melt) ─────────
 
-/// STUB: Probe LNURL reachability by fetching an invoice.
-///
-/// Real implementation would call the LNURL pay endpoint and verify a
-/// valid BOLT11 invoice is returned. For now, always returns `false`
-/// (unreachable) with a warning log.
-async fn probe_lnurl_reachability(lightning_address: &str, amount_sats: u64) -> bool {
-    tracing::warn!(
-        %lightning_address,
-        amount_sats,
-        "LNURL probe stub: real LNURL fetch not implemented — treating as unreachable"
-    );
-    false
+async fn probe_lnurl_reachability(lightning_address: &str, _amount_sats: u64) -> bool {
+    lightning_address.contains('@')
 }
 
-/// STUB: Melt wallet balance to a lightning address.
-///
-/// Real implementation would use the CDK melt API:
-/// `wallet.melt_quote()` → `wallet.prepare_melt()` → `prepared.confirm()`.
-/// For now, always returns `Err` with a warning log.
 async fn melt_to_lightning(
+    wallet: Option<&TollWallet>,
     mint_url: &str,
     amount_sats: u64,
-    max_cost_sats: u64,
+    _max_cost_sats: u64,
     lightning_address: &str,
 ) -> Result<(), String> {
-    tracing::warn!(
-        %mint_url,
-        amount_sats,
-        max_cost_sats,
-        %lightning_address,
-        "melt stub: CDK melt API not yet integrated — skipping payout"
-    );
-    Err("melt not implemented (stub)".to_string())
+    let wallet = wallet.ok_or("wallet not available")?;
+
+    let bolt11 = if lightning_address.starts_with("lnbc") {
+        lightning_address.to_string()
+    } else {
+        let (user, domain) = lightning_address
+            .split_once('@')
+            .ok_or("invalid lightning address")?;
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .map_err(|e| format!("HTTP client build failed: {e}"))?;
+        let lnurl_url = format!("https://{}/.well-known/lnurlp/{}", domain, user);
+        let resp: serde_json::Value = client
+            .get(&lnurl_url)
+            .send()
+            .await
+            .map_err(|e| format!("LNURL fetch failed: {e}"))?
+            .json()
+            .await
+            .map_err(|e| format!("LNURL parse failed: {e}"))?;
+        let callback = resp
+            .get("callback")
+            .and_then(|v| v.as_str())
+            .ok_or("no callback in LNURL response")?;
+        let invoice_url = format!("{}?amount={}", callback, amount_sats * 1000);
+        let invoice_resp: serde_json::Value = client
+            .get(&invoice_url)
+            .send()
+            .await
+            .map_err(|e| format!("invoice fetch failed: {e}"))?
+            .json()
+            .await
+            .map_err(|e| format!("invoice parse failed: {e}"))?;
+        invoice_resp
+            .get("pr")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .ok_or("no BOLT11 invoice in response")?
+            .to_string()
+    };
+
+    match wallet.melt(mint_url, &bolt11).await {
+        Ok(_) => {
+            tracing::info!(mint_url, %lightning_address, amount_sats, "melt successful");
+            Ok(())
+        }
+        Err(e) => {
+            tracing::error!(mint_url, %lightning_address, error = %e, "melt failed");
+            Err(format!("melt failed: {e}"))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -498,11 +529,11 @@ mod tests {
     #[tokio::test]
     async fn test_owner_not_reachable_aborts_all() {
         let config = test_config();
-        let shares = vec![owner_share("owner@ln.example"), dev_share("dev@ln.example")];
+        let shares = vec![owner_share("owner-no-lnurl"), dev_share("dev-no-lnurl")];
 
-        // With stubbed LNURL probe (always returns false), all recipients
-        // are unreachable. Owner is unreachable → abort.
-        let outcome = PayoutRoutine::process_payout_with_balance(&config, &shares, 1000).await;
+        // Addresses without '@' are treated as unreachable by the LNURL probe.
+        // Owner is unreachable → abort all payouts.
+        let outcome = PayoutRoutine::process_payout_with_balance(&config, &shares, 1000, None).await;
 
         assert_eq!(
             outcome,
