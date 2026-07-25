@@ -1,6 +1,10 @@
 //! GET /whoami — returns plain text `mac=<MAC>`, or HTTP 500 if MAC cannot
 //! be resolved.
 //!
+// HTTP #2: A `GET` request on the `/whoami` endpoint MUST return http status `200 OK` with the body containing the customer's `<device-identifier>`
+// HTTP #2: Formatted as `[type]=[value]`
+
+//!
 //! Port of `tollgate-module-basic-go/src/main.go` `handler` (lines 356–368)
 //! bound at `/whoami` (line 769). Go's handler:
 //!

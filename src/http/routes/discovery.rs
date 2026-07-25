@@ -1,4 +1,10 @@
 //! GET / — Nostr kind 10021 discovery event.
+//!
+// TIP #1: `metric`: `milliseconds` or `bytes`
+// TIP #1: `tips`: List of implemented TollGate TIP's represented as numbers
+// TIP #2: `<bearer_asset_type>` Always `cashu`.
+// TIP #2: `price_per_step`: (one or more)
+// HTTP #1: A `GET` request on the root endpoint MAY return http `200 OK` response where the  body is a `kind=10021` TollGate Discovery event.
 
 use crate::http::AppState;
 use crate::nostr_event;

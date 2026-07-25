@@ -1,5 +1,10 @@
 //! GET /usage — returns plain text "used/total" or "-1/-1".
 //!
+// HTTP #3: A `GET` request on the `/usage` endpoint MUST return http status `200 OK` with the body containing the customer's current usage and allotment.
+// HTTP #3: Formatted as `[usage]/[allotment]`
+// HTTP #3: If the customer has no active session, the response MUST be `-1/-1`.
+
+//!
 //! Phase 4: queries SessionManager for the requesting client's session.
 //! The client MAC is sourced from X-Forwarded-For or remote_addr (matching
 //! Go behavior on OpenWrt where nodogsplash sets X-Forwarded-For).

@@ -1,0 +1,11 @@
+[sources.tip]
+format = "markdown"
+dir = "spec"
+pattern = "TIP-{id:02d}.md"
+comment_marker = "TIP"
+
+[sources.http]
+format = "markdown"
+dir = "spec"
+pattern = "HTTP-{id:02d}.md"
+comment_marker = "HTTP"

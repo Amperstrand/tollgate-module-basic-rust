@@ -3,6 +3,15 @@
 //! Accepts text/plain (Cashu token) or application/json (Nostr kind 21000).
 //! Phase 4: verifies token, receives into wallet, creates session, returns
 //! kind 1022 on success or kind 21023 + HTTP 400 on failure.
+//!
+// HTTP #1: The Server MUST take a http `POST` request containing a bearer asset token directly in the request body.
+// HTTP #1: If the TollGate accepts the provided payment it MUST return http `200 OK` response where the body is a `kind=1022` TollGate Session event.
+// HTTP #1: If the payment is invalid, it SHOULD return a `kind=21023` Notice event with an appropriate error code, and MAY use http `402 Payment Required` or `400 Bad Request` status.
+// TIP #1: `p`: pubkey of the TollCustomer Gate (from the Customer's Payment event)
+// TIP #1: `device-identifier`: (hardware) identifier of the customer's device.
+// TIP #1: `allotment`: Amount of `<metric>` allotted to customer after payment.
+// TIP #1: `metric`: The purchased metric
+
 
 use crate::http::AppState;
 use crate::mac_resolver::{get_client_ip, get_mac_address};
