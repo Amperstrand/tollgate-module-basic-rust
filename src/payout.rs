@@ -17,11 +17,11 @@
 //! 8. Pay owner first (melt to lightning).
 //! 9. Phase 3: Pay remaining reachable maintainers.
 //!
-//! # Stub Note
+//! # LNURL + Melt
 //!
-//! The actual LNURL reachability probe and wallet melt are stubbed — they log
-//! warnings and return `unreachable`/`Err`. The structure and algorithm are
-//! complete so wiring real CDK melt calls later is a drop-in replacement.
+//! LNURL reachability probes use `reqwest` to resolve lightning addresses
+//! (user@domain) via the LNURL-pay flow (`.well-known/lnurlp/<user>`).
+//! Melt calls are wired to the CDK wallet's `melt()` method.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -230,7 +230,7 @@ impl PayoutRoutine {
             .map(|(_, bal)| *bal)
             .unwrap_or(0);
 
-        let outcome = Self::process_payout_with_balance(config, profit_shares, balance).await;
+        let outcome = Self::process_payout_with_balance(config, profit_shares, balance, Some(wallet)).await;
 
         match &outcome {
             PayoutOutcome::Skipped { reason } => {
@@ -260,12 +260,13 @@ impl PayoutRoutine {
 
     /// Core payout algorithm with a pre-fetched balance.
     ///
-    /// This is the testable core — it doesn't need a wallet or network.
-    /// The LNURL probe and melt calls are stubbed.
+    /// Pass `wallet: Some(&TollWallet)` in production to enable real melts.
+    /// Pass `wallet: None` in unit tests (melt calls will return Err).
     pub async fn process_payout_with_balance(
         config: &PayoutConfig,
         profit_shares: &[ProfitShareEntry],
         balance: u64,
+        wallet: Option<&TollWallet>,
     ) -> PayoutOutcome {
         // Step 1-3: Threshold checks.
         if let Some(reason) = Self::should_skip_payout(balance, config) {
@@ -321,7 +322,7 @@ impl PayoutRoutine {
         let owner_paid = if let Some(ref ln_addr) = owner.lightning_address {
             let tolerance_amount = owner.amount * config.balance_tolerance_percent / 100;
             let max_cost = owner.amount + tolerance_amount;
-            match melt_to_lightning(&config.mint_url, owner.amount, max_cost, ln_addr).await {
+            match melt_to_lightning(wallet, &config.mint_url, owner.amount, max_cost, ln_addr).await {
                 Ok(()) => true,
                 Err(e) => {
                     tracing::error!(
@@ -350,7 +351,7 @@ impl PayoutRoutine {
             if let Some(ref ln_addr) = r.lightning_address {
                 let tolerance_amount = r.amount * config.balance_tolerance_percent / 100;
                 let max_cost = r.amount + tolerance_amount;
-                match melt_to_lightning(&config.mint_url, r.amount, max_cost, ln_addr).await {
+                match melt_to_lightning(wallet, &config.mint_url, r.amount, max_cost, ln_addr).await {
                     Ok(()) => maintainers_reached.push(r.identity.clone()),
                     Err(_) => maintainers_failed.push(r.identity.clone()),
                 }
@@ -365,41 +366,147 @@ impl PayoutRoutine {
     }
 }
 
-// ── Stub functions (to be replaced with real LNURL/CDK melt) ─────────
+// ── LNURL resolution + melt ──────────────────────────────────────────
 
-/// STUB: Probe LNURL reachability by fetching an invoice.
-///
-/// Real implementation would call the LNURL pay endpoint and verify a
-/// valid BOLT11 invoice is returned. For now, always returns `false`
-/// (unreachable) with a warning log.
-async fn probe_lnurl_reachability(lightning_address: &str, amount_sats: u64) -> bool {
-    tracing::warn!(
-        %lightning_address,
-        amount_sats,
-        "LNURL probe stub: real LNURL fetch not implemented — treating as unreachable"
-    );
-    false
+async fn resolve_lightning_address(
+    lightning_address: &str,
+    amount_msats: u64,
+) -> Option<String> {
+    let (user, domain) = lightning_address.split_once('@')?;
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .ok()?;
+
+    let lnurl_url = format!("https://{}/.well-known/lnurlp/{}", domain, user);
+    let resp: serde_json::Value = client
+        .get(&lnurl_url)
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+
+    let callback = resp.get("callback")?.as_str()?;
+
+    let invoice_url = format!("{}?amount={}", callback, amount_msats);
+    let invoice_resp: serde_json::Value = client
+        .get(&invoice_url)
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+
+    let pr = invoice_resp.get("pr")?.as_str()?;
+    if pr.is_empty() {
+        return None;
+    }
+    Some(pr.to_string())
 }
 
-/// STUB: Melt wallet balance to a lightning address.
-///
-/// Real implementation would use the CDK melt API:
-/// `wallet.melt_quote()` → `wallet.prepare_melt()` → `prepared.confirm()`.
-/// For now, always returns `Err` with a warning log.
+async fn probe_lnurl_reachability(lightning_address: &str, _amount_sats: u64) -> bool {
+    if lightning_address.starts_with("lnbc") {
+        return true;
+    }
+
+    let (user, domain) = match lightning_address.split_once('@') {
+        Some(parts) => parts,
+        None => {
+            tracing::warn!(
+                %lightning_address,
+                "invalid lightning address format (expected user@domain)"
+            );
+            return false;
+        }
+    };
+
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(%lightning_address, error = %e, "failed to build HTTP client");
+            return false;
+        }
+    };
+
+    let lnurl_url = format!("https://{}/.well-known/lnurlp/{}", domain, user);
+    match client.get(&lnurl_url).send().await {
+        Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>().await {
+            Ok(v) if v.get("callback").is_some() => {
+                tracing::debug!(%lightning_address, "LNURL probe successful");
+                true
+            }
+            _ => {
+                tracing::warn!(%lightning_address, "LNURL endpoint missing callback field");
+                false
+            }
+        },
+        Ok(resp) => {
+            tracing::warn!(%lightning_address, status = %resp.status(), "LNURL endpoint non-success");
+            false
+        }
+        Err(e) => {
+            tracing::warn!(%lightning_address, error = %e, "LNURL probe failed");
+            false
+        }
+    }
+}
+
 async fn melt_to_lightning(
+    wallet: Option<&TollWallet>,
     mint_url: &str,
     amount_sats: u64,
     max_cost_sats: u64,
     lightning_address: &str,
 ) -> Result<(), String> {
-    tracing::warn!(
-        %mint_url,
-        amount_sats,
-        max_cost_sats,
-        %lightning_address,
-        "melt stub: CDK melt API not yet integrated — skipping payout"
-    );
-    Err("melt not implemented (stub)".to_string())
+    let wallet = wallet.ok_or_else(|| "wallet not available for melt".to_string())?;
+
+    let bolt11 = if lightning_address.starts_with("lnbc") {
+        lightning_address.to_string()
+    } else {
+        let amount_msats = amount_sats.saturating_mul(1000);
+        resolve_lightning_address(lightning_address, amount_msats)
+            .await
+            .ok_or_else(|| format!("failed to resolve LNURL for {}", lightning_address))?
+    };
+
+    match wallet.melt(mint_url, &bolt11).await {
+        Ok(info) => {
+            let total_cost = info.amount.saturating_add(info.fee);
+            if total_cost > max_cost_sats {
+                tracing::warn!(
+                    %mint_url,
+                    quote_id = %info.quote_id,
+                    actual_cost = total_cost,
+                    max_cost_sats,
+                    "melt fee exceeded tolerance threshold"
+                );
+            } else {
+                tracing::info!(
+                    %mint_url,
+                    quote_id = %info.quote_id,
+                    amount = info.amount,
+                    fee = info.fee,
+                    "melt successful"
+                );
+            }
+            Ok(())
+        }
+        Err(e) => {
+            tracing::error!(%mint_url, error = %e, "melt failed");
+            Err(format!("melt failed: {}", e))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -500,9 +607,9 @@ mod tests {
         let config = test_config();
         let shares = vec![owner_share("owner@ln.example"), dev_share("dev@ln.example")];
 
-        // With stubbed LNURL probe (always returns false), all recipients
-        // are unreachable. Owner is unreachable → abort.
-        let outcome = PayoutRoutine::process_payout_with_balance(&config, &shares, 1000).await;
+        // "ln.example" is a reserved TLD that won't resolve — probe returns
+        // false for all recipients. Owner is unreachable → abort.
+        let outcome = PayoutRoutine::process_payout_with_balance(&config, &shares, 1000, None).await;
 
         assert_eq!(
             outcome,

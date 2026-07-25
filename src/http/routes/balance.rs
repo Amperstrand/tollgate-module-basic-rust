@@ -83,7 +83,8 @@ pub async fn handle_balance(
         // matching Go's "MAC lookup failed" branch.
         return balance_json(StatusCode::OK, BalanceResponse::no_session());
     }
-    let mac = mac.expect("checked None above");
+    // Safe: we returned early above if mac was None.
+    let mac = mac.unwrap_or_default();
 
     // Look up the session for this MAC.
     let sessions = state.sessions.lock().await;
