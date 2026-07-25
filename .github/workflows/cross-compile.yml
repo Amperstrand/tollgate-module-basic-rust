@@ -92,6 +92,13 @@ jobs:
         with:
           components: rust-src
 
+      - name: Patch CDK deps for MIPS (32-bit AtomicU64 fix)
+        if: matrix.needs-build-std == true
+        run: |
+          sed -i 's|^cashu = { version = "0.17"|cashu = { git = "https://github.com/Amperstrand/cdk.git", branch = "fix/mips-atomicusize", default-features = false|' Cargo.toml
+          sed -i 's|^cdk = { version = "0.17"|cdk = { git = "https://github.com/Amperstrand/cdk.git", branch = "fix/mips-atomicusize", default-features = false, features = ["wallet"]|' Cargo.toml
+          sed -i 's|^cdk-sqlite = "0.17"|cdk-sqlite = { git = "https://github.com/Amperstrand/cdk.git", branch = "fix/mips-atomicusize" }|' Cargo.toml
+
       - name: Build MIPS
         if: matrix.needs-build-std == true
         run: |
