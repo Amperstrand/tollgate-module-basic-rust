@@ -17,3 +17,4 @@ pub mod tracing_setup;
 pub mod upstream_detector;
 pub mod valve;
 pub mod wallet;
+pub mod wireless;
