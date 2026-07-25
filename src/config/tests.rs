@@ -310,3 +310,112 @@ fn deserializes_upstream_detector_and_session_defaults() {
     let _: &UpstreamDetectorConfig = &cfg.upstream_detector;
     let _: &UpstreamWifiConfig = &cfg.upstream_wifi;
 }
+
+#[test]
+fn validate_rejects_empty_mints() {
+    let mut cfg = Config::new_default();
+    cfg.accepted_mints.clear();
+    let errors = cfg.validate().unwrap_err();
+    assert!(errors.iter().any(|e| e.contains("accepted_mints is empty")));
+}
+
+#[test]
+fn validate_rejects_invalid_metric() {
+    let mut cfg = Config::new_default();
+    cfg.metric = "seconds".to_string();
+    let errors = cfg.validate().unwrap_err();
+    assert!(errors.iter().any(|e| e.contains("metric must be")));
+}
+
+#[test]
+fn validate_rejects_zero_step_size() {
+    let mut cfg = Config::new_default();
+    cfg.step_size = 0;
+    let errors = cfg.validate().unwrap_err();
+    assert!(errors.iter().any(|e| e.contains("step_size must be greater than 0")));
+}
+
+#[test]
+fn validate_rejects_bad_mint_url() {
+    let mut cfg = Config::new_default();
+    cfg.accepted_mints[0].url = "not-a-url".to_string();
+    let errors = cfg.validate().unwrap_err();
+    assert!(errors.iter().any(|e| e.contains("must start with http")));
+}
+
+#[test]
+fn validate_rejects_bad_price_unit() {
+    let mut cfg = Config::new_default();
+    cfg.accepted_mints[0].price_unit = "usd".to_string();
+    let errors = cfg.validate().unwrap_err();
+    assert!(errors.iter().any(|e| e.contains("price_unit must be")));
+}
+
+#[test]
+fn validate_rejects_profit_share_out_of_range() {
+    let mut cfg = Config::new_default();
+    cfg.profit_share[0].factor = 1.5;
+    let errors = cfg.validate().unwrap_err();
+    assert!(errors.iter().any(|e| e.contains("factor must be between 0.0 and 1.0")));
+}
+
+#[test]
+fn validate_rejects_margin_out_of_range() {
+    let mut cfg = Config::new_default();
+    cfg.margin = Some(1.5);
+    let errors = cfg.validate().unwrap_err();
+    assert!(errors.iter().any(|e| e.contains("margin must be between")));
+}
+
+#[test]
+fn validate_accepts_valid_config() {
+    let cfg = Config::new_default();
+    assert!(cfg.validate().is_ok());
+}
+
+#[test]
+fn validate_collects_multiple_errors() {
+    let mut cfg = Config::new_default();
+    cfg.accepted_mints.clear();
+    cfg.metric = "bad".to_string();
+    cfg.step_size = 0;
+    let errors = cfg.validate().unwrap_err();
+    assert_eq!(errors.len(), 3);
+}
+
+#[test]
+fn ensure_current_version_updates_old_version() {
+    let mut cfg = Config::new_default();
+    cfg.config_version = "v0.0.1".to_string();
+    assert!(cfg.ensure_current_version());
+    assert_eq!(cfg.config_version, "v0.0.8");
+}
+
+#[test]
+fn ensure_current_version_noop_on_current() {
+    let mut cfg = Config::new_default();
+    assert!(!cfg.ensure_current_version());
+}
+
+#[test]
+fn ensure_defaults_fills_missing_fields() {
+    let mut cfg = Config::new_default();
+    cfg.accepted_mints.clear();
+    cfg.profit_share.clear();
+    cfg.step_size = 0;
+    cfg.log_level = "".to_string();
+    cfg.config_version = "".to_string();
+
+    assert!(cfg.ensure_defaults());
+    assert!(!cfg.accepted_mints.is_empty());
+    assert!(!cfg.profit_share.is_empty());
+    assert_eq!(cfg.step_size, 22020096);
+    assert_eq!(cfg.log_level, "info");
+    assert_eq!(cfg.config_version, "v0.0.8");
+}
+
+#[test]
+fn ensure_defaults_noop_when_already_set() {
+    let mut cfg = Config::new_default();
+    assert!(!cfg.ensure_defaults());
+}
