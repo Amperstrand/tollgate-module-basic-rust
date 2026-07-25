@@ -108,6 +108,40 @@ fn create_session_overwrites_existing() {
 }
 
 #[test]
+fn test_add_allotment_creates_new_session() {
+    let mut mgr = SessionManager::new();
+    let extended = mgr.add_allotment("aa:bb:cc:dd:ee:ff", "bytes", 1000, 3600);
+    assert!(!extended, "should return false for newly created session");
+    let s = mgr
+        .get_session("aa:bb:cc:dd:ee:ff")
+        .expect("session exists");
+    assert_eq!(s.allotment, 1000);
+    assert_eq!(s.metric, "bytes");
+    assert_eq!(s.used, 0);
+}
+
+#[test]
+fn test_add_allotment_extends_existing_session() {
+    let mut mgr = SessionManager::new();
+    mgr.create_session("aa:bb:cc:dd:ee:ff", 1000, "bytes", 3600);
+    let extended = mgr.add_allotment("aa:bb:cc:dd:ee:ff", "bytes", 500, 3600);
+    assert!(extended, "should return true for extended session");
+    let s = mgr.get_session("aa:bb:cc:dd:ee:ff").unwrap();
+    assert_eq!(s.allotment, 1500, "allotment should be 1000 + 500");
+}
+
+#[test]
+fn test_add_allotment_resets_used() {
+    let mut mgr = SessionManager::new();
+    mgr.create_session("aa:bb:cc:dd:ee:ff", 1000, "bytes", 3600);
+    mgr.update_usage("aa:bb:cc:dd:ee:ff", 500);
+    let extended = mgr.add_allotment("aa:bb:cc:dd:ee:ff", "bytes", 500, 3600);
+    assert!(extended);
+    let s = mgr.get_session("aa:bb:cc:dd:ee:ff").unwrap();
+    assert_eq!(s.used, 0, "used should be reset to 0 on extension");
+}
+
+#[test]
 fn test_save_and_load_roundtrip() {
     let tmp = tempfile::tempdir().expect("failed to create temp dir");
 

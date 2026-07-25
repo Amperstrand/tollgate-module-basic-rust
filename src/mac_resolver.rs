@@ -81,9 +81,7 @@ pub fn get_mac_address(ip: &str) -> Option<String> {
 /// We replicate that guard: forwarding headers are consulted iff
 /// `remote_addr` is a loopback address.
 pub fn get_client_ip(headers: &HeaderMap, remote_addr: Option<SocketAddr>) -> String {
-    let is_local = remote_addr
-        .map(|sa| sa.ip().is_loopback())
-        .unwrap_or(false);
+    let is_local = remote_addr.map(|sa| sa.ip().is_loopback()).unwrap_or(false);
 
     if is_local {
         if let Some(real_ip) = headers.get(&HeaderName::from_static("x-real-ip")) {
@@ -120,10 +118,7 @@ mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4};
 
     fn make_v4(ip: &str, port: u16) -> SocketAddr {
-        SocketAddr::V4(SocketAddrV4::new(
-            ip.parse::<Ipv4Addr>().unwrap(),
-            port,
-        ))
+        SocketAddr::V4(SocketAddrV4::new(ip.parse::<Ipv4Addr>().unwrap(), port))
     }
 
     // ── get_mac_address ────────────────────────────────────────────────
@@ -142,10 +137,7 @@ mod tests {
         // (clean env), skip gracefully rather than fail.
         let resolved = get_mac_address("127.0.0.1");
         if let Some(mac) = resolved {
-            assert!(
-                mac.contains(':'),
-                "expected colon-separated MAC, got {mac}"
-            );
+            assert!(mac.contains(':'), "expected colon-separated MAC, got {mac}");
             assert_ne!(mac, "00:00:00:00:00:00");
         }
     }

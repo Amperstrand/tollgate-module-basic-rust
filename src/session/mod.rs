@@ -64,6 +64,36 @@ impl SessionManager {
         session
     }
 
+    /// Add allotment to an existing session, or create a new one if none
+    /// exists. Returns `true` if an existing session was extended, `false`
+    /// if a new session was created. Extending resets `used` to 0 and
+    /// refreshes `granted_at` / `expiry`.
+    pub fn add_allotment(
+        &mut self,
+        mac: &str,
+        metric: &str,
+        amount: u64,
+        duration_secs: u64,
+    ) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        match self.sessions.get_mut(mac) {
+            Some(session) => {
+                session.allotment += amount;
+                session.granted_at = now;
+                session.used = 0;
+                session.expiry = now + duration_secs;
+                true
+            }
+            None => {
+                self.create_session(mac, amount, metric, duration_secs);
+                false
+            }
+        }
+    }
+
     /// Look up a session by MAC address.
     pub fn get_session(&self, mac: &str) -> Option<&CustomerSession> {
         self.sessions.get(mac)
@@ -124,11 +154,8 @@ impl SessionManager {
             .unwrap_or_default()
             .as_secs();
         let path = dir.join("sessions.json");
-        let data: Vec<&CustomerSession> = self
-            .sessions
-            .values()
-            .filter(|s| s.expiry > now)
-            .collect();
+        let data: Vec<&CustomerSession> =
+            self.sessions.values().filter(|s| s.expiry > now).collect();
         let json = serde_json::to_string_pretty(&data)?;
         let tmp = dir.join("sessions.json.tmp");
         std::fs::write(&tmp, json)?;

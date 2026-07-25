@@ -94,7 +94,10 @@ async fn run_ndsctl_with_retry(
 
         if output.status.success() {
             tracing::debug!(
-                action, mac, attempt = attempt + 1, max_retries,
+                action,
+                mac,
+                attempt = attempt + 1,
+                max_retries,
                 "ndsctl succeeded"
             );
             return Ok(());
@@ -187,8 +190,8 @@ mod tests {
     async fn success_on_first_attempt() {
         let dir = tempfile::tempdir().expect("tempdir");
         let bin = write_script(dir.path(), "ndsctl", "#!/bin/sh\nexit 0\n");
-        let res = run_ndsctl_with_retry(bin.to_str().unwrap(), "auth", "aa:bb:cc:dd:ee:ff", 5, 1)
-            .await;
+        let res =
+            run_ndsctl_with_retry(bin.to_str().unwrap(), "auth", "aa:bb:cc:dd:ee:ff", 5, 1).await;
         assert!(res.is_ok(), "expected Ok, got {:?}", res);
     }
 
@@ -210,8 +213,8 @@ if [ \"$n\" -lt 3 ]; then\n\
 fi\n\
 exit 0\n";
         let bin = write_script(dir.path(), "ndsctl", script);
-        let res = run_ndsctl_with_retry(bin.to_str().unwrap(), "auth", "11:22:33:44:55:66", 5, 1)
-            .await;
+        let res =
+            run_ndsctl_with_retry(bin.to_str().unwrap(), "auth", "11:22:33:44:55:66", 5, 1).await;
         assert!(res.is_ok(), "expected Ok after retry, got {:?}", res);
 
         let count: u32 = std::fs::read_to_string(dir.path().join("count"))
@@ -229,8 +232,8 @@ exit 0\n";
         let dir = tempfile::tempdir().expect("tempdir");
         let script = "#!/bin/sh\necho 'Client already authorized' >&2\nexit 1\n";
         let bin = write_script(dir.path(), "ndsctl", script);
-        let res = run_ndsctl_with_retry(bin.to_str().unwrap(), "auth", "aa:bb:cc:dd:ee:ff", 3, 1)
-            .await;
+        let res =
+            run_ndsctl_with_retry(bin.to_str().unwrap(), "auth", "aa:bb:cc:dd:ee:ff", 3, 1).await;
         assert!(res.is_ok(), "expected Ok for already-authed, got {:?}", res);
     }
 
@@ -242,8 +245,8 @@ exit 0\n";
         let dir = tempfile::tempdir().expect("tempdir");
         let script = "#!/bin/sh\necho 'Client not found' >&2\nexit 1\n";
         let bin = write_script(dir.path(), "ndsctl", script);
-        let res = run_ndsctl_with_retry(bin.to_str().unwrap(), "deauth", "aa:bb:cc:dd:ee:ff", 3, 1)
-            .await;
+        let res =
+            run_ndsctl_with_retry(bin.to_str().unwrap(), "deauth", "aa:bb:cc:dd:ee:ff", 3, 1).await;
         assert!(res.is_ok(), "expected Ok for not-found, got {:?}", res);
     }
 
@@ -254,8 +257,8 @@ exit 0\n";
         let dir = tempfile::tempdir().expect("tempdir");
         let script = "#!/bin/sh\necho 'permission denied' >&2\nexit 1\n";
         let bin = write_script(dir.path(), "ndsctl", script);
-        let res = run_ndsctl_with_retry(bin.to_str().unwrap(), "auth", "aa:bb:cc:dd:ee:ff", 3, 1)
-            .await;
+        let res =
+            run_ndsctl_with_retry(bin.to_str().unwrap(), "auth", "aa:bb:cc:dd:ee:ff", 3, 1).await;
         assert!(
             res.is_err(),
             "expected Err after exhausting retries, got {:?}",
@@ -280,7 +283,11 @@ exit 0\n";
             1,
         )
         .await;
-        assert!(res.is_err(), "expected Err for missing binary, got {:?}", res);
+        assert!(
+            res.is_err(),
+            "expected Err for missing binary, got {:?}",
+            res
+        );
         let err = res.unwrap_err();
         assert!(
             err.contains("failed to start"),

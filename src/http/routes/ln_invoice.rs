@@ -6,6 +6,7 @@ use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use serde::{Deserialize, Serialize};
+use std::sync::Mutex;
 
 #[derive(Debug, Deserialize)]
 pub struct CreateInvoiceRequest {
@@ -36,12 +37,48 @@ struct InvoiceStatus {
     expiry: u64,
 }
 
+#[derive(Debug, Clone)]
+struct QuoteRecord {
+    created_at: u64,
+    amount: u64,
+}
+
+type QuoteStore = std::sync::Mutex<std::collections::HashMap<String, QuoteRecord>>;
+
+static QUOTE_STORE: std::sync::OnceLock<QuoteStore> = std::sync::OnceLock::new();
+
+fn quote_store() -> &'static QuoteStore {
+    QUOTE_STORE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
 pub async fn handle_create_ln_invoice(
     State(_state): State<AppState>,
     axum::Json(req): axum::Json<CreateInvoiceRequest>,
 ) -> impl IntoResponse {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let quote_id = format!("stub-quote-{}", req.amount);
+
+    // Insert new quote and clean up old ones
+    {
+        let mut store = quote_store().lock().unwrap();
+        store.insert(
+            quote_id.clone(),
+            QuoteRecord {
+                created_at: now,
+                amount: req.amount,
+            },
+        );
+
+        // Remove quotes older than 30 minutes (1800 seconds)
+        store.retain(|_, rec| now - rec.created_at < 1800);
+    }
+
     let resp = InvoiceResponse {
-        quote: format!("stub-quote-{}", req.amount),
+        quote: quote_id,
         request: "stub-invoice".to_string(),
         pubkey: "stub-pubkey".to_string(),
     };

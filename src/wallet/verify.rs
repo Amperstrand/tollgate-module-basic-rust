@@ -89,7 +89,7 @@ impl TokenVerifier {
 
         for state in states {
             let s = state["state"].as_str().unwrap_or("");
-            if s != "UNSPENT" {
+            if s.to_uppercase() != "UNSPENT" {
                 return Err(format!("one or more proofs already spent (state: {s})"));
             }
         }

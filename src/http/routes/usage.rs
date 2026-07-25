@@ -5,62 +5,50 @@
 //! Go behavior on OpenWrt where nodogsplash sets X-Forwarded-For).
 
 use crate::http::AppState;
-use axum::extract::State;
+use crate::mac_resolver::{get_client_ip, get_mac_address};
+use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
+use std::net::SocketAddr;
 
-pub async fn handle_usage(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    // Try to get client MAC from X-Forwarded-For or other headers.
-    // In production, nodogsplash provides the client IP, which we'd resolve
-    // to MAC via ARP. For now, we use the IP as a session key proxy.
-    let client_key = headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.split(',').next().unwrap_or("").trim().to_string())
-        .or_else(|| {
-            headers
-                .get("x-real-ip")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string())
-        })
-        .unwrap_or_default();
+pub async fn handle_usage(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+) -> impl IntoResponse {
+    let client_ip = get_client_ip(&headers, Some(remote_addr));
+    let mac = match get_mac_address(&client_ip) {
+        Some(m) => m,
+        None => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [("content-type", "text/plain"), ("access-control-allow-origin", "*")],
+                "-1/-1".to_string(),
+            );
+        }
+    };
 
     let sessions = state.sessions.lock().await;
-    if client_key.is_empty() {
-        drop(sessions);
-        return usage_response("-1/-1");
-    }
-
-    match sessions.get_session(&client_key) {
-        Some(session) if sessions.is_active(&client_key) => {
+    match sessions.get_session(&mac) {
+        Some(session) if sessions.is_active(&mac) => {
             let used = session.used;
             let total = session.allotment;
             drop(sessions);
-            usage_response(format!("{used}/{total}"))
+            (
+                StatusCode::OK,
+                [("content-type", "text/plain"), ("access-control-allow-origin", "*")],
+                format!("{used}/{total}"),
+            )
         }
-        Some(_) => {
-            // Session exists but expired or exhausted
+        _ => {
             drop(sessions);
-            usage_response("-1/-1")
-        }
-        None => {
-            drop(sessions);
-            usage_response("-1/-1")
+            (
+                StatusCode::OK,
+                [("content-type", "text/plain"), ("access-control-allow-origin", "*")],
+                "-1/-1".to_string(),
+            )
         }
     }
-}
-
-fn usage_response(
-    body: impl Into<String>,
-) -> (StatusCode, [(&'static str, &'static str); 2], String) {
-    (
-        StatusCode::OK,
-        [
-            ("content-type", "text/plain"),
-            ("access-control-allow-origin", "*"),
-        ],
-        body.into(),
-    )
 }
 
 #[cfg(test)]
