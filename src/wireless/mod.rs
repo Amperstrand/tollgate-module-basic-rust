@@ -6,7 +6,9 @@
 pub mod connector;
 pub mod scanner;
 pub mod types;
+pub mod upstream_manager;
 
 pub use connector::Connector;
 pub use scanner::Scanner;
 pub use types::{Gateway, NetworkInfo, StaSection, UpstreamWifiConfig};
+pub use upstream_manager::{UpstreamManager, ManagerAction, ManagerStatus};
