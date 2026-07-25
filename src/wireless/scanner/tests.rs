@@ -1,5 +1,5 @@
-use super::Scanner;
 use super::super::types::*;
+use super::Scanner;
 
 const SAMPLE_IWINFO_OUTPUT: &str = "\
 Cell 01 - Address: AA:BB:CC:DD:EE:FF

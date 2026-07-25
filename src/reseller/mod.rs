@@ -6,4 +6,4 @@
 
 pub mod upstream_session;
 
-pub use upstream_session::{UpstreamSession, UpstreamPaymentResult};
+pub use upstream_session::{UpstreamPaymentResult, UpstreamSession};

@@ -78,7 +78,9 @@ impl Scanner {
                             bssid: bssid.clone(),
                             ssid: ssid.clone(),
                             signal: current_signal.unwrap_or(-100),
-                            encryption: current_encryption.clone().unwrap_or_else(|| "unknown".to_string()),
+                            encryption: current_encryption
+                                .clone()
+                                .unwrap_or_else(|| "unknown".to_string()),
                             radio: radio.to_string(),
                         });
                     }
@@ -109,10 +111,7 @@ impl Scanner {
                         .ok();
                 }
             } else if trimmed.starts_with("Encryption:") {
-                let enc = trimmed
-                    .strip_prefix("Encryption:")
-                    .unwrap_or("")
-                    .trim();
+                let enc = trimmed.strip_prefix("Encryption:").unwrap_or("").trim();
                 if !enc.is_empty() && enc != "none" {
                     current_encryption = Some(enc.to_string());
                 } else {
@@ -127,7 +126,9 @@ impl Scanner {
                     bssid: bssid.clone(),
                     ssid: ssid.clone(),
                     signal: current_signal.unwrap_or(-100),
-                    encryption: current_encryption.clone().unwrap_or_else(|| "unknown".to_string()),
+                    encryption: current_encryption
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_string()),
                     radio: radio.to_string(),
                 });
             }

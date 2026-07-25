@@ -4,12 +4,12 @@
 //! detects the upstream gateway, probes it to confirm it's a TollGate,
 //! and reports it to the upstream session manager.
 
-pub mod types;
 pub mod gateway_prober;
+pub mod types;
 
-use types::{NetworkEvent, EventType};
-use gateway_prober::GatewayProber;
 use crate::config::schema::UpstreamDetectorConfig;
+use gateway_prober::GatewayProber;
+use types::{EventType, NetworkEvent};
 
 pub struct UpstreamDetector {
     config: UpstreamDetectorConfig,
@@ -139,8 +139,7 @@ fn read_default_gateways() -> Result<Vec<RawGateway>, String> {
             continue;
         }
 
-        let ip = hex_to_ip(gateway_hex)
-            .unwrap_or_else(|| format!("unparseable:{gateway_hex}"));
+        let ip = hex_to_ip(gateway_hex).unwrap_or_else(|| format!("unparseable:{gateway_hex}"));
 
         let mac = lookup_mac(&ip).unwrap_or_default();
 

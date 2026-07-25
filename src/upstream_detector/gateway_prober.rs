@@ -51,7 +51,10 @@ impl GatewayProber {
             .map_err(|e| format!("parse discovery event: {e}"))?;
 
         if event.kind != 10021 {
-            return Err(format!("not a TollGate (kind={}, expected 10021)", event.kind));
+            return Err(format!(
+                "not a TollGate (kind={}, expected 10021)",
+                event.kind
+            ));
         }
 
         let mut info = GatewayInfo {

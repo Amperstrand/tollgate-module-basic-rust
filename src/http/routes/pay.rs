@@ -12,7 +12,6 @@
 // TIP #1: `allotment`: Amount of `<metric>` allotted to customer after payment.
 // TIP #1: `metric`: The purchased metric
 
-
 use crate::http::AppState;
 use crate::mac_resolver::{get_client_ip, get_mac_address};
 use crate::nostr_event;
@@ -234,15 +233,12 @@ pub async fn handle_pay(
     let allotment = (received_amount / price_per_step) * step_size;
 
     let mut sessions = state.sessions.lock().await;
-    let _session = sessions.create_session(
-        &mac,
-        allotment,
-        &state.config.metric,
-        duration_secs,
-    );
-    sessions.save_to_disk(&crate::config::config_dir()).unwrap_or_else(|e| {
-        tracing::warn!(error = %e, "failed to save sessions to disk");
-    });
+    let _session = sessions.create_session(&mac, allotment, &state.config.metric, duration_secs);
+    sessions
+        .save_to_disk(&crate::config::config_dir())
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "failed to save sessions to disk");
+        });
     drop(sessions);
 
     // Open the gate to grant network access via ndsctl.

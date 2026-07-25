@@ -230,7 +230,8 @@ impl PayoutRoutine {
             .map(|(_, bal)| *bal)
             .unwrap_or(0);
 
-        let outcome = Self::process_payout_with_balance(config, profit_shares, balance, Some(wallet)).await;
+        let outcome =
+            Self::process_payout_with_balance(config, profit_shares, balance, Some(wallet)).await;
 
         match &outcome {
             PayoutOutcome::Skipped { reason } => {
@@ -322,7 +323,8 @@ impl PayoutRoutine {
         let owner_paid = if let Some(ref ln_addr) = owner.lightning_address {
             let tolerance_amount = owner.amount * config.balance_tolerance_percent / 100;
             let max_cost = owner.amount + tolerance_amount;
-            match melt_to_lightning(wallet, &config.mint_url, owner.amount, max_cost, ln_addr).await {
+            match melt_to_lightning(wallet, &config.mint_url, owner.amount, max_cost, ln_addr).await
+            {
                 Ok(()) => true,
                 Err(e) => {
                     tracing::error!(
@@ -351,7 +353,8 @@ impl PayoutRoutine {
             if let Some(ref ln_addr) = r.lightning_address {
                 let tolerance_amount = r.amount * config.balance_tolerance_percent / 100;
                 let max_cost = r.amount + tolerance_amount;
-                match melt_to_lightning(wallet, &config.mint_url, r.amount, max_cost, ln_addr).await {
+                match melt_to_lightning(wallet, &config.mint_url, r.amount, max_cost, ln_addr).await
+                {
                     Ok(()) => maintainers_reached.push(r.identity.clone()),
                     Err(_) => maintainers_failed.push(r.identity.clone()),
                 }
@@ -533,7 +536,8 @@ mod tests {
 
         // Addresses without '@' are treated as unreachable by the LNURL probe.
         // Owner is unreachable → abort all payouts.
-        let outcome = PayoutRoutine::process_payout_with_balance(&config, &shares, 1000, None).await;
+        let outcome =
+            PayoutRoutine::process_payout_with_balance(&config, &shares, 1000, None).await;
 
         assert_eq!(
             outcome,

@@ -2,7 +2,8 @@ use super::*;
 
 const SAMPLE_SESSION_GRANT: &str = r#"{"kind":1022,"pubkey":"abcdef","content":"","tags":[["metric","bytes"],["step_size","22020096"],["allotment","22020096"],["expiry","1784900000"]]}"#;
 
-const SAMPLE_REJECTION: &str = r#"{"kind":21023,"pubkey":"abcdef","content":"insufficient funds","tags":[]}"#;
+const SAMPLE_REJECTION: &str =
+    r#"{"kind":21023,"pubkey":"abcdef","content":"insufficient funds","tags":[]}"#;
 
 #[test]
 fn parse_session_grant_extracts_allotment() {

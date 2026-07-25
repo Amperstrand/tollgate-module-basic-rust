@@ -180,5 +180,8 @@ fn emergency_penalty_extends_blacklist() {
     let ttl = entry.expires_at.duration_since(now).as_secs();
 
     // Should be longer than just the normal TTL
-    assert!(ttl > normal_ttl, "emergency blacklist should be longer than {normal_ttl}s, got {ttl}s");
+    assert!(
+        ttl > normal_ttl,
+        "emergency blacklist should be longer than {normal_ttl}s, got {ttl}s"
+    );
 }

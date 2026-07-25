@@ -332,7 +332,9 @@ fn validate_rejects_zero_step_size() {
     let mut cfg = Config::new_default();
     cfg.step_size = 0;
     let errors = cfg.validate().unwrap_err();
-    assert!(errors.iter().any(|e| e.contains("step_size must be greater than 0")));
+    assert!(errors
+        .iter()
+        .any(|e| e.contains("step_size must be greater than 0")));
 }
 
 #[test]
@@ -356,7 +358,9 @@ fn validate_rejects_profit_share_out_of_range() {
     let mut cfg = Config::new_default();
     cfg.profit_share[0].factor = 1.5;
     let errors = cfg.validate().unwrap_err();
-    assert!(errors.iter().any(|e| e.contains("factor must be between 0.0 and 1.0")));
+    assert!(errors
+        .iter()
+        .any(|e| e.contains("factor must be between 0.0 and 1.0")));
 }
 
 #[test]

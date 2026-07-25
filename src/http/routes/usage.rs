@@ -27,7 +27,10 @@ pub async fn handle_usage(
         None => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                [("content-type", "text/plain"), ("access-control-allow-origin", "*")],
+                [
+                    ("content-type", "text/plain"),
+                    ("access-control-allow-origin", "*"),
+                ],
                 "-1/-1".to_string(),
             );
         }
@@ -41,7 +44,10 @@ pub async fn handle_usage(
             drop(sessions);
             (
                 StatusCode::OK,
-                [("content-type", "text/plain"), ("access-control-allow-origin", "*")],
+                [
+                    ("content-type", "text/plain"),
+                    ("access-control-allow-origin", "*"),
+                ],
                 format!("{used}/{total}"),
             )
         }
@@ -49,7 +55,10 @@ pub async fn handle_usage(
             drop(sessions);
             (
                 StatusCode::OK,
-                [("content-type", "text/plain"), ("access-control-allow-origin", "*")],
+                [
+                    ("content-type", "text/plain"),
+                    ("access-control-allow-origin", "*"),
+                ],
                 "-1/-1".to_string(),
             )
         }

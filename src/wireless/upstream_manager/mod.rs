@@ -72,9 +72,7 @@ impl UpstreamManager {
                 self.do_monitor(wallet_token).await
             }
 
-            ManagerState::Connecting(_) => {
-                ManagerAction::NoAction
-            }
+            ManagerState::Connecting(_) => ManagerAction::NoAction,
 
             ManagerState::Switching(_) => {
                 if self.switch_cooldown_elapsed() {
@@ -84,9 +82,7 @@ impl UpstreamManager {
                 }
             }
 
-            ManagerState::ManualPause => {
-                ManagerAction::NoAction
-            }
+            ManagerState::ManualPause => ManagerAction::NoAction,
         }
     }
 
@@ -209,7 +205,11 @@ impl UpstreamManager {
 
         if let Some(sig) = signal {
             if sig < self.config.signal_floor {
-                tracing::warn!(signal = sig, floor = self.config.signal_floor, "signal below floor");
+                tracing::warn!(
+                    signal = sig,
+                    floor = self.config.signal_floor,
+                    "signal below floor"
+                );
                 self.blacklist_gateway(&gateway.bssid);
                 self.state = ManagerState::Idle;
                 self.current_gateway = None;
@@ -246,7 +246,11 @@ impl UpstreamManager {
         self.state = ManagerState::Monitoring;
         ManagerAction::Monitoring {
             signal,
-            remaining: self.current_session.as_ref().map(|s| s.remaining()).unwrap_or(0),
+            remaining: self
+                .current_session
+                .as_ref()
+                .map(|s| s.remaining())
+                .unwrap_or(0),
         }
     }
 
@@ -261,7 +265,9 @@ impl UpstreamManager {
 
     fn is_blacklisted(&self, bssid: &str) -> bool {
         let now = Instant::now();
-        self.blacklist.iter().any(|e| e.bssid == bssid && e.expires_at > now)
+        self.blacklist
+            .iter()
+            .any(|e| e.bssid == bssid && e.expires_at > now)
     }
 
     fn blacklist_gateway(&mut self, bssid: &str) {
@@ -289,7 +295,11 @@ impl UpstreamManager {
             state: format!("{:?}", self.state),
             connected_ssid: self.current_gateway.as_ref().map(|g| g.ssid.clone()),
             connected_signal: self.current_gateway.as_ref().map(|g| g.signal),
-            remaining: self.current_session.as_ref().map(|s| s.remaining()).unwrap_or(0),
+            remaining: self
+                .current_session
+                .as_ref()
+                .map(|s| s.remaining())
+                .unwrap_or(0),
             consecutive_failures: self.consecutive_failures,
             blacklist_count: self.blacklist.len(),
         }

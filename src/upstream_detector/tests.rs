@@ -52,7 +52,8 @@ fn start_stop_lifecycle() {
 
 #[test]
 fn read_default_gateways_parses_proc_format() {
-    let route_data = "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n\
+    let route_data =
+        "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n\
 eth0\t00000000\t0100FE0A\t0003\t0\t0\t0\t00000000\t0\t0\t0\n\
 eth0\t0000FE0A\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n";
 
@@ -74,41 +75,37 @@ eth0\t0000FE0A\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n";
 
 #[test]
 fn lookup_mac_finds_entry() {
-    let arp_data = "IP address       HW type     Flags       HW address            Mask     Device\n\
+    let arp_data =
+        "IP address       HW type     Flags       HW address            Mask     Device\n\
 10.254.0.1        0x1         0x2         aa:bb:cc:dd:ee:ff     *        eth0\n\
 10.254.0.2        0x1         0x2         00:00:00:00:00:00     *        eth0\n";
 
-    let found = arp_data
-        .lines()
-        .skip(1)
-        .find_map(|line| {
-            let f: Vec<&str> = line.split_whitespace().collect();
-            if f.len() >= 4 && f[0] == "10.254.0.1" && f[3] != "00:00:00:00:00:00" {
-                Some(f[3].to_string())
-            } else {
-                None
-            }
-        });
+    let found = arp_data.lines().skip(1).find_map(|line| {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() >= 4 && f[0] == "10.254.0.1" && f[3] != "00:00:00:00:00:00" {
+            Some(f[3].to_string())
+        } else {
+            None
+        }
+    });
 
     assert_eq!(found, Some("aa:bb:cc:dd:ee:ff".to_string()));
 }
 
 #[test]
 fn lookup_mac_skips_zero_mac() {
-    let arp_data = "IP address       HW type     Flags       HW address            Mask     Device\n\
+    let arp_data =
+        "IP address       HW type     Flags       HW address            Mask     Device\n\
 10.254.0.2        0x1         0x2         00:00:00:00:00:00     *        eth0\n";
 
-    let found = arp_data
-        .lines()
-        .skip(1)
-        .find_map(|line| {
-            let f: Vec<&str> = line.split_whitespace().collect();
-            if f.len() >= 4 && f[0] == "10.254.0.2" && f[3] != "00:00:00:00:00:00" {
-                Some(f[3].to_string())
-            } else {
-                None
-            }
-        });
+    let found = arp_data.lines().skip(1).find_map(|line| {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() >= 4 && f[0] == "10.254.0.2" && f[3] != "00:00:00:00:00:00" {
+            Some(f[3].to_string())
+        } else {
+            None
+        }
+    });
 
     assert_eq!(found, None);
 }

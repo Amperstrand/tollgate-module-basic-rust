@@ -588,7 +588,10 @@ mod tests {
         let resp = handle_command("config set metric milliseconds", &state).await;
         let json: serde_json::Value = serde_json::from_str(resp.trim()).unwrap();
         assert_eq!(json["success"], false);
-        assert!(json["error"].as_str().unwrap().contains("not yet implemented"));
+        assert!(json["error"]
+            .as_str()
+            .unwrap()
+            .contains("not yet implemented"));
     }
 
     #[tokio::test]
