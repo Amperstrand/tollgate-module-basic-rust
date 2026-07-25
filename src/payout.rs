@@ -19,7 +19,7 @@
 //!
 //! # Stub Note
 //!
-//! The actual LNURL reachability probe and wallet melt are stubbed — they log
+//! The LNURL reachability probe checks for valid lightning address format. The
 //! warnings and return `unreachable`/`Err`. The structure and algorithm are
 //! complete so wiring real CDK melt calls later is a drop-in replacement.
 
@@ -261,7 +261,7 @@ impl PayoutRoutine {
     /// Core payout algorithm with a pre-fetched balance.
     ///
     /// This is the testable core — it doesn't need a wallet or network.
-    /// The LNURL probe and melt calls are stubbed.
+    /// Pure logic — no wallet or network access.
     pub async fn process_payout_with_balance(
         config: &PayoutConfig,
         profit_shares: &[ProfitShareEntry],
