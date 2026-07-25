@@ -135,6 +135,11 @@ async fn run_tick(
             mgr.revoke_session(mac);
         }
         mgr.cleanup_expired();
+        if !updates.is_empty() || !to_revoke.is_empty() {
+            if let Err(e) = mgr.save_to_disk(&crate::config::config_dir()) {
+                tracing::warn!(error = %e, "failed to persist session updates to disk");
+            }
+        }
     }
 
     for mac in &to_revoke {

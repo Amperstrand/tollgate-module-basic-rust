@@ -234,8 +234,8 @@ fn handle_config_set(rest: &str) -> String {
     match key {
         "metric" | "step_size" => {
             serde_json::json!({
-                "success": true,
-                "message": format!("{key} updated to {value}")
+                "success": false,
+                "error": format!("config set not yet implemented — Arc<Config> is immutable; restart required to change {key}")
             })
             .to_string()
                 + "\n"
@@ -583,12 +583,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_config_set_updates_value() {
+    async fn test_config_set_returns_not_implemented() {
         let state = make_test_state();
         let resp = handle_command("config set metric milliseconds", &state).await;
         let json: serde_json::Value = serde_json::from_str(resp.trim()).unwrap();
-        assert_eq!(json["success"], true);
-        assert_eq!(json["message"], "metric updated to milliseconds");
+        assert_eq!(json["success"], false);
+        assert!(json["error"].as_str().unwrap().contains("not yet implemented"));
     }
 
     #[tokio::test]
