@@ -105,6 +105,128 @@ impl Config {
         }
         Ok(())
     }
+
+    /// Comprehensive validation of all config fields.
+    pub fn validate(&self) -> Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+
+        if let Err(e) = self.validate_profit_share() {
+            errors.push(e);
+        }
+
+        if self.accepted_mints.is_empty() {
+            errors.push("accepted_mints is empty: at least one mint required".to_string());
+        }
+
+        if self.metric != "bytes" && self.metric != "milliseconds" {
+            errors.push(format!(
+                "metric must be 'bytes' or 'milliseconds', got '{}'",
+                self.metric
+            ));
+        }
+
+        if self.step_size == 0 {
+            errors.push("step_size must be greater than 0".to_string());
+        }
+
+        for (i, mint) in self.accepted_mints.iter().enumerate() {
+            if mint.url.is_empty() {
+                errors.push(format!("accepted_mints[{i}].url is empty"));
+            }
+            if !mint.url.starts_with("https://") && !mint.url.starts_with("http://") {
+                errors.push(format!(
+                    "accepted_mints[{i}].url must start with http:// or https://, got '{}'",
+                    mint.url
+                ));
+            }
+            if mint.price_unit != "sat" && mint.price_unit != "sats" {
+                errors.push(format!(
+                    "accepted_mints[{i}].price_unit must be 'sat' or 'sats', got '{}'",
+                    mint.price_unit
+                ));
+            }
+        }
+
+        if let Some(margin) = self.margin {
+            if margin < 0.0 || margin > 1.0 {
+                errors.push(format!(
+                    "margin must be between 0.0 and 1.0, got {}",
+                    margin
+                ));
+            }
+        }
+
+        for (i, ps) in self.profit_share.iter().enumerate() {
+            if ps.factor < 0.0 || ps.factor > 1.0 {
+                errors.push(format!(
+                    "profit_share[{i}].factor must be between 0.0 and 1.0, got {}",
+                    ps.factor
+                ));
+            }
+            if ps.identity.is_empty() {
+                errors.push(format!("profit_share[{i}].identity is empty"));
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
+    /// Ensure config_version is current. Returns true if the version was updated.
+    pub fn ensure_current_version(&mut self) -> bool {
+        const CURRENT_VERSION: &str = "v0.0.8";
+        if self.config_version != CURRENT_VERSION {
+            tracing::info!(
+                old = %self.config_version,
+                new = CURRENT_VERSION,
+                "migrating config version"
+            );
+            self.config_version = CURRENT_VERSION.to_string();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Ensure the config has sensible defaults for missing critical fields.
+    /// Returns true if any changes were made.
+    pub fn ensure_defaults(&mut self) -> bool {
+        let mut changed = false;
+
+        if self.accepted_mints.is_empty() {
+            self.accepted_mints = vec![MintConfig::default_production("https://mint.coinos.io")];
+            changed = true;
+        }
+
+        if self.profit_share.is_empty() {
+            self.profit_share = Config::new_default().profit_share;
+            changed = true;
+        }
+
+        if self.step_size == 0 {
+            self.step_size = 22020096;
+            changed = true;
+        }
+
+        if self.log_level.is_empty() {
+            self.log_level = "info".to_string();
+            changed = true;
+        }
+
+        if self.metric.is_empty() {
+            self.metric = "bytes".to_string();
+            changed = true;
+        }
+
+        if self.ensure_current_version() {
+            changed = true;
+        }
+
+        changed
+    }
 }
 
 // ── MintConfig ───────────────────────────────────────────────────────
