@@ -105,7 +105,7 @@ jobs:
           export AR_${TARGET_UPPER}="$TC/bin/${{ matrix.musl-tc }}-ar"
           export PATH="$TC/bin:$PATH"
           cargo +nightly update -p cdk -p cdk-common
-          cargo +nightly build -Z build-std --release --target ${{ matrix.target }}
+          cargo +nightly build -Z build-std=std,panic_abort --release --target ${{ matrix.target }}
 
       - name: Binary size
         run: |
