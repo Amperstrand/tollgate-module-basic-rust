@@ -76,14 +76,21 @@ pub fn get_mac_address(ip: &str) -> Option<String> {
 }
 
 pub fn resolve_ip_from_mac(mac: &str) -> Option<IpAddr> {
+    resolve_all_ips_from_mac(mac).into_iter().next()
+}
+
+pub fn resolve_all_ips_from_mac(mac: &str) -> Vec<IpAddr> {
     let mac_lower = mac.trim().to_ascii_lowercase();
+    let mut ips = Vec::new();
 
     if let Ok(data) = std::fs::read_to_string(DHCP_LEASES_PATH) {
         for line in data.split('\n') {
             let fields: Vec<&str> = line.split_whitespace().collect();
             if fields.len() >= 3 && fields[1].to_ascii_lowercase() == mac_lower {
                 if let Ok(ip) = fields[2].parse::<IpAddr>() {
-                    return Some(ip);
+                    if !ips.contains(&ip) {
+                        ips.push(ip);
+                    }
                 }
             }
         }
@@ -97,13 +104,40 @@ pub fn resolve_ip_from_mac(mac: &str) -> Option<IpAddr> {
                 && fields[3] != ZERO_MAC
             {
                 if let Ok(ip) = fields[0].parse::<IpAddr>() {
-                    return Some(ip);
+                    if !ips.contains(&ip) {
+                        ips.push(ip);
+                    }
                 }
             }
         }
     }
 
-    None
+    if let Ok(output) = std::process::Command::new("ip")
+        .args(["-6", "neigh", "show"])
+        .output()
+    {
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.split('\n') {
+                if let Some(mac_pos) = line.find("lladdr ") {
+                    let rest = &line[mac_pos + 7..];
+                    if let Some(mac_end) = rest.find(' ') {
+                        let entry_mac = rest[..mac_end].to_ascii_lowercase();
+                        if entry_mac == mac_lower {
+                            let ip_str = line.split_whitespace().next().unwrap_or("");
+                            if let Ok(ip) = ip_str.parse::<IpAddr>() {
+                                if !ips.contains(&ip) {
+                                    ips.push(ip);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    ips
 }
 
 /// Extract the client IP from request headers (or fall back to the socket
