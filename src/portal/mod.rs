@@ -2,6 +2,9 @@ use async_trait::async_trait;
 
 pub mod nds;
 
+#[cfg(feature = "embedded-portal")]
+pub mod nft_manager;
+
 pub use nds::NdsPortal;
 
 #[async_trait]
