@@ -1,7 +1,7 @@
 #[cfg(feature = "embedded-portal")]
 use nftables::{
     batch::Batch,
-    expr::{Expression, NamedExpression, Payload, PayloadField},
+    expr::{Expression, Meta, MetaKey, NamedExpression, Payload, PayloadField},
     schema::{self, NfListObject},
     stmt::{Counter as StmtCounter, Match, Operator, Statement},
     types::{NfChainPolicy, NfChainType, NfFamily, NfHook},
@@ -84,8 +84,8 @@ impl NftManager {
             name: "forward".into(),
             _type: Some(NfChainType::Filter),
             hook: Some(NfHook::Forward),
-            prio: Some(0),
-            policy: Some(NfChainPolicy::Drop),
+            prio: Some(-1),
+            policy: Some(NfChainPolicy::Accept),
             ..Default::default()
         }));
 
@@ -97,6 +97,16 @@ impl NftManager {
     fn add_forward_rules(&self, batch: &mut Batch<'static>) {
         let table: std::borrow::Cow<'static, str> = self.table.clone().into();
 
+        let lan_match = || {
+            Statement::Match(Match {
+                left: Expression::Named(NamedExpression::Meta(Meta {
+                    key: MetaKey::Iifname,
+                })),
+                right: Expression::String("br-lan".into()),
+                op: Operator::EQ,
+            })
+        };
+
         let accept_in_set =
             |batch: &mut Batch<'static>, proto: &'static str, field: &'static str, set: String| {
                 batch.add(NfListObject::Rule(schema::Rule {
@@ -104,6 +114,7 @@ impl NftManager {
                     table: table.clone(),
                     chain: "forward".into(),
                     expr: vec![
+                        lan_match(),
                         Statement::Match(Match {
                             left: Expression::Named(NamedExpression::Payload(
                                 Payload::PayloadField(PayloadField {
@@ -130,6 +141,7 @@ impl NftManager {
                 table: table.clone(),
                 chain: "forward".into(),
                 expr: vec![
+                    lan_match(),
                     Statement::Match(Match {
                         left: Expression::Named(NamedExpression::Payload(Payload::PayloadField(
                             PayloadField {
@@ -150,6 +162,26 @@ impl NftManager {
         accept_port(batch, "tcp", 53);
         accept_port(batch, "udp", 53);
         accept_port(batch, "tcp", 80);
+        accept_port(batch, "tcp", 2121);
+
+        batch.add(NfListObject::Rule(schema::Rule {
+            family: NfFamily::INet,
+            table: table.clone(),
+            chain: "forward".into(),
+            expr: vec![
+                lan_match(),
+                Statement::Match(Match {
+                    left: Expression::Named(NamedExpression::Meta(Meta {
+                        key: MetaKey::Oifname,
+                    })),
+                    right: Expression::String("br-lan".into()),
+                    op: Operator::NEQ,
+                }),
+                Statement::Reject(None),
+            ]
+            .into(),
+            ..Default::default()
+        }));
     }
 
     #[cfg(feature = "embedded-portal")]
@@ -419,7 +451,7 @@ mod tests {
         assert!(json.contains("\"forward\""));
         assert!(json.contains("\"filter\""));
         assert!(json.contains("\"nat\""));
-        assert!(json.contains("\"drop\""));
+        assert!(json.contains("\"accept\""));
     }
 
     #[cfg(feature = "embedded-portal")]
