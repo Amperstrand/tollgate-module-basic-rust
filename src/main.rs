@@ -183,6 +183,34 @@ async fn main() {
         })
     };
 
+    #[cfg(feature = "embedded-portal")]
+    let watchdog_handle = {
+        let nft = portal::nft_manager::NftManager::new();
+        tokio::spawn(async move {
+            let mut consecutive_failures = 0u32;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                match tokio::net::TcpStream::connect("127.0.0.1:2121").await {
+                    Ok(_) => {
+                        if consecutive_failures > 0 {
+                            tracing::info!("HTTP recovered after {consecutive_failures} failures");
+                        }
+                        consecutive_failures = 0;
+                    }
+                    Err(_) => {
+                        consecutive_failures += 1;
+                        tracing::warn!("HTTP health check failed ({consecutive_failures}/3)");
+                        if consecutive_failures >= 3 {
+                            tracing::error!("HTTP unresponsive 90s — removing nftables table to prevent lockout");
+                            let _ = nft.teardown();
+                            consecutive_failures = 0;
+                        }
+                    }
+                }
+            }
+        })
+    };
+
     // Wait for shutdown signal
     let shutdown_int = tokio::signal::ctrl_c();
 
@@ -211,5 +239,7 @@ async fn main() {
     monitor_handle.abort();
     #[cfg(feature = "embedded-portal")]
     redirect_handle.abort();
+    #[cfg(feature = "embedded-portal")]
+    watchdog_handle.abort();
     tracing::info!("shutdown complete");
 }

@@ -129,6 +129,7 @@ define Package/$(PKG_NAME)/install
 	$(INSTALL_DATA) $(PKG_MAKEFILE_DIR)files/lib/upgrade/keep.d/tollgate $(1)/lib/upgrade/keep.d/tollgate
 
 	$(INSTALL_DIR) $(1)/etc/tollgate
+	$(INSTALL_DATA) $(PKG_MAKEFILE_DIR)files/etc/tollgate/emergency-clear.nft $(1)/etc/tollgate/emergency-clear.nft
 endef
 
 $(eval $(call BuildPackage,tollgate-rs))
