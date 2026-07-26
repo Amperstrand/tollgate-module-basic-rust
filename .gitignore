@@ -12,3 +12,6 @@
 .idea/
 .vscode/
 spec/
+
+# OpenCode session artifacts
+.omo/
