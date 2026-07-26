@@ -3,7 +3,7 @@ use nftables::{
     batch::Batch,
     expr::{Expression, NamedExpression, Payload, PayloadField},
     schema::{self, NfListObject},
-    stmt::{Match, Operator, Statement},
+    stmt::{Counter as StmtCounter, Match, Operator, Statement},
     types::{NfChainPolicy, NfChainType, NfFamily, NfHook},
 };
 
@@ -288,6 +288,104 @@ impl NftManager {
         }
         Err(NftError::CounterNotFound(target))
     }
+
+    #[cfg(feature = "embedded-portal")]
+    pub fn build_counter_rule_batch(&self, ip: IpAddr) -> Batch<'static> {
+        let mut batch = Batch::new();
+        let (proto, ip_str) = match ip {
+            IpAddr::V4(v4) => ("ip", v4.to_string()),
+            IpAddr::V6(v6) => ("ip6", v6.to_string()),
+        };
+        let counter = Self::counter_name(&ip);
+
+        batch.add(NfListObject::Rule(schema::Rule {
+            family: NfFamily::INet,
+            table: self.table.clone().into(),
+            chain: "forward".into(),
+            expr: vec![
+                Statement::Match(Match {
+                    left: Expression::Named(NamedExpression::Payload(Payload::PayloadField(
+                        PayloadField {
+                            protocol: proto.into(),
+                            field: "saddr".into(),
+                        },
+                    ))),
+                    right: Expression::String(ip_str.into()),
+                    op: Operator::EQ,
+                }),
+                Statement::Counter(StmtCounter::Named(counter.into())),
+                Statement::Accept(None),
+            ]
+            .into(),
+            ..Default::default()
+        }));
+        batch
+    }
+
+    #[cfg(feature = "embedded-portal")]
+    pub fn build_delete_rule_batch(&self, handle: u32) -> Batch<'static> {
+        let mut batch = Batch::new();
+        batch.delete(NfListObject::Rule(schema::Rule {
+            family: NfFamily::INet,
+            table: self.table.clone().into(),
+            chain: "forward".into(),
+            handle: Some(handle),
+            expr: [][..].into(),
+            ..Default::default()
+        }));
+        batch
+    }
+
+    #[cfg(feature = "embedded-portal")]
+    fn apply_with_echo(batch: Batch<'static>) -> Result<String, NftError> {
+        let json_str = serde_json::to_string(&batch.to_nftables())
+            .map_err(|e| NftError::Apply(e.to_string()))?;
+        nftables::helper::apply_ruleset_raw(&json_str, nftables::helper::DEFAULT_NFT, &["--echo"])
+            .map_err(|e| NftError::Apply(e.to_string()))
+    }
+
+    pub fn parse_rule_handle(response_json: &str, table: &str) -> Option<u32> {
+        let parsed: serde_json::Value = serde_json::from_str(response_json).ok()?;
+        let objects = parsed.get("nftables")?.as_array()?;
+        for obj in objects {
+            for key in ["add", "insert", "replace"] {
+                if let Some(rule) = obj.get(key).and_then(|o| o.get("rule")) {
+                    if rule.get("table").and_then(|t| t.as_str()) == Some(table)
+                        && rule.get("chain").and_then(|c| c.as_str()) == Some("forward")
+                    {
+                        return rule
+                            .get("handle")
+                            .and_then(|h| h.as_u64())
+                            .map(|h| h as u32);
+                    }
+                }
+            }
+            if let Some(rule) = obj.get("rule") {
+                if rule.get("table").and_then(|t| t.as_str()) == Some(table)
+                    && rule.get("chain").and_then(|c| c.as_str()) == Some("forward")
+                {
+                    return rule
+                        .get("handle")
+                        .and_then(|h| h.as_u64())
+                        .map(|h| h as u32);
+                }
+            }
+        }
+        None
+    }
+
+    #[cfg(feature = "embedded-portal")]
+    pub fn add_counter_rule(&self, ip: IpAddr) -> Result<u32, NftError> {
+        let batch = self.build_counter_rule_batch(ip);
+        let response = Self::apply_with_echo(batch)?;
+        Self::parse_rule_handle(&response, &self.table)
+            .ok_or_else(|| NftError::Apply("rule handle not found in echo response".into()))
+    }
+
+    #[cfg(feature = "embedded-portal")]
+    pub fn delete_rule(&self, handle: u32) -> Result<(), NftError> {
+        Self::apply(self.build_delete_rule_batch(handle))
+    }
 }
 
 #[cfg(test)]
@@ -420,5 +518,76 @@ mod tests {
             }
         }
         assert!(found, "counter must be found in mock JSON");
+    }
+
+    #[cfg(feature = "embedded-portal")]
+    #[test]
+    fn counter_rule_batch_contains_ip_and_counter_ref() {
+        let mgr = NftManager::new();
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 55));
+        let batch = mgr.build_counter_rule_batch(ip);
+        let json = serde_json::to_string(&batch.to_nftables()).unwrap();
+
+        assert!(json.contains("10.0.0.55"), "must match client IP");
+        assert!(
+            json.contains("\"c-10.0.0.55\""),
+            "must reference named counter"
+        );
+        assert!(json.contains("\"accept\""), "must accept matched traffic");
+        assert!(json.contains("\"forward\""), "must be in forward chain");
+    }
+
+    #[cfg(feature = "embedded-portal")]
+    #[test]
+    fn counter_rule_batch_v6_uses_ip6() {
+        let mgr = NftManager::new();
+        let ip = IpAddr::V6(Ipv6Addr::LOCALHOST);
+        let batch = mgr.build_counter_rule_batch(ip);
+        let json = serde_json::to_string(&batch.to_nftables()).unwrap();
+
+        assert!(json.contains("\"ip6\""), "v6 rule must use ip6 protocol");
+        assert!(
+            json.contains("\"c6-::1\""),
+            "must reference v6 counter name"
+        );
+    }
+
+    #[cfg(feature = "embedded-portal")]
+    #[test]
+    fn delete_rule_batch_contains_handle() {
+        let mgr = NftManager::new();
+        let batch = mgr.build_delete_rule_batch(77);
+        let json = serde_json::to_string(&batch.to_nftables()).unwrap();
+
+        assert!(json.contains("\"delete\""), "must be delete operation");
+        assert!(json.contains("77"), "must reference handle 77");
+    }
+
+    #[test]
+    fn parse_rule_handle_from_echo_response() {
+        let mock = r#"{"nftables":[{"add":{"rule":{"family":"inet","table":"tollgate","chain":"forward","expr":[],"handle":42}}}]}"#;
+        let handle = NftManager::parse_rule_handle(mock, "tollgate");
+        assert_eq!(handle, Some(42));
+    }
+
+    #[test]
+    fn parse_rule_handle_from_bare_rule() {
+        let mock = r#"{"nftables":[{"rule":{"family":"inet","table":"tollgate","chain":"forward","expr":[],"handle":99}}]}"#;
+        let handle = NftManager::parse_rule_handle(mock, "tollgate");
+        assert_eq!(handle, Some(99));
+    }
+
+    #[test]
+    fn parse_rule_handle_wrong_table_returns_none() {
+        let mock = r#"{"nftables":[{"add":{"rule":{"family":"inet","table":"other","chain":"forward","expr":[],"handle":1}}}]}"#;
+        let handle = NftManager::parse_rule_handle(mock, "tollgate");
+        assert_eq!(handle, None);
+    }
+
+    #[test]
+    fn parse_rule_handle_no_rule_returns_none() {
+        let mock = r#"{"nftables":[{"counter":{"name":"foo"}}]}"#;
+        let handle = NftManager::parse_rule_handle(mock, "tollgate");
+        assert_eq!(handle, None);
     }
 }
