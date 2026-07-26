@@ -2766,6 +2766,7 @@ dependencies = [
 name = "tollgate-module-basic-rust"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
  "cashu",
  "cdk",

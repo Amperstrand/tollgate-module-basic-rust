@@ -1,5 +1,6 @@
 use super::CaptivePortal;
 use crate::valve;
+use async_trait::async_trait;
 
 pub struct NdsPortal;
 
@@ -15,6 +16,7 @@ impl NdsPortal {
     }
 }
 
+#[async_trait]
 impl CaptivePortal for NdsPortal {
     async fn grant_access(&self, mac: &str) -> Result<(), String> {
         valve::open_gate(mac).await

@@ -54,6 +54,9 @@ sha2 = "0.10"
 # Error derive macro
 thiserror = "1"
 
+# Async trait object safety (CaptivePortal dyn dispatch)
+async-trait = "0.1"
+
 [dev-dependencies]
 tempfile = "3"
 
