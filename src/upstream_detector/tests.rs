@@ -16,8 +16,10 @@ fn hex_to_ip_rejects_invalid() {
 
 #[test]
 fn should_skip_ignored_interface() {
-    let mut config = UpstreamDetectorConfig::default();
-    config.ignore_interfaces = vec!["lo".into(), "docker0".into(), "br-lan".into()];
+    let config = UpstreamDetectorConfig {
+        ignore_interfaces: vec!["lo".into(), "docker0".into(), "br-lan".into()],
+        ..Default::default()
+    };
     let detector = UpstreamDetector::new(config);
 
     assert!(detector.should_skip_interface("lo"));
@@ -29,8 +31,10 @@ fn should_skip_ignored_interface() {
 
 #[test]
 fn should_skip_respects_only_interfaces() {
-    let mut config = UpstreamDetectorConfig::default();
-    config.only_interfaces = vec!["eth0".into()];
+    let config = UpstreamDetectorConfig {
+        only_interfaces: vec!["eth0".into()],
+        ..Default::default()
+    };
     let detector = UpstreamDetector::new(config);
 
     assert!(!detector.should_skip_interface("eth0"));

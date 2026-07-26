@@ -5,6 +5,7 @@ use serde::Deserialize;
 #[derive(Debug, Deserialize)]
 struct DiscoveryEvent {
     kind: u64,
+    #[allow(dead_code)]
     content: String,
     tags: Vec<Vec<String>>,
 }

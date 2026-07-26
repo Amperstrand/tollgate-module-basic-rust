@@ -4,20 +4,20 @@
 //! and 811–829 (getIP). Behaviour contract:
 //!
 //! - `get_mac_address(ip)`:
-//!     1. Validate `ip` parses as `IpAddr` (matches Go's `net.ParseIP`).
-//!     2. Read `/tmp/dhcp.leases`. Each line is split on whitespace; if
-//!        `fields.len() >= 3 && fields[2].eq_ignore_ascii_case(ip)`,
-//!        return `fields[1]` (the MAC).
-//!     3. Fallback: read `/proc/net/arp`. Each line is split on whitespace;
-//!        if `fields.len() >= 4 && fields[0].eq_ignore_ascii_case(ip)
-//!        && fields[3] != "00:00:00:00:00:00"`, return `fields[3]`.
-//!     4. Otherwise return `None`.
+//! 1. Validate `ip` parses as `IpAddr` (matches Go's `net.ParseIP`).
+//! 2. Read `/tmp/dhcp.leases`. Each line is split on whitespace; if
+//!    `fields.len() >= 3 && fields[2].eq_ignore_ascii_case(ip)`,
+//!    return `fields[1]` (the MAC).
+//! 3. Fallback: read `/proc/net/arp`. Each line is split on whitespace;
+//!    if `fields.len() >= 4 && fields[0].eq_ignore_ascii_case(ip)
+//!    && fields[3] != "00:00:00:00:00:00"`, return `fields[3]`.
+//! 4. Otherwise return `None`.
 //!
 //! - `get_client_ip(headers, remote_addr)`:
-//!     Mirrors Go's `getIP`: only honours forwarding headers when the
-//!     request is from a loopback peer (so production OpenWrt traffic
-//!     is unaffected). Order: `X-Real-Ip`, then first IP of
-//!     `X-Forwarded-For`, then `remote_addr`.
+//!   Mirrors Go's `getIP`: only honours forwarding headers when the
+//!   request is from a loopback peer (so production OpenWrt traffic
+//!   is unaffected). Order: `X-Real-Ip`, then first IP of
+//!   `X-Forwarded-For`, then `remote_addr`.
 
 use axum::http::{HeaderMap, HeaderName};
 use std::net::{IpAddr, SocketAddr};

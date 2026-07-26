@@ -18,6 +18,7 @@ enum ManagerState {
     Connecting(String),
     Connected,
     Monitoring,
+    #[allow(dead_code)]
     Switching(String),
     ManualPause,
 }

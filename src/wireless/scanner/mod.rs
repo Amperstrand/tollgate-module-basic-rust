@@ -37,7 +37,7 @@ impl Scanner {
             }
         }
 
-        all_networks.sort_by(|a, b| b.signal.cmp(&a.signal));
+        all_networks.sort_by_key(|n| std::cmp::Reverse(n.signal));
         all_networks
     }
 

@@ -1,13 +1,14 @@
-use super::CaptivePortal;
-use async_trait::async_trait;
-use std::collections::HashMap;
+#[cfg(any(test, feature = "embedded-portal"))]
 use std::net::IpAddr;
-use std::sync::Mutex;
 
-use crate::mac_resolver::{resolve_all_ips_from_mac, resolve_ip_from_mac};
+#[cfg(test)]
+use crate::mac_resolver::resolve_ip_from_mac;
 
 #[cfg(feature = "embedded-portal")]
-use super::nft_manager::NftManager;
+use {async_trait::async_trait, std::collections::HashMap, std::sync::Mutex};
+
+#[cfg(feature = "embedded-portal")]
+use {super::nft_manager::NftManager, super::CaptivePortal};
 
 #[cfg(feature = "embedded-portal")]
 pub struct EmbeddedPortal {
@@ -47,19 +48,9 @@ impl Default for EmbeddedPortal {
     }
 }
 
-#[cfg_attr(not(feature = "embedded-portal"), allow(dead_code))]
+#[cfg(test)]
 fn resolve_or_err(mac: &str) -> Result<IpAddr, String> {
     resolve_ip_from_mac(mac).ok_or_else(|| format!("no IP address found for MAC {mac}"))
-}
-
-#[cfg_attr(not(feature = "embedded-portal"), allow(dead_code))]
-fn resolve_all_or_err(mac: &str) -> Result<Vec<IpAddr>, String> {
-    let ips = resolve_all_ips_from_mac(mac);
-    if ips.is_empty() {
-        Err(format!("no IP address found for MAC {mac}"))
-    } else {
-        Ok(ips)
-    }
 }
 
 #[cfg(feature = "embedded-portal")]
