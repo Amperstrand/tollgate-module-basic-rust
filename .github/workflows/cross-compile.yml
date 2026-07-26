@@ -96,33 +96,6 @@ jobs:
         with:
           components: rust-src
 
-      - name: Patch CDK deps for MIPS (32-bit AtomicU64 fix)
-        if: matrix.needs-build-std == true
-        run: |
-          python3 << 'EOF'
-          import re
-          fork = 'git = "https://github.com/Amperstrand/cdk.git", branch = "fix/mips-atomicusize"'
-          with open("Cargo.toml") as f:
-              c = f.read()
-          c = re.sub(
-              r'^cdk = \{ version = "0\.17".*$',
-              'cdk = { ' + fork + ', default-features = false, features = ["wallet"] }',
-              c, flags=re.MULTILINE,
-          )
-          c = re.sub(
-              r'^cdk-sqlite = "0\.17"$',
-              'cdk-sqlite = { ' + fork + ' }',
-              c, flags=re.MULTILINE,
-          )
-          c = re.sub(
-              r'^cashu = "0\.17"$',
-              'cashu = { ' + fork + ', default-features = false }',
-              c, flags=re.MULTILINE,
-          )
-          with open("Cargo.toml", "w") as f:
-              f.write(c)
-          EOF
-
       - name: Build MIPS
         if: matrix.needs-build-std == true
         run: |
@@ -132,7 +105,6 @@ jobs:
           export CARGO_TARGET_${TARGET_UPPER}_LINKER="$TC/bin/${{ matrix.musl-tc }}-gcc"
           export AR_${TARGET_UPPER}="$TC/bin/${{ matrix.musl-tc }}-ar"
           export PATH="$TC/bin:$PATH"
-          cargo +nightly update -p cdk -p cdk-common -p cdk-sql-common -p cdk-sqlite -p cashu -p cdk-http-client
           cargo +nightly build -Z build-std=std,panic_abort --release --target ${{ matrix.target }}
 
       - name: Binary size
