@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 
+pub mod embedded;
 pub mod nds;
 
 #[cfg(feature = "embedded-portal")]
