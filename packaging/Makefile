@@ -67,7 +67,7 @@ define Package/$(PKG_NAME)/postinst
 echo "TollGate Rust post-installation..."
 
 # Run uci-defaults
-for script in /etc/uci-defaults/99-tollgate-setup; do
+for script in /etc/uci-defaults/99-tollgate-setup /etc/uci-defaults/90-tollgate-captive-portal-symlink; do
     if [ -x "$$script" ]; then
         echo "Running $$script ..."
         "$$script" || echo "Warning: $$script exited with code $$?"
@@ -82,7 +82,10 @@ done
 /etc/init.d/nodogsplash restart 2>/dev/null || true
 
 # Enable and start TollGate
-if [ -x /etc/init.d/tollgate ]; then
+if [ -x /etc/init.d/tollgate-wrt ]; then
+    /etc/init.d/tollgate-wrt enable 2>/dev/null || true
+    /etc/init.d/tollgate-wrt start 2>/dev/null || true
+elif [ -x /etc/init.d/tollgate ]; then
     /etc/init.d/tollgate enable 2>/dev/null || true
     /etc/init.d/tollgate start 2>/dev/null || true
 fi
@@ -110,9 +113,17 @@ define Package/$(PKG_NAME)/install
 
 	$(INSTALL_DIR) $(1)/etc/init.d
 	$(INSTALL_BIN) $(PKG_MAKEFILE_DIR)files/etc/init.d/tollgate $(1)/etc/init.d/tollgate
+	$(INSTALL_BIN) $(PKG_MAKEFILE_DIR)files/etc/init.d/tollgate-wrt $(1)/etc/init.d/tollgate-wrt
 
 	$(INSTALL_DIR) $(1)/etc/uci-defaults
 	$(INSTALL_BIN) $(PKG_MAKEFILE_DIR)files/etc/uci-defaults/99-tollgate-setup $(1)/etc/uci-defaults/99-tollgate-setup
+	$(INSTALL_BIN) $(PKG_MAKEFILE_DIR)files/etc/uci-defaults/90-tollgate-captive-portal-symlink $(1)/etc/uci-defaults/90-tollgate-captive-portal-symlink
+
+	$(INSTALL_DIR) $(1)/etc/nftables.d
+	$(INSTALL_DATA) $(PKG_MAKEFILE_DIR)files/etc/nftables.d/20-nds-enforce.nft $(1)/etc/nftables.d/20-nds-enforce.nft
+
+	$(INSTALL_DIR) $(1)/etc/tollgate/tollgate-captive-portal-site/assets
+	$(CP) $(PKG_MAKEFILE_DIR)files/tollgate-captive-portal-site/ $(1)/etc/tollgate/tollgate-captive-portal-site/
 
 	$(INSTALL_DIR) $(1)/lib/upgrade/keep.d
 	$(INSTALL_DATA) $(PKG_MAKEFILE_DIR)files/lib/upgrade/keep.d/tollgate $(1)/lib/upgrade/keep.d/tollgate
