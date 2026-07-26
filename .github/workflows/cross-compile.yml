@@ -24,8 +24,12 @@ jobs:
         run: cargo fmt --all -- --check
       - name: clippy
         run: cargo clippy --all-targets -- -W warnings
+      - name: clippy (embedded-portal)
+        run: cargo clippy --all-targets --features embedded-portal -- -W warnings
       - name: test
         run: cargo test --verbose
+      - name: test (embedded-portal)
+        run: cargo test --verbose --features embedded-portal
 
   cross-build:
     name: cross ${{ matrix.target }}
