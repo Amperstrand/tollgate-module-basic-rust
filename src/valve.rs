@@ -104,14 +104,20 @@ async fn run_ndsctl_with_retry(
         }
 
         let stderr = String::from_utf8_lossy(&output.stderr);
-        // ndsctl returns non-zero if the client is already in the requested
-        // state or is not present — these are benign for our purposes.
-        if stderr.contains("already") || stderr.contains("not found") {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let combined = format!("{stderr} {stdout}");
+
+        if combined.contains("already")
+            || combined.contains("not found")
+            || combined.contains("No such")
+            || combined.contains("not connected")
+        {
             tracing::debug!(
                 action,
                 mac,
                 attempt = attempt + 1,
                 stderr = %stderr.trim(),
+                stdout = %stdout.trim(),
                 "ndsctl reported benign non-zero state, treating as success"
             );
             return Ok(());
@@ -123,6 +129,7 @@ async fn run_ndsctl_with_retry(
                 mac,
                 attempt = attempt + 1,
                 stderr = %stderr.trim(),
+                stdout = %stdout.trim(),
                 "ndsctl failed, retrying"
             );
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
@@ -132,6 +139,7 @@ async fn run_ndsctl_with_retry(
                 mac,
                 attempt = attempt + 1,
                 stderr = %stderr.trim(),
+                stdout = %stdout.trim(),
                 "ndsctl failed on final attempt"
             );
         }
