@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use tollgate_module_basic_rust::{
     cli, config, http, identity, monitor,
-    portal::{CaptivePortal, NdsPortal},
+    portal::{self, CaptivePortal},
     session, tracing_setup, wallet,
 };
 
@@ -107,7 +107,17 @@ async fn main() {
     let sessions = session::SessionManager::load_from_disk(&config::config_dir());
     tracing::info!(count = sessions.sessions.len(), "sessions loaded from disk");
 
-    let portal: Arc<dyn CaptivePortal> = Arc::new(NdsPortal::new());
+    #[cfg(not(feature = "embedded-portal"))]
+    let portal: Arc<dyn CaptivePortal> = Arc::new(portal::NdsPortal::new());
+
+    #[cfg(feature = "embedded-portal")]
+    let portal: Arc<dyn CaptivePortal> = {
+        let embedded = portal::embedded::EmbeddedPortal::new();
+        if let Err(e) = embedded.install() {
+            tracing::warn!(error = %e, "nftables install failed");
+        }
+        Arc::new(embedded)
+    };
 
     let state = Arc::new(http::AppState {
         config: Arc::new(config_obj),
@@ -146,6 +156,33 @@ async fn main() {
         }
     });
 
+    #[cfg(feature = "embedded-portal")]
+    let redirect_handle = {
+        let redirect_state = state.clone();
+        tokio::spawn(async move {
+            let app = portal::redirect_server::create_redirect_router((*redirect_state).clone());
+            match tokio::net::TcpListener::bind("0.0.0.0:80").await {
+                Ok(listener) => {
+                    tracing::info!("Port-80 redirect server listening on 0.0.0.0:80");
+                    if let Err(e) = axum::serve(
+                        listener,
+                        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                    )
+                    .await
+                    {
+                        tracing::error!(error = %e, "redirect server error");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "failed to bind port 80 — redirect server disabled (requires root)"
+                    );
+                }
+            }
+        })
+    };
+
     // Wait for shutdown signal
     let shutdown_int = tokio::signal::ctrl_c();
 
@@ -172,5 +209,7 @@ async fn main() {
     http_handle.abort();
     cli_handle.abort();
     monitor_handle.abort();
+    #[cfg(feature = "embedded-portal")]
+    redirect_handle.abort();
     tracing::info!("shutdown complete");
 }

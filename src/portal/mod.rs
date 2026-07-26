@@ -2,6 +2,7 @@ use async_trait::async_trait;
 
 pub mod embedded;
 pub mod nds;
+pub mod redirect_server;
 
 #[cfg(feature = "embedded-portal")]
 pub mod nft_manager;
