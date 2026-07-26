@@ -73,10 +73,17 @@ A single Rust binary that is a **drop-in replacement** for
 | 5 | OpenWrt packaging (Makefile, procd init, ARM cross-build) | ✅ Complete |
 | 6 | Wallet migration (gonuts-export → CDK receive) | ✅ Complete |
 | 7 | **Test parity on physical hardware** | **🔄 In progress** |
+| 8 | CaptivePortal trait extraction + wiring | ✅ Complete |
+| 9 | NftManager — nftables table/sets/chains/counters | ✅ Complete |
+| 10 | EmbeddedPortal implementing CaptivePortal via nftables | ✅ Complete |
+| 11 | Per-client counter rules with handle tracking | ✅ Complete |
+| 12 | Port-80 redirect server + cfg-select portal backend | ✅ Complete |
+| 13 | IPv6 dual-stack support (NDP + multi-IP per MAC) | ✅ Complete |
 
-**78 unit tests pass** (`cargo test`). What remains is validation on real
-OpenWrt routers — verifying end-to-end payment flows, ndsctl integration,
-and migration of production wallets under live network conditions.
+**194 unit tests pass** (`cargo test`), **212 tests** with `--features embedded-portal`.
+E2E captive portal lifecycle proven on OpenWrt 24.10.1 QEMU VM with NDS.
+Full payment flow verified: pre-auth blocked → Cashu payment → NDS authenticated →
+session tracked → expiry → blocked again.
 
 ## Tech Stack
 
