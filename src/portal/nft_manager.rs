@@ -23,6 +23,7 @@ pub enum NftError {
     CounterNotFound(String),
 }
 
+#[derive(Clone)]
 pub struct NftManager {
     table: String,
 }

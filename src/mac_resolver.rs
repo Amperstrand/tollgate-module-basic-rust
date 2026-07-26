@@ -75,6 +75,37 @@ pub fn get_mac_address(ip: &str) -> Option<String> {
     None
 }
 
+pub fn resolve_ip_from_mac(mac: &str) -> Option<IpAddr> {
+    let mac_lower = mac.trim().to_ascii_lowercase();
+
+    if let Ok(data) = std::fs::read_to_string(DHCP_LEASES_PATH) {
+        for line in data.split('\n') {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() >= 3 && fields[1].to_ascii_lowercase() == mac_lower {
+                if let Ok(ip) = fields[2].parse::<IpAddr>() {
+                    return Some(ip);
+                }
+            }
+        }
+    }
+
+    if let Ok(data) = std::fs::read_to_string(PROC_NET_ARP_PATH) {
+        for line in data.split('\n') {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() >= 4
+                && fields[3].to_ascii_lowercase() == mac_lower
+                && fields[3] != ZERO_MAC
+            {
+                if let Ok(ip) = fields[0].parse::<IpAddr>() {
+                    return Some(ip);
+                }
+            }
+        }
+    }
+
+    None
+}
+
 /// Extract the client IP from request headers (or fall back to the socket
 /// remote address), mirroring Go's `getIP(r)`. Go only honours forwarding
 /// headers when `isLocalRequest(r)` is true — i.e. the peer is loopback.
