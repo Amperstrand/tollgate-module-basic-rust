@@ -230,20 +230,51 @@ fn handle_config_set(rest: &str) -> String {
             + "\n";
     }
     let key = parts[0];
-    let _value = parts[1];
+    let value = parts[1];
+
     match key {
         "metric" | "step_size" => {
-            serde_json::json!({
-                "success": false,
-                "error": format!("config set not yet implemented — Arc<Config> is immutable; restart required to change {key}")
-            })
-            .to_string()
-                + "\n"
+            let mut current = crate::config::load_config()
+                .unwrap_or(None)
+                .unwrap_or_default();
+            match key {
+                "metric" => {
+                    if value != "bytes" && value != "milliseconds" {
+                        return serde_json::json!({
+                            "success": false,
+                            "error": format!("metric must be 'bytes' or 'milliseconds', got '{value}'")
+                        })
+                        .to_string() + "\n";
+                    }
+                    current.metric = value.to_string();
+                }
+                "step_size" => {
+                    match value.parse::<u64>() {
+                        Ok(n) if n > 0 => current.step_size = n,
+                        _ => return serde_json::json!({
+                            "success": false,
+                            "error": format!("step_size must be a positive integer, got '{value}'")
+                        }).to_string() + "\n",
+                    }
+                }
+                _ => {}
+            }
+
+            match crate::config::save_config(&current) {
+                Ok(_) => serde_json::json!({
+                    "success": true,
+                    "message": format!("{key} updated to {value} (restart required to take effect)")
+                }).to_string() + "\n",
+                Err(e) => serde_json::json!({
+                    "success": false,
+                    "error": format!("failed to save config: {e}")
+                }).to_string() + "\n",
+            }
         }
         _ => {
             serde_json::json!({
                 "success": false,
-                "error": format!("unsupported config key: {key}")
+                "error": format!("unsupported config key: {key} (supported: metric, step_size)")
             })
             .to_string()
                 + "\n"
@@ -582,15 +613,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_config_set_returns_not_implemented() {
+    async fn test_config_set_writes_to_disk() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::env::set_var("TOLLGATE_TEST_CONFIG_DIR", dir.path());
+        let config = crate::config::Config::new_default();
+        crate::config::save_config(&config).unwrap();
+
         let state = make_test_state();
         let resp = handle_command("config set metric milliseconds", &state).await;
         let json: serde_json::Value = serde_json::from_str(resp.trim()).unwrap();
-        assert_eq!(json["success"], false);
-        assert!(json["error"]
-            .as_str()
-            .unwrap()
-            .contains("not yet implemented"));
+        assert_eq!(json["success"], true);
+
+        let reloaded = crate::config::load_config().unwrap().unwrap();
+        assert_eq!(reloaded.metric, "milliseconds");
+
+        std::env::remove_var("TOLLGATE_TEST_CONFIG_DIR");
     }
 
     #[tokio::test]
