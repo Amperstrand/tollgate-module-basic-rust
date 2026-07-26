@@ -97,7 +97,19 @@ impl CaptivePortal for EmbeddedPortal {
     }
 
     async fn is_authenticated(&self, mac: &str) -> bool {
-        resolve_ip_from_mac(mac).is_some()
+        match resolve_ip_from_mac(mac) {
+            Some(ip) => self.rule_handles.lock().unwrap().contains_key(&ip),
+            None => false,
+        }
+    }
+}
+
+#[cfg(feature = "embedded-portal")]
+impl Drop for EmbeddedPortal {
+    fn drop(&mut self) {
+        if let Err(e) = self.nft.teardown() {
+            eprintln!("warning: nftables teardown failed: {e}");
+        }
     }
 }
 
