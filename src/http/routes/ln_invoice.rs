@@ -165,18 +165,16 @@ pub async fn handle_get_ln_invoice(
     let (state_str, check_state_str, expiry) = {
         let wallet_guard = state.wallet.lock().await;
         match wallet_guard.as_ref() {
-            Some(wallet) => {
-                match wallet.check_mint_quote(&stored.mint_url, &q.quote).await {
-                    Ok(raw) => {
-                        let lower = raw.to_lowercase();
-                        let is_paid = lower.contains("paid") || lower.contains("issued");
-                        let s = if is_paid { "paid" } else { "unpaid" };
-                        let cs = if is_paid { "PAID" } else { "UNPAID" };
-                        (s.to_string(), cs.to_string(), stored.expiry)
-                    }
-                    Err(_) => ("unpaid".to_string(), "UNPAID".to_string(), stored.expiry),
+            Some(wallet) => match wallet.check_mint_quote(&stored.mint_url, &q.quote).await {
+                Ok(raw) => {
+                    let lower = raw.to_lowercase();
+                    let is_paid = lower.contains("paid") || lower.contains("issued");
+                    let s = if is_paid { "paid" } else { "unpaid" };
+                    let cs = if is_paid { "PAID" } else { "UNPAID" };
+                    (s.to_string(), cs.to_string(), stored.expiry)
                 }
-            }
+                Err(_) => ("unpaid".to_string(), "UNPAID".to_string(), stored.expiry),
+            },
             None => ("unpaid".to_string(), "UNPAID".to_string(), stored.expiry),
         }
     };
