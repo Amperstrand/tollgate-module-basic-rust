@@ -26,7 +26,7 @@ pub async fn handle_usage(
         Some(m) => m,
         None => {
             return (
-                StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::OK,
                 [
                     ("content-type", "text/plain"),
                     ("access-control-allow-origin", "*"),
