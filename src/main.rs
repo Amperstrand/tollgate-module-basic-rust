@@ -45,8 +45,9 @@ async fn main() {
     let old_db = db_dir.join("wallet.db");
     let new_db = db_dir.join("wallet.sqlite");
     let migration_marker = db_dir.join(".migration_complete");
+    let tokens_file_exists = old_db.exists() && !new_db.exists() && !migration_marker.exists();
 
-    if old_db.exists() && !new_db.exists() && !migration_marker.exists() {
+    if tokens_file_exists {
         tracing::info!("detected gonuts bbolt wallet, attempting auto-migration");
         let export_tool = std::env::var("GONUTS_EXPORT_PATH")
             .unwrap_or_else(|_| "/usr/bin/gonuts-export".to_string());
@@ -60,12 +61,7 @@ async fn main() {
 
         match export_result {
             Ok(output) if output.status.success() => {
-                tracing::info!("gonuts-export completed, importing tokens");
-                let _ = std::fs::write(&migration_marker, b"");
-                tracing::info!("migration marker written");
-                // Tokens will be imported on next CLI `migrate` command
-                // or when mint connectivity allows wallet.receive()
-                tracing::info!(tokens_file = %tokens_file.display(), "tokens exported, run 'migrate <path>' via CLI to import");
+                tracing::info!(tokens_file = %tokens_file.display(), "gonuts-export completed");
             }
             Ok(output) => {
                 tracing::warn!(
@@ -77,9 +73,7 @@ async fn main() {
                 tracing::warn!(
                     error = %e,
                     export_tool = %export_tool,
-                    "gonuts-export not found or failed, starting with empty wallet. \
-                     Operator can run migration manually: gonuts-export wallet.db tokens.jsonl && \
-                     echo 'migrate /etc/tollgate/tokens.jsonl' | nc -U /var/run/tollgate.sock"
+                    "gonuts-export not found, starting with empty wallet. Manual: gonuts-export wallet.db tokens.jsonl"
                 );
             }
         }
@@ -100,6 +94,49 @@ async fn main() {
         match toll_wallet.ensure_mint(&mint.url).await {
             Ok(()) => tracing::info!(mint = %mint.url, "wallet registered for mint"),
             Err(e) => tracing::warn!(mint = %mint.url, error = %e, "failed to register mint"),
+        }
+    }
+
+    if tokens_file_exists {
+        tracing::info!("importing tokens from gonuts migration");
+        let tokens_path = db_dir.join("tokens.jsonl");
+        match std::fs::read_to_string(&tokens_path) {
+            Ok(content) => {
+                let mut imported = 0u64;
+                let mut failed = 0u64;
+                for line in content.lines() {
+                    let line = line.trim();
+                    if line.is_empty() || line.starts_with('#') {
+                        continue;
+                    }
+                    match toll_wallet.receive(line).await {
+                        Ok(amount) => {
+                            tracing::info!(amount, "token imported");
+                            imported += amount;
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "failed to import token");
+                            failed += 1;
+                        }
+                    }
+                }
+                tracing::info!(imported, failed, "migration import complete");
+
+                let _ = std::fs::write(&migration_marker,
+                    format!("imported={imported}\nfailed={failed}\ndate={}\n",
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs()));
+
+                if let Err(e) = std::fs::rename(&old_db, db_dir.join("wallet.db.pre-migration")) {
+                    tracing::warn!(error = %e, "failed to rename old wallet.db");
+                }
+                tracing::info!("migration complete: marker written, old wallet.db renamed");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to read tokens.jsonl for import");
+            }
         }
     }
 
