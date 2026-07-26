@@ -13,6 +13,7 @@ pub struct AppState {
     pub identity: Arc<crate::identity::MerchantIdentity>,
     pub wallet: Arc<tokio::sync::Mutex<Option<crate::wallet::wallet::TollWallet>>>,
     pub sessions: Arc<tokio::sync::Mutex<crate::session::SessionManager>>,
+    pub portal: Arc<dyn crate::portal::CaptivePortal>,
 }
 
 /// Build the main HTTP router with all routes.

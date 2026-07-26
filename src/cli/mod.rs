@@ -429,6 +429,7 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::identity::MerchantIdentity;
+    use crate::portal::{CaptivePortal, NdsPortal};
     use crate::session::SessionManager;
     use crate::wallet::TollWallet;
     use std::sync::Once;
@@ -437,16 +438,12 @@ mod tests {
 
     fn make_test_state() -> Arc<AppState> {
         INIT.call_once(|| {
-            // Redirect config/identity paths to a temp dir so tests
-            // don't try to write to /etc/tollgate (fails on CI runners).
             let dir = std::env::temp_dir().join("tollgate-cli-tests");
             std::fs::create_dir_all(&dir).ok();
             std::env::set_var("TOLLGATE_TEST_CONFIG_DIR", &dir);
         });
         let config = Arc::new(Config::new_default());
 
-        // Generate a test identity in-memory (don't hit disk — CI runners
-        // fail on MerchantIdentity::load_or_generate() write).
         let secp = secp256k1::Secp256k1::new();
         let (secret_key, _) = secp.generate_keypair(&mut rand::thread_rng());
         let identity = Arc::new(MerchantIdentity {
@@ -460,11 +457,13 @@ mod tests {
             std::path::PathBuf::from("/tmp"),
         ))));
         let sessions = Arc::new(tokio::sync::Mutex::new(SessionManager::new()));
+        let portal: Arc<dyn CaptivePortal> = Arc::new(NdsPortal::new());
         Arc::new(AppState {
             config,
             identity,
             wallet,
             sessions,
+            portal,
         })
     }
 

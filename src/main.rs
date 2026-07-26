@@ -1,7 +1,11 @@
 //! tollgate-module-basic-rust — main entry point.
 
 use std::sync::Arc;
-use tollgate_module_basic_rust::{cli, config, http, identity, session, tracing_setup, wallet};
+use tollgate_module_basic_rust::{
+    cli, config, http, identity, monitor,
+    portal::{CaptivePortal, NdsPortal},
+    session, tracing_setup, wallet,
+};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -103,13 +107,21 @@ async fn main() {
     let sessions = session::SessionManager::load_from_disk(&config::config_dir());
     tracing::info!(count = sessions.sessions.len(), "sessions loaded from disk");
 
-    // Build app state
+    let portal: Arc<dyn CaptivePortal> = Arc::new(NdsPortal::new());
+
     let state = Arc::new(http::AppState {
         config: Arc::new(config_obj),
         identity: Arc::new(identity),
         wallet: Arc::new(tokio::sync::Mutex::new(Some(toll_wallet))),
         sessions: Arc::new(tokio::sync::Mutex::new(sessions)),
+        portal: portal.clone(),
     });
+
+    let monitor_handle = {
+        let sessions = state.sessions.clone();
+        let portal = state.portal.clone();
+        monitor::Monitor::new(sessions, portal).start()
+    };
 
     // Start HTTP server + CLI socket
     let http_state = state.clone();
@@ -159,5 +171,6 @@ async fn main() {
 
     http_handle.abort();
     cli_handle.abort();
+    monitor_handle.abort();
     tracing::info!("shutdown complete");
 }

@@ -242,7 +242,7 @@ pub async fn handle_pay(
     drop(sessions);
 
     // Open the gate to grant network access via ndsctl.
-    if let Err(e) = crate::valve::open_gate(&mac).await {
+    if let Err(e) = state.portal.grant_access(&mac).await {
         tracing::warn!(mac = %mac, error = %e, "failed to open gate");
         // Continue anyway — session is created, gate may be opened manually.
     }
