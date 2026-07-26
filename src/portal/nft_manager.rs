@@ -107,33 +107,11 @@ impl NftManager {
             })
         };
 
-        let accept_in_set =
-            |batch: &mut Batch<'static>, proto: &'static str, field: &'static str, set: String| {
-                batch.add(NfListObject::Rule(schema::Rule {
-                    family: NfFamily::INet,
-                    table: table.clone(),
-                    chain: "forward".into(),
-                    expr: vec![
-                        lan_match(),
-                        Statement::Match(Match {
-                            left: Expression::Named(NamedExpression::Payload(
-                                Payload::PayloadField(PayloadField {
-                                    protocol: proto.into(),
-                                    field: field.into(),
-                                }),
-                            )),
-                            right: Expression::String(set.into()),
-                            op: Operator::IN,
-                        }),
-                        Statement::Accept(None),
-                    ]
-                    .into(),
-                    ..Default::default()
-                }));
-            };
-
-        accept_in_set(batch, "ip", "saddr", format!("@{SET_V4}"));
-        accept_in_set(batch, "ip6", "saddr", format!("@{SET_V6}"));
+        // Per-client counter+accept rules are added dynamically by grant_access.
+        // We do NOT add blanket set-accept rules here because they would shadow
+        // the per-client counter rules (nftables accept is terminal within a
+        // chain, so traffic matching a set-accept rule would never reach the
+        // counter rule appended after it).
 
         let accept_port = |batch: &mut Batch<'static>, proto: &'static str, port: u32| {
             batch.add(NfListObject::Rule(schema::Rule {
@@ -461,10 +439,13 @@ mod tests {
         let batch = mgr.build_install_batch();
         let json = serde_json::to_string(&batch.to_nftables()).unwrap();
 
-        assert!(json.contains("@authenticated_v4"));
-        assert!(json.contains("@authenticated_v6"));
+        assert!(
+            !json.contains("@authenticated_v4"),
+            "set-accept rules must NOT be in install batch (they shadow per-client counters)"
+        );
         assert!(json.contains("\"accept\""));
         assert!(json.contains("53"));
+        assert!(json.contains("2121"));
     }
 
     #[cfg(feature = "embedded-portal")]

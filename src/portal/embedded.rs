@@ -66,19 +66,47 @@ fn resolve_all_or_err(mac: &str) -> Result<Vec<IpAddr>, String> {
 #[async_trait]
 impl CaptivePortal for EmbeddedPortal {
     async fn grant_access(&self, mac: &str) -> Result<(), String> {
-        let ips = resolve_all_or_err(mac)?;
+        let mac_owned = mac.to_string();
         let nft = self.nft.clone();
         let handles = tokio::task::spawn_blocking(move || -> Result<Vec<(IpAddr, u32)>, String> {
-            let mut handles = Vec::new();
+            let ips = crate::mac_resolver::resolve_all_ips_from_mac(&mac_owned);
+            if ips.is_empty() {
+                return Err(format!("no IP address found for MAC {mac_owned}"));
+            }
+            let mut installed = Vec::new();
             for ip in &ips {
-                nft.add_client(*ip).map_err(|e| e.to_string())?;
-                nft.create_counter(*ip).map_err(|e| e.to_string())?;
+                if let Err(e) = nft.add_client(*ip) {
+                    for (done_ip, done_h) in &installed {
+                        let _ = nft.delete_rule(*done_h);
+                        let _ = nft.remove_client(*done_ip);
+                        let _ = nft.delete_counter(done_ip);
+                    }
+                    return Err(e.to_string());
+                }
+                if let Err(e) = nft.create_counter(*ip) {
+                    let _ = nft.remove_client(*ip);
+                    for (done_ip, done_h) in &installed {
+                        let _ = nft.delete_rule(*done_h);
+                        let _ = nft.remove_client(*done_ip);
+                        let _ = nft.delete_counter(done_ip);
+                    }
+                    return Err(e.to_string());
+                }
                 match nft.add_counter_rule(*ip) {
-                    Ok(h) => handles.push((*ip, h)),
-                    Err(e) => return Err(e.to_string()),
+                    Ok(h) => installed.push((*ip, h)),
+                    Err(e) => {
+                        let _ = nft.delete_counter(ip);
+                        let _ = nft.remove_client(*ip);
+                        for (done_ip, done_h) in &installed {
+                            let _ = nft.delete_rule(*done_h);
+                            let _ = nft.remove_client(*done_ip);
+                            let _ = nft.delete_counter(done_ip);
+                        }
+                        return Err(e.to_string());
+                    }
                 }
             }
-            Ok(handles)
+            Ok(installed)
         })
         .await
         .map_err(|e| e.to_string())??;
@@ -91,37 +119,49 @@ impl CaptivePortal for EmbeddedPortal {
     }
 
     async fn revoke_access(&self, mac: &str) -> Result<(), String> {
-        let ips = resolve_all_or_err(mac)?;
-        let handles: Vec<(IpAddr, Option<u32>)> = {
-            let mut map = self.rule_handles.lock().unwrap();
-            ips.iter().map(|ip| (*ip, map.remove(ip))).collect()
+        let mac_owned = mac.to_string();
+        let nft = self.nft.clone();
+        let handles_snapshot: std::collections::HashMap<IpAddr, u32> = {
+            let map = self.rule_handles.lock().unwrap();
+            map.clone()
         };
 
-        let nft = self.nft.clone();
-        tokio::task::spawn_blocking(move || -> Result<(), String> {
-            for (ip, handle) in &handles {
-                if let Some(h) = handle {
-                    let _ = nft.delete_rule(*h);
+        let cleaned_ips: Vec<IpAddr> =
+            tokio::task::spawn_blocking(move || -> Result<Vec<IpAddr>, String> {
+                let ips = crate::mac_resolver::resolve_all_ips_from_mac(&mac_owned);
+                let mut cleaned = Vec::new();
+                for ip in &ips {
+                    if let Some(h) = handles_snapshot.get(ip) {
+                        let _ = nft.delete_rule(*h);
+                    }
+                    let _ = nft.remove_client(*ip);
+                    let _ = nft.delete_counter(ip);
+                    cleaned.push(*ip);
                 }
-                let _ = nft.remove_client(*ip);
-                let _ = nft.delete_counter(ip);
-            }
-            Ok(())
-        })
-        .await
-        .map_err(|e| e.to_string())?
+                Ok(cleaned)
+            })
+            .await
+            .map_err(|e| e.to_string())??;
+
+        let mut map = self.rule_handles.lock().unwrap();
+        for ip in &cleaned_ips {
+            map.remove(ip);
+        }
+        Ok(())
     }
 
     async fn poll_usage(&self, mac: &str) -> Result<(u64, u64), String> {
-        let ips = resolve_all_or_err(mac)?;
+        let mac_owned = mac.to_string();
         let nft = self.nft.clone();
         tokio::task::spawn_blocking(move || -> Result<(u64, u64), String> {
-            let mut total_packets = 0u64;
+            let ips = crate::mac_resolver::resolve_all_ips_from_mac(&mac_owned);
+            if ips.is_empty() {
+                return Err(format!("no IP address found for MAC {mac_owned}"));
+            }
             let mut total_bytes = 0u64;
             for ip in &ips {
-                if let Ok((p, b)) = nft.poll_counter(ip) {
-                    total_packets += p;
-                    total_bytes += b;
+                if let Ok((_, bytes)) = nft.poll_counter(ip) {
+                    total_bytes += bytes;
                 }
             }
             Ok((total_bytes, 0))
@@ -131,12 +171,17 @@ impl CaptivePortal for EmbeddedPortal {
     }
 
     async fn is_authenticated(&self, mac: &str) -> bool {
-        let ips = resolve_all_ips_from_mac(mac);
-        if ips.is_empty() {
-            return false;
-        }
-        let map = self.rule_handles.lock().unwrap();
-        ips.iter().any(|ip| map.contains_key(ip))
+        let mac_owned = mac.to_string();
+        let known_ips: Vec<IpAddr> = {
+            let map = self.rule_handles.lock().unwrap();
+            map.keys().cloned().collect()
+        };
+        tokio::task::spawn_blocking(move || {
+            let ips = crate::mac_resolver::resolve_all_ips_from_mac(&mac_owned);
+            ips.iter().any(|ip| known_ips.contains(ip))
+        })
+        .await
+        .unwrap_or(false)
     }
 }
 
