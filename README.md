@@ -94,8 +94,23 @@ and migration of production wallets under live network conditions.
 - **`thiserror 1`** — error derive macro.
 - **`sha2 0.10` + `hex 0.4`** — event ID hashing.
 - **`rand 0.8`** — key/seed generation.
+- **`async-trait 0.1`** — object-safe CaptivePortal trait (dyn dispatch).
+- **`nftables 0.6`** (optional, `embedded-portal` feature) — nftables JSON API.
 
 **No OpenSSL dependency.** TLS is handled by rustls for static musl linking.
+
+### Embedded Portal Feature
+
+The `embedded-portal` cargo feature enables a built-in nftables-based captive
+portal that can eventually replace the NoDogSplash (NDS) dependency:
+
+```bash
+# Default build (uses NdsPortal — calls ndsctl auth/deauth, same as Go)
+cargo build --release
+
+# Embedded portal build (uses nftables directly — no NDS needed)
+cargo build --release --features embedded-portal
+```
 
 ## Build
 
@@ -302,8 +317,11 @@ echo "migrate /etc/tollgate/tokens.jsonl" | socat - UNIX-CONNECT:/var/run/tollga
 ## Testing
 
 ```bash
-# Run all 78 unit tests
+# Run all 194 unit tests (default features)
 cargo test
+
+# Run all 212 tests including embedded portal
+cargo test --features embedded-portal
 
 # Run with output visible
 cargo test -- --nocapture
@@ -314,6 +332,8 @@ cargo test config
 cargo test session
 cargo test metering
 cargo test cli
+cargo test portal
+cargo test monitor
 ```
 
 **Test coverage by module:**
