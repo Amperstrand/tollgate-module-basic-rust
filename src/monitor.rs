@@ -1,25 +1,16 @@
-//! Background usage monitoring — polls active sessions every 2 seconds and
-//! revokes access (`close_gate` + `revoke_session`) when the allotment is
-//! exhausted.
-//!
-//! Mirrors Go `merchant.go:StartDataUsageMonitoring`. For "bytes" sessions
-//! the actual bandwidth is queried via `ndsctl json <mac>`; for time-based
-//! sessions the elapsed time since `granted_at` is used.
-
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tokio::process::Command;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
+use crate::portal::CaptivePortal;
 use crate::session::SessionManager;
 
 pub struct Monitor {
     sessions: Arc<Mutex<SessionManager>>,
-    valve_mutex: Arc<Mutex<()>>,
+    portal: Arc<dyn CaptivePortal>,
     interval_secs: u64,
-    ndsctl_bin: String,
 }
 
 fn now_secs() -> u64 {
@@ -33,23 +24,12 @@ fn is_time_metric(metric: &str) -> bool {
     metric == "milliseconds" || metric == "time"
 }
 
-fn parse_ndsctl_json_usage(stdout: &str) -> u64 {
-    let v: serde_json::Value = match serde_json::from_str(stdout) {
-        Ok(v) => v,
-        Err(_) => return 0,
-    };
-    let downloaded_kb = v.get("downloaded").and_then(|n| n.as_u64()).unwrap_or(0);
-    let uploaded_kb = v.get("uploaded").and_then(|n| n.as_u64()).unwrap_or(0);
-    downloaded_kb.saturating_add(uploaded_kb) * 1024
-}
-
 impl Monitor {
-    pub fn new(sessions: Arc<Mutex<SessionManager>>) -> Self {
+    pub fn new(sessions: Arc<Mutex<SessionManager>>, portal: Arc<dyn CaptivePortal>) -> Self {
         Monitor {
             sessions,
-            valve_mutex: Arc::new(Mutex::new(())),
+            portal,
             interval_secs: 2,
-            ndsctl_bin: std::env::var("NDSCTL_BIN").unwrap_or_else(|_| "ndsctl".to_string()),
         }
     }
 
@@ -58,22 +38,15 @@ impl Monitor {
         self
     }
 
-    #[cfg(test)]
-    fn with_ndsctl_bin(mut self, bin: &str) -> Self {
-        self.ndsctl_bin = bin.to_string();
-        self
-    }
-
     pub fn start(self) -> JoinHandle<()> {
         let interval = Duration::from_secs(self.interval_secs.max(1));
         let sessions = self.sessions;
-        let valve_mutex = self.valve_mutex;
-        let ndsctl_bin = self.ndsctl_bin;
+        let portal = self.portal;
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             loop {
                 ticker.tick().await;
-                run_tick(&sessions, &valve_mutex, &ndsctl_bin).await;
+                run_tick(&sessions, &portal).await;
             }
         })
     }
@@ -86,11 +59,7 @@ struct SessionSnapshot {
     granted_at: u64,
 }
 
-async fn run_tick(
-    sessions: &Arc<Mutex<SessionManager>>,
-    valve_mutex: &Arc<Mutex<()>>,
-    ndsctl_bin: &str,
-) {
+async fn run_tick(sessions: &Arc<Mutex<SessionManager>>, portal: &Arc<dyn CaptivePortal>) {
     let now = now_secs();
 
     let snapshots: Vec<SessionSnapshot> = {
@@ -112,7 +81,17 @@ async fn run_tick(
 
     for snap in &snapshots {
         if snap.metric == "bytes" {
-            let usage = query_ndsctl_usage(valve_mutex, ndsctl_bin, &snap.mac).await;
+            let usage = match portal.poll_usage(&snap.mac).await {
+                Ok((used, _total)) => used,
+                Err(e) => {
+                    tracing::debug!(
+                        mac = %snap.mac,
+                        error = %e,
+                        "portal.poll_usage failed, treating as zero"
+                    );
+                    0
+                }
+            };
             updates.push((snap.mac.clone(), usage));
             if usage >= snap.allotment {
                 to_revoke.push(snap.mac.clone());
@@ -144,54 +123,93 @@ async fn run_tick(
 
     for mac in &to_revoke {
         tracing::warn!(mac = %mac, "allotment reached, closing gate");
-        if let Err(e) = crate::valve::close_gate(mac).await {
+        if let Err(e) = portal.revoke_access(mac).await {
             tracing::warn!(mac = %mac, error = %e, "failed to close gate");
         }
     }
 }
 
-async fn query_ndsctl_usage(valve_mutex: &Arc<Mutex<()>>, bin: &str, mac: &str) -> u64 {
-    let _lock = valve_mutex.lock().await;
-
-    let output = match Command::new(bin).args(["json", mac]).output().await {
-        Ok(o) => o,
-        Err(_) => {
-            tracing::debug!(mac = %mac, "ndsctl not available, skipping bandwidth check");
-            return 0;
-        }
-    };
-
-    if !output.status.success() {
-        tracing::debug!(mac = %mac, "ndsctl json returned non-zero, skipping");
-        return 0;
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_ndsctl_json_usage(&stdout)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::{Path, PathBuf};
+    use async_trait::async_trait;
+    use std::collections::HashMap;
+    use std::sync::Mutex as StdMutex;
 
-    fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
-        let path = dir.join(name);
-        std::fs::write(&path, body).expect("write mock script");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&path).expect("stat script").permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&path, perms).expect("chmod script");
+    struct MockPortal {
+        usage_map: StdMutex<HashMap<String, u64>>,
+        revoked: StdMutex<Vec<String>>,
+        granted: StdMutex<Vec<String>>,
+        fail_poll: StdMutex<bool>,
+    }
+
+    impl MockPortal {
+        fn new() -> Self {
+            MockPortal {
+                usage_map: StdMutex::new(HashMap::new()),
+                revoked: StdMutex::new(Vec::new()),
+                granted: StdMutex::new(Vec::new()),
+                fail_poll: StdMutex::new(false),
+            }
         }
-        path
+
+        fn set_usage(&self, mac: &str, bytes: u64) {
+            self.usage_map
+                .lock()
+                .unwrap()
+                .insert(mac.to_string(), bytes);
+        }
+
+        fn set_fail_poll(&self, fail: bool) {
+            *self.fail_poll.lock().unwrap() = fail;
+        }
+
+        fn was_revoked(&self, mac: &str) -> bool {
+            self.revoked.lock().unwrap().iter().any(|m| m == mac)
+        }
+
+        #[allow(dead_code)]
+        fn was_granted(&self, mac: &str) -> bool {
+            self.granted.lock().unwrap().iter().any(|m| m == mac)
+        }
+    }
+
+    #[async_trait]
+    impl CaptivePortal for MockPortal {
+        async fn grant_access(&self, mac: &str) -> Result<(), String> {
+            self.granted.lock().unwrap().push(mac.to_string());
+            Ok(())
+        }
+
+        async fn revoke_access(&self, mac: &str) -> Result<(), String> {
+            self.revoked.lock().unwrap().push(mac.to_string());
+            Ok(())
+        }
+
+        async fn poll_usage(&self, mac: &str) -> Result<(u64, u64), String> {
+            if *self.fail_poll.lock().unwrap() {
+                return Err("mock poll failure".to_string());
+            }
+            let usage = self
+                .usage_map
+                .lock()
+                .unwrap()
+                .get(mac)
+                .copied()
+                .unwrap_or(0);
+            Ok((usage, 0))
+        }
+
+        async fn is_authenticated(&self, _mac: &str) -> bool {
+            false
+        }
     }
 
     #[tokio::test]
     async fn test_monitor_creates_and_starts() {
         let sessions = Arc::new(Mutex::new(SessionManager::new()));
-        let monitor = Monitor::new(sessions).with_interval(1);
+        let portal: Arc<dyn CaptivePortal> = Arc::new(MockPortal::new());
+        let monitor = Monitor::new(sessions, portal).with_interval(1);
         let handle = monitor.start();
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(!handle.is_finished(), "monitor task should be running");
@@ -200,14 +218,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_bytes_session_expires_on_usage() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let script = "#!/bin/sh\n\
-if [ \"$1\" = \"json\" ]; then\n\
-  echo '{\"downloaded\": 1000000, \"uploaded\": 500000}'\n\
-  exit 0\n\
-fi\n\
-exit 0\n";
-        let bin = write_script(dir.path(), "ndsctl", script);
+        let mock = Arc::new(MockPortal::new());
+        mock.set_usage("aa:bb:cc:dd:ee:02", 2_000_000);
 
         let sessions = Arc::new(Mutex::new(SessionManager::new()));
         {
@@ -215,9 +227,8 @@ exit 0\n";
             mgr.create_session("aa:bb:cc:dd:ee:02", 1024, "bytes", 3600);
         }
 
-        let monitor = Monitor::new(sessions.clone())
-            .with_interval(1)
-            .with_ndsctl_bin(bin.to_str().unwrap());
+        let portal: Arc<dyn CaptivePortal> = mock.clone();
+        let monitor = Monitor::new(sessions.clone(), portal).with_interval(1);
         let handle = monitor.start();
 
         tokio::time::sleep(Duration::from_secs(3)).await;
@@ -228,17 +239,22 @@ exit 0\n";
             mgr.get_session("aa:bb:cc:dd:ee:02").is_none(),
             "bytes session should be revoked after usage exceeds allotment"
         );
+        assert!(
+            mock.was_revoked("aa:bb:cc:dd:ee:02"),
+            "portal.revoke_access should be called for expired session"
+        );
     }
 
     #[tokio::test]
     async fn test_ms_session_expires_on_time() {
         let sessions = Arc::new(Mutex::new(SessionManager::new()));
+        let portal: Arc<dyn CaptivePortal> = Arc::new(MockPortal::new());
         {
             let mut mgr = sessions.lock().await;
             mgr.create_session("aa:bb:cc:dd:ee:03", 1, "milliseconds", 3600);
         }
 
-        let monitor = Monitor::new(sessions.clone()).with_interval(1);
+        let monitor = Monitor::new(sessions.clone(), portal).with_interval(1);
         let handle = monitor.start();
 
         tokio::time::sleep(Duration::from_secs(3)).await;
@@ -252,55 +268,35 @@ exit 0\n";
     }
 
     #[tokio::test]
-    async fn test_ndsctl_unavailable_doesnt_crash() {
+    async fn test_portal_poll_error_doesnt_crash() {
+        let mock = Arc::new(MockPortal::new());
+        mock.set_fail_poll(true);
+
         let sessions = Arc::new(Mutex::new(SessionManager::new()));
         {
             let mut mgr = sessions.lock().await;
             mgr.create_session("aa:bb:cc:dd:ee:01", 1_000_000, "bytes", 3600);
         }
 
-        let monitor = Monitor::new(sessions.clone())
-            .with_interval(1)
-            .with_ndsctl_bin("/nonexistent/ndsctl-test-path");
+        let portal: Arc<dyn CaptivePortal> = mock.clone();
+        let monitor = Monitor::new(sessions.clone(), portal).with_interval(1);
         let handle = monitor.start();
 
         tokio::time::sleep(Duration::from_secs(3)).await;
 
         assert!(
             !handle.is_finished(),
-            "monitor should still be running when ndsctl unavailable"
+            "monitor should still be running when portal.poll_usage errors"
         );
 
         {
             let mgr = sessions.lock().await;
             assert!(
                 mgr.get_session("aa:bb:cc:dd:ee:01").is_some(),
-                "session should persist when ndsctl unavailable"
+                "session should persist when portal.poll_usage errors"
             );
         }
 
         handle.abort();
-    }
-
-    #[test]
-    fn test_parse_ndsctl_json_usage() {
-        let json = r#"{"downloaded": 1000, "uploaded": 500}"#;
-        assert_eq!(parse_ndsctl_json_usage(json), (1000 + 500) * 1024);
-    }
-
-    #[test]
-    fn test_parse_ndsctl_json_missing_fields() {
-        assert_eq!(
-            parse_ndsctl_json_usage(r#"{"downloaded": 1000}"#),
-            1000 * 1024
-        );
-        assert_eq!(parse_ndsctl_json_usage(r#"{"uploaded": 500}"#), 500 * 1024);
-        assert_eq!(parse_ndsctl_json_usage("{}"), 0);
-    }
-
-    #[test]
-    fn test_parse_ndsctl_json_invalid() {
-        assert_eq!(parse_ndsctl_json_usage(""), 0);
-        assert_eq!(parse_ndsctl_json_usage("not json"), 0);
     }
 }
