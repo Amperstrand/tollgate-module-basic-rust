@@ -471,6 +471,7 @@ mod tests {
     use crate::portal::{CaptivePortal, NdsPortal};
     use crate::session::SessionManager;
     use crate::wallet::TollWallet;
+    use serial_test::serial;
     use std::sync::Once;
 
     static INIT: Once = Once::new();
@@ -621,6 +622,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_config_set_writes_to_disk() {
         let dir = tempfile::TempDir::new().unwrap();
         std::env::set_var("TOLLGATE_TEST_CONFIG_DIR", dir.path());

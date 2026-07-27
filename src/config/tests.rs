@@ -11,6 +11,7 @@ use super::{
     config_dir, config_path, identities_path, install_path, load_config, load_identities,
     load_install,
 };
+use serial_test::serial;
 use std::fs;
 
 const PRODUCTION_CONFIG_JSON: &str = r#"{
@@ -115,6 +116,7 @@ fn with_test_dir(files: &[(&str, &str)]) -> std::path::PathBuf {
 }
 
 #[test]
+#[serial]
 fn default_config_path_is_etc_tollgate() {
     std::env::remove_var("TOLLGATE_TEST_CONFIG_DIR");
     assert_eq!(
@@ -132,6 +134,7 @@ fn default_config_path_is_etc_tollgate() {
 }
 
 #[test]
+#[serial]
 fn config_path_honors_test_config_dir() {
     let dir = std::env::temp_dir().join(format!("tollgate-cfg-test-{}", rand_hex()));
     fs::create_dir_all(&dir).unwrap();
@@ -144,6 +147,7 @@ fn config_path_honors_test_config_dir() {
 }
 
 #[test]
+#[serial]
 fn config_dir_reports_correct_directory() {
     std::env::remove_var("TOLLGATE_TEST_CONFIG_DIR");
     assert_eq!(config_dir(), std::path::Path::new("/etc/tollgate"));
@@ -156,6 +160,7 @@ fn config_dir_reports_correct_directory() {
 }
 
 #[test]
+#[serial]
 fn loads_full_production_config() {
     with_test_dir(&[
         ("config.json", PRODUCTION_CONFIG_JSON),
@@ -232,6 +237,7 @@ fn loads_full_production_config() {
 }
 
 #[test]
+#[serial]
 fn missing_config_file_returns_none() {
     let dir = std::env::temp_dir().join(format!("tollgate-missing-{}", rand_hex()));
     fs::create_dir_all(&dir).unwrap();
@@ -243,6 +249,7 @@ fn missing_config_file_returns_none() {
 }
 
 #[test]
+#[serial]
 fn empty_config_file_returns_none() {
     let dir = std::env::temp_dir().join(format!("tollgate-empty-{}", rand_hex()));
     fs::create_dir_all(&dir).unwrap();
@@ -255,6 +262,7 @@ fn empty_config_file_returns_none() {
 }
 
 #[test]
+#[serial]
 fn loads_identities() {
     with_test_dir(&[("identities.json", IDENTITIES_JSON)]);
     let ids = load_identities()
@@ -281,6 +289,7 @@ fn loads_identities() {
 }
 
 #[test]
+#[serial]
 fn loads_install_config() {
     with_test_dir(&[("install.json", INSTALL_JSON)]);
     let inst = load_install().expect("install should load").expect("Some");

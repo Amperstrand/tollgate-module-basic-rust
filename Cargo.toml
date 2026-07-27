@@ -65,6 +65,7 @@ embedded-portal = ["dep:nftables"]
 
 [dev-dependencies]
 tempfile = "3"
+serial_test = "3"
 
 [patch.crates-io]
 cdk-common = { git = "https://github.com/Amperstrand/cdk-common", branch = "main" }

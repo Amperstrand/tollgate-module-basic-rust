@@ -115,11 +115,6 @@ jobs:
           ls -lh "$BIN"
           echo "SIZE_BYTES=$(stat -c %s "$BIN")" >> $GITHUB_ENV
 
-      - name: Build .ipk package
-        run: |
-          ARCH=$(echo "${{ matrix.target }}" | sed 's/unknown-linux-musl//' | sed 's/musleabihf//' | tr -d '-')
-          ./packaging/build-ipk.sh "$ARCH" dist/
-
       - name: Stage artifacts
         run: |
           mkdir -p openwrt
