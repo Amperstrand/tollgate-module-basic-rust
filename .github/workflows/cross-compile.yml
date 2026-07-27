@@ -115,14 +115,22 @@ jobs:
           ls -lh "$BIN"
           echo "SIZE_BYTES=$(stat -c %s "$BIN")" >> $GITHUB_ENV
 
-      - name: Stage binary for packaging
+      - name: Build .ipk package
+        run: |
+          ARCH=$(echo "${{ matrix.target }}" | sed 's/unknown-linux-musl//' | sed 's/musleabihf//' | tr -d '-')
+          ./packaging/build-ipk.sh "$ARCH" dist/
+
+      - name: Stage artifacts
         run: |
           mkdir -p openwrt
           cp target/${{ matrix.target }}/release/tollgate-module-basic-rust \
              openwrt/tollgate-module-basic-rust-${{ matrix.target }}
+          cp dist/*.ipk openwrt/ 2>/dev/null || true
 
       - uses: actions/upload-artifact@v4
         with:
           name: tollgate-${{ matrix.target }}
-          path: openwrt/tollgate-module-basic-rust-${{ matrix.target }}
+          path: |
+            openwrt/tollgate-module-basic-rust-${{ matrix.target }}
+            openwrt/*.ipk
           if-no-files-found: error
