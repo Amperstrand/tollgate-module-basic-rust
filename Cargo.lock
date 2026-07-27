@@ -389,6 +389,31 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "cashu"
+version = "0.17.0"
+source = "git+https://github.com/cashubtc/cdk?branch=main#d033f1bde4678574f55dad115707b36018031ab5"
+dependencies = [
+ "bitcoin",
+ "cbor-diag",
+ "ciborium",
+ "lightning",
+ "lightning-invoice",
+ "once_cell",
+ "serde",
+ "serde_json",
+ "serde_with",
+ "strum",
+ "strum_macros",
+ "thiserror 2.0.19",
+ "tracing",
+ "unicode-normalization",
+ "url",
+ "uuid",
+ "web-time",
+ "zeroize",
+]
+
+[[package]]
+name = "cashu"
 version = "0.17.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92e035322b7e279fc37a110e5fffdcf987fa5414caea1d0576cedb3b3611cbbb"
@@ -456,7 +481,7 @@ dependencies = [
  "bitcoin",
  "bitcoin-payment-instructions",
  "cbor-diag",
- "cdk-common",
+ "cdk-common 0.17.3",
  "cdk-signatory",
  "ciborium",
  "futures",
@@ -483,6 +508,37 @@ dependencies = [
 
 [[package]]
 name = "cdk-common"
+version = "0.17.0"
+source = "git+https://github.com/cashubtc/cdk?branch=main#d033f1bde4678574f55dad115707b36018031ab5"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bitcoin",
+ "cashu 0.17.0",
+ "cbor-diag",
+ "ciborium",
+ "futures",
+ "getrandom 0.2.17",
+ "jsonwebtoken",
+ "lightning",
+ "lightning-invoice",
+ "parking_lot",
+ "paste",
+ "serde",
+ "serde_json",
+ "serde_with",
+ "thiserror 2.0.19",
+ "tokio",
+ "tracing",
+ "url",
+ "uuid",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-time",
+]
+
+[[package]]
+name = "cdk-common"
 version = "0.17.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7cb4f7239c3ed8ce35d8928324cf73147c802eb4f7cc42ef71827954cda96ac3"
@@ -490,7 +546,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bitcoin",
- "cashu",
+ "cashu 0.17.3",
  "cbor-diag",
  "cdk-http-client",
  "ciborium",
@@ -547,7 +603,7 @@ dependencies = [
  "async-trait",
  "bip39",
  "bitcoin",
- "cdk-common",
+ "cdk-common 0.17.3",
  "clap",
  "getrandom 0.2.17",
  "home",
@@ -567,7 +623,7 @@ checksum = "9ed515d34378fa51a5531882ea7c774f1f7af69bd4f50958c120c96f9159ac2f"
 dependencies = [
  "async-trait",
  "bitcoin",
- "cdk-common",
+ "cdk-common 0.17.3",
  "lightning-invoice",
  "once_cell",
  "serde",
@@ -586,7 +642,7 @@ checksum = "f96798d170b82f860daa83b2fc8f997151e6b77eb9f37c2ff4a92a7b5d650033"
 dependencies = [
  "async-trait",
  "bitcoin",
- "cdk-common",
+ "cdk-common 0.17.3",
  "cdk-sql-common",
  "lightning-invoice",
  "paste",
@@ -2807,8 +2863,9 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
- "cashu",
+ "cashu 0.17.3",
  "cdk",
+ "cdk-common 0.17.0",
  "cdk-sqlite",
  "hex",
  "http-body-util",

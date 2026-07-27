@@ -26,7 +26,11 @@ tower-http = { version = "0.6", features = ["cors", "timeout", "trace"] }
 http-body-util = "0.1"
 
 # Cashu Development Kit (wallet side — we are a wallet talking to mints)
+# cdk-common patched from git main because crates.io 0.17.3 still has
+# AtomicU64 which breaks 32-bit MIPS. Remove the git override when
+# cashubtc publishes >=0.17.4 to crates.io.
 cdk = { version = "0.17", default-features = false, features = ["wallet"] }
+cdk-common = { git = "https://github.com/cashubtc/cdk", branch = "main" }
 cdk-sqlite = "0.17"
 
 # Cashu protocol primitives (Token parsing, NUT types)
@@ -66,9 +70,6 @@ embedded-portal = ["dep:nftables"]
 
 [dev-dependencies]
 tempfile = "3"
-
-[patch.crates-io]
-cdk-common = { git = "https://github.com/cashubtc/cdk", branch = "main" }
 
 [profile.release]
 # Aggressive size optimization — tollgate ships on resource-constrained OpenWrt routers
