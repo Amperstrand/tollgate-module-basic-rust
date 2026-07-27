@@ -71,7 +71,7 @@ tempfile = "3"
 
 [profile.release]
 # Aggressive size optimization — tollgate ships on resource-constrained OpenWrt routers
-panic = "abort"
+panic = "unwind"
 strip = true
 opt-level = "z"
 lto = true
