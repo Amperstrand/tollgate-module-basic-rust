@@ -456,7 +456,7 @@ dependencies = [
  "bitcoin",
  "bitcoin-payment-instructions",
  "cbor-diag",
- "cdk-common",
+ "cdk-common 0.17.3 (registry+https://github.com/rust-lang/crates.io-index)",
  "cdk-signatory",
  "ciborium",
  "futures",
@@ -516,6 +516,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "cdk-common"
+version = "0.17.3"
+source = "git+https://github.com/Amperstrand/cdk-common?branch=main#524e9c922805b624efe88b7c5e00b7e40db7dfbe"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bitcoin",
+ "cashu",
+ "cbor-diag",
+ "cdk-http-client",
+ "ciborium",
+ "futures",
+ "getrandom 0.2.17",
+ "jsonwebtoken",
+ "lightning",
+ "lightning-invoice",
+ "parking_lot",
+ "paste",
+ "serde",
+ "serde_json",
+ "serde_with",
+ "thiserror 2.0.19",
+ "tokio",
+ "tracing",
+ "url",
+ "uuid",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-time",
+]
+
+[[package]]
 name = "cdk-http-client"
 version = "0.17.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -547,7 +579,7 @@ dependencies = [
  "async-trait",
  "bip39",
  "bitcoin",
- "cdk-common",
+ "cdk-common 0.17.3 (registry+https://github.com/rust-lang/crates.io-index)",
  "clap",
  "getrandom 0.2.17",
  "home",
@@ -567,7 +599,7 @@ checksum = "9ed515d34378fa51a5531882ea7c774f1f7af69bd4f50958c120c96f9159ac2f"
 dependencies = [
  "async-trait",
  "bitcoin",
- "cdk-common",
+ "cdk-common 0.17.3 (registry+https://github.com/rust-lang/crates.io-index)",
  "lightning-invoice",
  "once_cell",
  "serde",
@@ -586,7 +618,7 @@ checksum = "f96798d170b82f860daa83b2fc8f997151e6b77eb9f37c2ff4a92a7b5d650033"
 dependencies = [
  "async-trait",
  "bitcoin",
- "cdk-common",
+ "cdk-common 0.17.3 (registry+https://github.com/rust-lang/crates.io-index)",
  "cdk-sql-common",
  "lightning-invoice",
  "paste",
@@ -2845,6 +2877,7 @@ dependencies = [
  "axum",
  "cashu",
  "cdk",
+ "cdk-common 0.17.3 (git+https://github.com/Amperstrand/cdk-common?branch=main)",
  "cdk-sqlite",
  "hex",
  "http-body-util",
