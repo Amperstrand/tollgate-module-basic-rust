@@ -13,7 +13,7 @@ pub struct NetworkInfo {
 }
 
 /// A gateway with pricing info — a TollGate access point.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Gateway {
     pub bssid: String,
     pub ssid: String,

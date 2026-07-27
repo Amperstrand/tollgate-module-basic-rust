@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tollgate_module_basic_rust::{
     cli, config, http, identity, monitor,
     portal::{self, CaptivePortal},
-    session, tracing_setup, wallet,
+    session, tracing_setup, wallet, wireless,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -174,6 +174,40 @@ async fn main() {
         monitor::Monitor::new(sessions, portal).start()
     };
 
+    let upstream_handle = {
+        let upstream_config = wireless::UpstreamWifiConfig::default();
+        let mut mgr = wireless::UpstreamManager::new(upstream_config);
+        let wallet_arc = state.wallet.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+                wireless::UpstreamWifiConfig::default().scan_interval_seconds,
+            ));
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let token: Option<String> = {
+                    let w = wallet_arc.lock().await;
+                    if let Some(wallet) = w.as_ref() {
+                        match wallet.get_balance().await {
+                            Ok(0) => None,
+                            Ok(balance) => {
+                                tracing::debug!(balance, "wallet has balance for upstream payment");
+                                None
+                            }
+                            Err(_) => None,
+                        }
+                    } else {
+                        None
+                    }
+                };
+                let action = mgr.tick(token.as_deref()).await;
+                if action != wireless::ManagerAction::NoAction {
+                    tracing::info!(action = ?action, "upstream manager action");
+                }
+            }
+        })
+    };
+
     // Start HTTP server + CLI socket
     let http_state = state.clone();
     let http_handle = tokio::spawn(async move {
@@ -278,6 +312,7 @@ async fn main() {
     http_handle.abort();
     cli_handle.abort();
     monitor_handle.abort();
+    upstream_handle.abort();
     #[cfg(feature = "embedded-portal")]
     redirect_handle.abort();
     #[cfg(feature = "embedded-portal")]
