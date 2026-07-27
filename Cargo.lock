@@ -484,7 +484,8 @@ dependencies = [
 [[package]]
 name = "cdk-common"
 version = "0.17.3"
-source = "git+https://github.com/Amperstrand/cdk-common?branch=main#524e9c922805b624efe88b7c5e00b7e40db7dfbe"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7cb4f7239c3ed8ce35d8928324cf73147c802eb4f7cc42ef71827954cda96ac3"
 dependencies = [
  "anyhow",
  "async-trait",

@@ -68,7 +68,7 @@ tempfile = "3"
 serial_test = "3"
 
 [patch.crates-io]
-cdk-common = { git = "https://github.com/Amperstrand/cdk-common", branch = "main" }
+# cdk-common fork removed — upstream CDK 0.17.3 includes the AtomicUsize fix (PR #2261)
 
 [profile.release]
 # Aggressive size optimization — tollgate ships on resource-constrained OpenWrt routers
