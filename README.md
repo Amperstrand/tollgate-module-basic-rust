@@ -1,7 +1,7 @@
 # tollgate-module-basic-rust
 
 > **Status: WIP — Phase 7 (test parity on physical hardware) in progress.**
-> Phases 0–6 are complete (78 unit tests passing). The Go original remains
+> Phases 0–6 are complete (210 unit tests passing). The Go original remains
 > the production binary until this Rust clone passes full test-parity on
 > real OpenWrt hardware.
 
@@ -74,9 +74,10 @@ A single Rust binary that is a **drop-in replacement** for
 | 6 | Wallet migration (gonuts-export → CDK receive) | ✅ Complete |
 | 7 | **Test parity on physical hardware** | **🔄 In progress** |
 
-**78 unit tests pass** (`cargo test`). What remains is validation on real
-OpenWrt routers — verifying end-to-end payment flows, ndsctl integration,
-and migration of production wallets under live network conditions.
+**210 unit tests pass** (`cargo test`). **21/21 PRTA integration tests pass**
+locally. What remains is validation on real OpenWrt routers — verifying
+end-to-end payment flows, ndsctl integration, and migration of production
+wallets under live network conditions.
 
 ## Tech Stack
 
@@ -274,8 +275,8 @@ The HTTP server listens on `127.0.0.1:2121`. All routes set
 | `GET` | `/whoami` | ✅ Implemented | Returns mac=<MAC> as plain text. Resolves MAC from /tmp/dhcp.leases then /proc/net/arp. Returns HTTP 500 on lookup failure. |
 | `GET` | `/usage` | ✅ Implemented | Returns `used/total` plain text for the requesting client's session. Returns `-1/-1` if no active session. Client identified via `X-Forwarded-For` or `X-Real-IP`. |
 | `GET` | `/balance` | ✅ Implemented | Returns JSON with Go-compatible session-state schema: {"status": <int>, "session_active": <bool>, "usage": <int>, "allotment": <int>, "remaining": <int>} (with optional metric/start_time/error fields omitted via Go's omitempty semantics). |
-| `POST` | `/ln-invoice` | ⚠️ **Stub** | Returns hardcoded `stub-quote-*` / `stub-invoice` / `stub-pubkey`. **Not wired to CDK mint quotes.** |
-| `GET` | `/ln-invoice?quote=<id>` | ⚠️ **Stub** | Returns `state: "unpaid"`, `checkState: "UNPAID"`, `expiry: 0`. **Not wired to CDK quote status.** |
+| `POST` | `/ln-invoice` | ✅ Implemented | Creates a real mint quote via CDK `request_mint_quote()`. Returns quote ID, BOLT11 invoice, and mint URL. Falls back to stub on CDK error. |
+| `GET` | `/ln-invoice?quote=<id>` | ✅ Implemented | Checks real quote state via CDK `check_mint_quote()`. Returns `paid`/`unpaid` based on mint response. |
 
 ### Nostr event shapes
 
@@ -286,9 +287,9 @@ The HTTP server listens on `127.0.0.1:2121`. All routes set
 | 21000 | Client → Merchant | Payment event (POST `/` body) wrapping a Cashu token. |
 | 21023 | Merchant → Client | Payment rejected (POST `/` failure, HTTP 400) with error content. |
 
-> **Note:** The kind 1022 response in the payment handler currently uses
-> placeholder `id` and empty `sig` fields. Full Nostr signing of session
-> events is a Phase 7 task.
+> **Note:** Kind 1022 session events are fully signed with real
+> secp256k1 Schnorr signatures (NIP-01 compliant). Event IDs are
+> computed as SHA-256 of the canonical event array.
 
 ## CLI (Unix Socket)
 
@@ -317,7 +318,7 @@ echo "migrate /etc/tollgate/tokens.jsonl" | socat - UNIX-CONNECT:/var/run/tollga
 ## Testing
 
 ```bash
-# Run all 194 unit tests (default features)
+# Run all 210 unit tests (default features)
 cargo test
 
 # Run all 212 tests including embedded portal
@@ -340,18 +341,18 @@ cargo test monitor
 
 | Module | Tests | What's covered |
 |--------|-------|----------------|
-| `config` | 7 | Round-trip Go config/identities/install JSON, defaults, missing/empty files. |
-| `cli` | 7 | Version string, status, wallet balance, wallet info, unknown command, migrate (nonexistent/empty/invalid tokens). |
-| `session` | 9 | Create, get, is_active, expiry, usage exhaustion, revoke, cleanup, overwrite. |
+| `config` | 15 | Round-trip Go config/identities/install JSON, defaults, missing/empty files, validation (all error paths), dot-path set/get, migration, ensure_defaults. |
+| `cli` | 12 | Version, status, wallet balance/info, config get/set, migrate, health, unknown command, concurrent sessions. |
+| `session` | 20 | Create, get, is_active, expiry, usage exhaustion (including `used==allotment` boundary), revoke, cleanup, overwrite, zero allotment, concurrent same-MAC, re-payment, disk save/load roundtrip. |
 | `metering` | 6 | ndsctl output parsing (download+upload sum, missing fields, empty, garbage, non-numeric, whitespace). |
-| `wallet::wallet` | 8 | Open/close cycle, mint acceptance, seed roundtrip, balance, per-mint balance, db path sanitization, receive errors, concurrency, timeout protection. |
-| `wallet::verify` | 6 | Token parsing, Y-value extraction, mint filtering, invalid tokens, milli-unit scaling. |
-| `http::routes::pay` | 7 | Nostr event token extraction (valid/wrong kind/missing tag/invalid JSON/multiple tags), session creation, MAC resolution, 400 status. |
+| `monitor` | 4 | Monitor lifecycle, bytes session expiry, time session expiry, portal poll error resilience. |
+| `wallet::wallet` | 10 | Open/close cycle, mint acceptance, seed roundtrip, balance, per-mint balance, db path sanitization, receive errors, concurrency, timeout protection. |
+| `wallet::verify` | 12 | Token parsing, Y-value extraction, mint filtering, invalid tokens, milli-unit scaling, empty/whitespace/garbage tokens, wrong mint error detail, trailing-slash URL matching, multiple accepted mints. |
+| `http::routes::pay` | 12 | Nostr event token extraction (valid/wrong kind/missing tag/invalid JSON/multiple tags), session creation, 400/415 status, payment below minimum, allotment calculation, concurrent sessions. |
 | `http::routes::usage` | 3 | No session, active session, expired session. |
 
-### What is NOT tested
+### What is NOT tested in CI
 
-- **End-to-end payment flow** against a live mint (requires network).
 - **ndsctl integration** on real OpenWrt (the parse function is tested; the
   `poll_usage` subprocess call is not exercised in CI).
 - **Physical hardware deployment** — this is Phase 7.
@@ -359,6 +360,12 @@ cargo test monitor
   [`docs/brick-detection.md`](docs/brick-detection.md) but **not implemented
   in code** (the migration sidesteps it by importing tokens into a fresh
   CDK wallet).
+
+### PRTA integration tests (21/21 pass locally)
+
+End-to-end payment flow IS tested against a live mint (testnut.cashu.exchange)
+via the [Physical Router Test Automation](https://github.com/OpenTollGate/physical-router-test-automation)
+suite:
 
 ## Migration from Go
 
