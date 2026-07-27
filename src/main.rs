@@ -212,9 +212,23 @@ async fn main() {
     let http_state = state.clone();
     let http_handle = tokio::spawn(async move {
         let app = http::create_router((*http_state).clone());
-        let listener = tokio::net::TcpListener::bind("0.0.0.0:2121")
-            .await
-            .expect("failed to bind 0.0.0.0:2121");
+        let listener = match tokio::net::TcpListener::bind("0.0.0.0:2121").await {
+            Ok(l) => l,
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                tracing::error!(
+                    "Port 2121 already in use. Another TollGate process is likely running.\n\
+                     Find and kill it:\n\
+                     sudo ss -tlnp sport = :2121\n\
+                     sudo kill -9 <PID>\n\
+                     Or: fuser -k 2121/tcp"
+                );
+                std::process::exit(1);
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "failed to bind 0.0.0.0:2121");
+                std::process::exit(1);
+            }
+        };
         tracing::info!("HTTP server listening on 0.0.0.0:2121");
         axum::serve(
             listener,
