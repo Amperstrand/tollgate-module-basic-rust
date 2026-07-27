@@ -321,7 +321,7 @@ echo "migrate /etc/tollgate/tokens.jsonl" | socat - UNIX-CONNECT:/var/run/tollga
 # Run all 210 unit tests (default features)
 cargo test
 
-# Run all 212 tests including embedded portal
+# Run all 228 tests including embedded portal
 cargo test --features embedded-portal
 
 # Run with output visible
