@@ -1,0 +1,6 @@
+- generic [ref=e1]:
+  - heading "TollGate Portal" [level=1] [ref=e2]
+  - paragraph [ref=e3]: Internet access requires payment. Paste a Cashu token below.
+  - textbox "cashuB..." [ref=e4]: cashuBo2F0gaJhaUgB35e2-4pXKmFwh6NhYQJhc3hAMTEzMDBl
+  - button "Pay & Connect" [active] [ref=e5] [cursor=pointer]
+  - generic [ref=e6]: "Payment failed: payment rejected: invalid Cashu token: Io(Error { kind: UnexpectedEof, message: \"failed to fill whole buffer\" })"

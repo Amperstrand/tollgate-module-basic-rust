@@ -122,12 +122,16 @@ async fn main() {
                 }
                 tracing::info!(imported, failed, "migration import complete");
 
-                let _ = std::fs::write(&migration_marker,
-                    format!("imported={imported}\nfailed={failed}\ndate={}\n",
+                let _ = std::fs::write(
+                    &migration_marker,
+                    format!(
+                        "imported={imported}\nfailed={failed}\ndate={}\n",
                         std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
-                            .as_secs()));
+                            .as_secs()
+                    ),
+                );
 
                 if let Err(e) = std::fs::rename(&old_db, db_dir.join("wallet.db.pre-migration")) {
                     tracing::warn!(error = %e, "failed to rename old wallet.db");

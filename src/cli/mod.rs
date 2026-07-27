@@ -254,7 +254,9 @@ fn handle_config_set(rest: &str) -> String {
                         _ => return serde_json::json!({
                             "success": false,
                             "error": format!("step_size must be a positive integer, got '{value}'")
-                        }).to_string() + "\n",
+                        })
+                        .to_string()
+                            + "\n",
                     }
                 }
                 _ => {}
@@ -264,11 +266,17 @@ fn handle_config_set(rest: &str) -> String {
                 Ok(_) => serde_json::json!({
                     "success": true,
                     "message": format!("{key} updated to {value} (restart required to take effect)")
-                }).to_string() + "\n",
-                Err(e) => serde_json::json!({
-                    "success": false,
-                    "error": format!("failed to save config: {e}")
-                }).to_string() + "\n",
+                })
+                .to_string()
+                    + "\n",
+                Err(e) => {
+                    serde_json::json!({
+                        "success": false,
+                        "error": format!("failed to save config: {e}")
+                    })
+                    .to_string()
+                        + "\n"
+                }
             }
         }
         _ => {

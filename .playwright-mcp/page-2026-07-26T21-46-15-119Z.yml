@@ -1,0 +1,5 @@
+- generic [active] [ref=e1]:
+  - heading "TollGate Portal" [level=1] [ref=e2]
+  - paragraph [ref=e3]: Internet access requires payment. Paste a Cashu token below.
+  - textbox "cashuB..." [ref=e4]
+  - button "Pay & Connect" [ref=e5] [cursor=pointer]
