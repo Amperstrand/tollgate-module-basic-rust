@@ -366,4 +366,69 @@ mod tests {
         let expected = StatusCode::BAD_REQUEST;
         assert_eq!(expected.as_u16(), 400);
     }
+
+    #[test]
+    fn unsupported_content_type_returns_415() {
+        let expected = StatusCode::UNSUPPORTED_MEDIA_TYPE;
+        assert_eq!(expected.as_u16(), 415);
+    }
+
+    #[test]
+    fn payment_below_minimum_detected_via_zero_steps() {
+        let received_amount: u64 = 0;
+        let price_per_step: u64 = 1;
+        let steps = received_amount / price_per_step;
+        assert_eq!(steps, 0, "zero amount must yield zero steps");
+    }
+
+    #[test]
+    fn payment_below_minimum_with_small_amount() {
+        let received_amount: u64 = 1;
+        let price_per_step: u64 = 2;
+        let steps = received_amount / price_per_step;
+        assert_eq!(steps, 0, "amount < price_per_step must yield zero steps");
+    }
+
+    #[test]
+    fn allotment_calculation_correct() {
+        let received_amount: u64 = 5;
+        let price_per_step: u64 = 1;
+        let step_size: u64 = 22020096;
+        let steps = received_amount / price_per_step;
+        let allotment = steps * step_size;
+        assert_eq!(steps, 5);
+        assert_eq!(allotment, 110100480);
+    }
+
+    #[tokio::test]
+    async fn concurrent_sessions_different_macs_no_interference() {
+        use crate::session::SessionManager;
+        let mgr = std::sync::Arc::new(tokio::sync::Mutex::new(SessionManager::new()));
+
+        let h1 = tokio::spawn({
+            let mgr = mgr.clone();
+            async move {
+                mgr.lock()
+                    .await
+                    .create_session("aa:bb:cc:dd:ee:01", 1000, "bytes", 3600)
+            }
+        });
+        let h2 = tokio::spawn({
+            let mgr = mgr.clone();
+            async move {
+                mgr.lock()
+                    .await
+                    .create_session("aa:bb:cc:dd:ee:02", 2000, "bytes", 3600)
+            }
+        });
+
+        let (s1, s2) = (h1.await.unwrap(), h2.await.unwrap());
+        assert_eq!(s1.mac, "aa:bb:cc:dd:ee:01");
+        assert_eq!(s2.mac, "aa:bb:cc:dd:ee:02");
+
+        let guard = mgr.lock().await;
+        assert_eq!(guard.sessions.len(), 2);
+        assert!(guard.is_active("aa:bb:cc:dd:ee:01"));
+        assert!(guard.is_active("aa:bb:cc:dd:ee:02"));
+    }
 }

@@ -203,3 +203,82 @@ fn test_save_filters_expired_sessions() {
     assert!(loaded.get_session("aa:bb:cc:dd:ee:01").is_some());
     assert!(loaded.get_session("aa:bb:cc:dd:ee:02").is_none());
 }
+
+#[test]
+fn is_active_false_when_used_equals_allotment() {
+    let mut mgr = SessionManager::new();
+    mgr.create_session("aa:bb:cc:dd:ee:ff", 1000, "bytes", 3600);
+    mgr.update_usage("aa:bb:cc:dd:ee:ff", 1000);
+    assert!(
+        !mgr.is_active("aa:bb:cc:dd:ee:ff"),
+        "used == allotment should be inactive"
+    );
+}
+
+#[test]
+fn create_session_with_zero_allotment() {
+    let mut mgr = SessionManager::new();
+    let s = mgr.create_session("aa:bb:cc:dd:ee:ff", 0, "bytes", 3600);
+    assert_eq!(s.allotment, 0);
+    assert!(
+        !mgr.is_active("aa:bb:cc:dd:ee:ff"),
+        "zero-allotment session should be inactive"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_create_session_same_mac_no_panic() {
+    use std::sync::Arc;
+    let mgr = Arc::new(tokio::sync::Mutex::new(SessionManager::new()));
+    let mac = "aa:bb:cc:dd:ee:ff";
+
+    let h1 = tokio::spawn({
+        let mgr = mgr.clone();
+        let mac = mac.to_string();
+        async move { mgr.lock().await.create_session(&mac, 1000, "bytes", 3600) }
+    });
+    let h2 = tokio::spawn({
+        let mgr = mgr.clone();
+        let mac = mac.to_string();
+        async move { mgr.lock().await.create_session(&mac, 2000, "bytes", 3600) }
+    });
+
+    let (r1, r2) = (h1.await.unwrap(), h2.await.unwrap());
+    assert!(r1.allotment == 1000 || r1.allotment == 2000);
+    assert!(r2.allotment == 1000 || r2.allotment == 2000);
+    let guard = mgr.lock().await;
+    assert_eq!(guard.sessions.len(), 1, "same MAC should not duplicate");
+    let final_allotment = guard.get_session(mac).unwrap().allotment;
+    assert!(
+        final_allotment == 1000 || final_allotment == 2000,
+        "last writer wins: {final_allotment}"
+    );
+}
+
+#[test]
+fn re_payment_overwrites_existing_session() {
+    let mut mgr = SessionManager::new();
+    mgr.create_session("aa:bb:cc:dd:ee:ff", 1000, "bytes", 3600);
+    mgr.update_usage("aa:bb:cc:dd:ee:ff", 800);
+    mgr.create_session("aa:bb:cc:dd:ee:ff", 5000, "bytes", 3600);
+    let s = mgr.get_session("aa:bb:cc:dd:ee:ff").unwrap();
+    assert_eq!(s.allotment, 5000);
+    assert_eq!(s.used, 0, "used should be reset on overwrite");
+}
+
+#[test]
+fn cleanup_expired_preserves_active_sessions() {
+    let mut mgr = SessionManager::new();
+    for i in 0..10 {
+        mgr.create_session(&format!("aa:bb:cc:dd:ee:{i:02x}"), 1000, "bytes", 3600);
+    }
+    {
+        let s = mgr.sessions.get_mut("aa:bb:cc:dd:ee:05").unwrap();
+        s.expiry = now() - 1;
+    }
+    let removed = mgr.cleanup_expired();
+    assert_eq!(removed, 1);
+    assert_eq!(mgr.sessions.len(), 9);
+    assert!(mgr.get_session("aa:bb:cc:dd:ee:05").is_none());
+    assert!(mgr.get_session("aa:bb:cc:dd:ee:00").is_some());
+}

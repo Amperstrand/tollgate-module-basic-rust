@@ -26,7 +26,10 @@ pub struct TokenVerifier {
 impl TokenVerifier {
     pub fn new(mint_urls: Vec<String>) -> Self {
         Self {
-            accepted_mints: mint_urls.into_iter().collect(),
+            accepted_mints: mint_urls
+                .into_iter()
+                .map(|u| u.trim_end_matches('/').to_string())
+                .collect(),
             client: build_http_client(),
         }
     }
@@ -172,5 +175,78 @@ mod tests {
         let token: Token = SAMPLE_TOKEN.parse().expect("valid token");
         let sat: u64 = token.value().expect("value").into();
         assert_eq!(sat * 1_000, 1_000);
+    }
+
+    #[test]
+    fn rejects_empty_token_string() {
+        let wallet = TokenVerifier::new(vec![]);
+        let result = rt().block_on(wallet.verify(""));
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("invalid Cashu token"),
+            "expected parse error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_whitespace_only_token() {
+        let wallet = TokenVerifier::new(vec![]);
+        let result = rt().block_on(wallet.verify("   \n\t  "));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_garbage_base64_token() {
+        let wallet = TokenVerifier::new(vec![]);
+        let result = rt().block_on(wallet.verify("cashuB!!!not-valid-base64!!!"));
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().contains("invalid Cashu token"),
+            "expected parse error"
+        );
+    }
+
+    #[test]
+    fn wrong_mint_rejected_with_mint_url_in_error() {
+        let wallet = TokenVerifier::new(vec!["https://treasury.cashu.exchange".to_string()]);
+        let result = rt().block_on(wallet.verify(SAMPLE_TOKEN));
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("not accepted"), "got: {err}");
+        assert!(
+            err.contains("testnut") || err.contains("cashu"),
+            "error should mention the mint: {err}"
+        );
+    }
+
+    #[test]
+    fn trailing_slash_mint_url_matches_base() {
+        let wallet = TokenVerifier::new(vec!["https://testnut.cashu.space/".to_string()]);
+        let result = rt().block_on(wallet.verify(SAMPLE_TOKEN));
+        // Can't reach a real mint in unit tests, but the error must NOT be
+        // a "not accepted" rejection — that would mean slash-normalization failed.
+        if let Err(ref e) = result {
+            assert!(
+                !e.contains("not accepted"),
+                "trailing slash should still match: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn multiple_accepted_mints_all_pass_filter() {
+        let wallet = TokenVerifier::new(vec![
+            "https://treasury.cashu.exchange".to_string(),
+            "https://testnut.cashu.space".to_string(),
+            "https://mint.coinos.io".to_string(),
+        ]);
+        let result = rt().block_on(wallet.verify(SAMPLE_TOKEN));
+        if let Err(ref e) = result {
+            assert!(
+                !e.contains("not accepted"),
+                "testnut should be in accepted list: {e}"
+            );
+        }
     }
 }

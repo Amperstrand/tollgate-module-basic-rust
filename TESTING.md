@@ -151,6 +151,17 @@ pip install "marshmallow==3.20.1" --force-reinstall
 
 **Fix:** CI uses `dtolnay/rust-toolchain@nightly` with `-Z build-std=std,panic_abort`.
 
+### cdk-common AtomicU64 on 32-bit MIPS
+
+**Cause:** `cdk-common` 0.17.3 (from crates.io) uses `AtomicU64` in test
+modules, which is unavailable on 32-bit MIPS (`mips-unknown-linux-musl`).
+
+**Fix:** `Cargo.toml` has a `[patch.crates-io]` entry pointing to
+[Amperstrand/cdk-common](https://github.com/Amperstrand/cdk-common) — an
+exact clone of crates.io 0.17.3 with only `AtomicU64 → AtomicUsize` in
+test modules. Same version, same API, MIPS-safe atomics. Remove the patch
+when cashubtc/cdk publishes a compatible release (0.17.4+) to crates.io.
+
 ## Test matrix
 
 | Test | Local | GCP | OpenWrt VM | Physical Router |
