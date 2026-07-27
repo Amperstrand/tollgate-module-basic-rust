@@ -67,8 +67,6 @@ embedded-portal = ["dep:nftables"]
 [dev-dependencies]
 tempfile = "3"
 
-[patch.crates-io]
-
 [profile.release]
 # Aggressive size optimization — tollgate ships on resource-constrained OpenWrt routers
 panic = "unwind"
