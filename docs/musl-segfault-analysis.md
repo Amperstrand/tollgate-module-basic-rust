@@ -175,3 +175,71 @@ env:
 6. [rust-lang/rust#108878](https://github.com/rust-lang/rust/issues/108878) — Mixed static/dynamic linking on musl
 7. [rust-lang/rust#154439](https://github.com/rust-lang/rust/issues/154439) — gettid + LTO + musl weak linkage segfault
 8. [habitat-sh/habitat#8135](https://github.com/habitat-sh/habitat/pull/8135) — Habitat's fix: relocation-model=static
+
+---
+
+## 7. Additional Finding: getrandom dlsym Issue
+
+Beyond the static-PIE/musl-gcc wrapper issue, there is a **secondary root cause**
+related to the `getrandom` crate (used by `ring` for entropy):
+
+- getrandom v0.3.x uses `dlsym()` to look up `getrandom` at runtime
+- `dlsym()` fails on statically linked musl binaries because static symbols
+  cannot be looked up at runtime
+- This was fixed in getrandom v0.4.3 by using static linking for musl targets
+  directly (see [rust-random/getrandom PR #602](https://github.com/rust-random/getrandom/pull/602))
+
+**Evidence** (getrandom v0.4.3 source):
+```rust
+#[cfg(not(target_env = "musl"))]
+let raw_ptr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"getrandom".as_ptr()) };
+#[cfg(target_env = "musl")]
+let raw_ptr = {
+    let fptr: GetRandomFn = libc::getrandom;
+    unsafe { transmute::<GetRandomFn, *mut c_void>(fptr) }
+};
+```
+
+**Recommendation**: If the `relocation-model=static` fix is insufficient on
+specific hardware, consider upgrading the getrandom dependency or switching
+from `ring` to `aws-lc-rs` crypto provider (which has better musl support).
+
+---
+
+## 8. GCP-Specific Notes
+
+### Nested Virtualization
+
+GCP supports nested KVM via a special image license:
+- The `nested-ubuntu` image in the `tollgate-test-lab` project has `enable-vmx`
+- VMs created from this image get `/dev/kvm` and `kvm_intel` module
+- Default Ubuntu images do NOT have KVM support
+
+**Correct GCP VM creation**:
+```bash
+gcloud compute instances create tollgate-test \
+    --image=nested-ubuntu \
+    --machine-type=n1-standard-8 \
+    --zone=us-central1-a
+```
+
+### QEMU CPU Model
+
+Even with nested KVM, QEMU's default CPU model (`qemu64`) may lack features
+that ring/BoringSSL assembly needs. Use `-cpu host` to pass through real
+CPU features:
+
+```bash
+qemu-system-x86_64 -enable-kvm -cpu host -m 512 ...
+```
+
+### Binary Type for GCP Testing
+
+| Binary Type | GCP Host | OpenWrt QEMU (KVM) | QEMU TCG |
+|-------------|----------|---------------------|----------|
+| musl-static (with relocation-model=static) | ✅ Works | ✅ Works | ❌ May segfault |
+| glibc-dynamic | ✅ Works | N/A (needs glibc) | N/A |
+
+**Recommendation**: Use glibc-dynamic builds for GCP host testing. Use
+musl-static (with relocation-model=static) for OpenWrt VM and physical
+router deployment.
