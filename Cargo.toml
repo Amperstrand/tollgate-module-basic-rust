@@ -67,7 +67,6 @@ embedded-portal = ["dep:nftables"]
 tempfile = "3"
 serial_test = "3"
 
-[patch.crates-io]
 # cdk-common fork removed — upstream CDK 0.17.3 includes the AtomicUsize fix (PR #2261)
 
 [profile.release]
