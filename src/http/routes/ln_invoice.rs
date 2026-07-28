@@ -16,24 +16,33 @@ pub struct CreateInvoiceRequest {
 }
 
 #[derive(Debug, Serialize)]
-struct InvoiceResponse {
+struct LightningInvoiceResponse {
+    status: u64,
     quote: String,
-    request: String,
-    pubkey: String,
+    #[serde(skip_serializing_if = "String::is_empty", default)]
+    invoice: String,
+    #[serde(rename = "mint_url")]
+    mint_url: String,
+    amount: u64,
+    #[serde(skip_serializing_if = "is_zero_u64", default)]
+    expiry: u64,
+    state: String,
+    access_granted: bool,
+    #[serde(skip_serializing_if = "is_zero_u64", default)]
+    allotment: u64,
+    #[serde(skip_serializing_if = "String::is_empty", default)]
+    metric: String,
+    #[serde(skip_serializing_if = "String::is_empty", default)]
+    error: String,
+}
+
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
 }
 
 #[derive(Debug, Deserialize)]
 pub struct InvoiceQuery {
     pub quote: String,
-}
-
-#[derive(Debug, Serialize)]
-struct InvoiceStatus {
-    quote: String,
-    state: String,
-    #[serde(rename = "checkState")]
-    check_state: String,
-    expiry: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -91,10 +100,18 @@ pub async fn handle_create_ln_invoice(
         None => {
             return json_response(
                 StatusCode::OK,
-                InvoiceResponse {
+                LightningInvoiceResponse {
+                    status: 1,
                     quote: format!("stub-quote-{}", req.amount),
-                    request: "stub-invoice".to_string(),
-                    pubkey: "stub-pubkey".to_string(),
+                    invoice: "stub-invoice".to_string(),
+                    mint_url: mint_url.clone(),
+                    amount: req.amount,
+                    expiry: 0,
+                    state: "unpaid".to_string(),
+                    access_granted: false,
+                    allotment: 0,
+                    metric: String::new(),
+                    error: String::new(),
                 },
             );
         }
@@ -108,7 +125,7 @@ pub async fn handle_create_ln_invoice(
                 .as_secs();
 
             {
-                let mut store = quote_store().lock().unwrap();
+                let mut store = quote_store().lock().unwrap_or_else(|e| e.into_inner());
                 store.insert(
                     info.id.clone(),
                     StoredQuote {
@@ -122,10 +139,18 @@ pub async fn handle_create_ln_invoice(
 
             json_response(
                 StatusCode::OK,
-                InvoiceResponse {
+                LightningInvoiceResponse {
+                    status: 1,
                     quote: info.id,
-                    request: info.request,
-                    pubkey: mint_url,
+                    invoice: info.request,
+                    mint_url: mint_url.clone(),
+                    amount: req.amount,
+                    expiry: info.expiry,
+                    state: "unpaid".to_string(),
+                    access_granted: false,
+                    allotment: 0,
+                    metric: String::new(),
+                    error: String::new(),
                 },
             )
         }
@@ -133,10 +158,18 @@ pub async fn handle_create_ln_invoice(
             tracing::warn!(error = ?e, "ln-invoice: mint quote failed");
             json_response(
                 StatusCode::OK,
-                InvoiceResponse {
+                LightningInvoiceResponse {
+                    status: 1,
                     quote: format!("stub-quote-{}", req.amount),
-                    request: "stub-invoice".to_string(),
-                    pubkey: "stub-pubkey".to_string(),
+                    invoice: "stub-invoice".to_string(),
+                    mint_url: mint_url.clone(),
+                    amount: req.amount,
+                    expiry: 0,
+                    state: "unpaid".to_string(),
+                    access_granted: false,
+                    allotment: 0,
+                    metric: String::new(),
+                    error: String::new(),
                 },
             )
         }
@@ -148,7 +181,7 @@ pub async fn handle_get_ln_invoice(
     Query(q): Query<InvoiceQuery>,
 ) -> Response {
     let stored = {
-        let store = quote_store().lock().unwrap();
+        let store = quote_store().lock().unwrap_or_else(|e| e.into_inner());
         store.get(&q.quote).cloned()
     };
 
@@ -157,12 +190,24 @@ pub async fn handle_get_ln_invoice(
         None => {
             return json_response(
                 StatusCode::NOT_FOUND,
-                serde_json::json!({"error": "quote not found"}),
+                LightningInvoiceResponse {
+                    status: 0,
+                    quote: q.quote,
+                    invoice: String::new(),
+                    mint_url: String::new(),
+                    amount: 0,
+                    expiry: 0,
+                    state: "unpaid".to_string(),
+                    access_granted: false,
+                    allotment: 0,
+                    metric: String::new(),
+                    error: "quote not found".to_string(),
+                },
             );
         }
     };
 
-    let (state_str, check_state_str, expiry) = {
+    let (state_str, expiry) = {
         let wallet_guard = state.wallet.read().await;
         match wallet_guard.as_ref() {
             Some(wallet) => match wallet.check_mint_quote(&stored.mint_url, &q.quote).await {
@@ -170,22 +215,28 @@ pub async fn handle_get_ln_invoice(
                     let lower = raw.to_lowercase();
                     let is_paid = lower.contains("paid") || lower.contains("issued");
                     let s = if is_paid { "paid" } else { "unpaid" };
-                    let cs = if is_paid { "PAID" } else { "UNPAID" };
-                    (s.to_string(), cs.to_string(), stored.expiry)
+                    (s.to_string(), stored.expiry)
                 }
-                Err(_) => ("unpaid".to_string(), "UNPAID".to_string(), stored.expiry),
+                Err(_) => ("unpaid".to_string(), stored.expiry),
             },
-            None => ("unpaid".to_string(), "UNPAID".to_string(), stored.expiry),
+            None => ("unpaid".to_string(), stored.expiry),
         }
     };
 
     json_response(
         StatusCode::OK,
-        InvoiceStatus {
+        LightningInvoiceResponse {
+            status: 1,
             quote: q.quote,
-            state: state_str,
-            check_state: check_state_str,
+            invoice: String::new(),
+            mint_url: stored.mint_url,
+            amount: 0,
             expiry,
+            state: state_str,
+            access_granted: false,
+            allotment: 0,
+            metric: String::new(),
+            error: String::new(),
         },
     )
 }

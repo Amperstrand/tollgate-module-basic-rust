@@ -107,7 +107,7 @@ impl CaptivePortal for EmbeddedPortal {
             .await
             .map_err(|e| AppError::Internal(e.to_string()))??;
 
-        let mut map = self.rule_handles.lock().unwrap();
+        let mut map = self.rule_handles.lock().unwrap_or_else(|e| e.into_inner());
         for (ip, handle) in handles {
             map.insert(ip, handle);
         }
@@ -118,7 +118,7 @@ impl CaptivePortal for EmbeddedPortal {
         let mac_owned = mac.to_string();
         let nft = self.nft.clone();
         let handles_snapshot: std::collections::HashMap<IpAddr, u32> = {
-            let map = self.rule_handles.lock().unwrap();
+            let map = self.rule_handles.lock().unwrap_or_else(|e| e.into_inner());
             map.clone()
         };
 
@@ -139,7 +139,7 @@ impl CaptivePortal for EmbeddedPortal {
             .await
             .map_err(|e| AppError::Internal(e.to_string()))??;
 
-        let mut map = self.rule_handles.lock().unwrap();
+        let mut map = self.rule_handles.lock().unwrap_or_else(|e| e.into_inner());
         for ip in &cleaned_ips {
             map.remove(ip);
         }
@@ -171,7 +171,7 @@ impl CaptivePortal for EmbeddedPortal {
     async fn is_authenticated(&self, mac: &str) -> bool {
         let mac_owned = mac.to_string();
         let known_ips: Vec<IpAddr> = {
-            let map = self.rule_handles.lock().unwrap();
+            let map = self.rule_handles.lock().unwrap_or_else(|e| e.into_inner());
             map.keys().cloned().collect()
         };
         tokio::task::spawn_blocking(move || {
