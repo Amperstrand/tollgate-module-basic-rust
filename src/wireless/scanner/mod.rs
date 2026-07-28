@@ -1,6 +1,7 @@
 //! WiFi scanner — parses `iwinfo` scan output to discover networks.
 
 use super::types::NetworkInfo;
+use crate::error::WirelessError;
 use std::process::Command;
 
 pub struct Scanner;
@@ -42,16 +43,15 @@ impl Scanner {
     }
 
     /// Scan a single radio using `iwinfo <radio> scan`.
-    pub fn scan_radio(radio: &str) -> Result<Vec<NetworkInfo>, String> {
+    pub fn scan_radio(radio: &str) -> Result<Vec<NetworkInfo>, WirelessError> {
         let output = Command::new("iwinfo")
             .args([radio, "scan"])
             .output()
-            .map_err(|e| format!("execute iwinfo: {e}"))?;
+            .map_err(|e| WirelessError::ScanSpawn(e.to_string()))?;
 
         if !output.status.success() {
-            return Err(format!(
-                "iwinfo scan failed: {}",
-                String::from_utf8_lossy(&output.stderr)
+            return Err(WirelessError::ScanFailed(
+                String::from_utf8_lossy(&output.stderr).to_string(),
             ));
         }
 

@@ -11,7 +11,7 @@ use tower_http::cors::{Any, CorsLayer};
 pub struct AppState {
     pub config: Arc<crate::config::Config>,
     pub identity: Arc<crate::identity::MerchantIdentity>,
-    pub wallet: Arc<tokio::sync::Mutex<Option<crate::wallet::wallet::TollWallet>>>,
+    pub wallet: Arc<tokio::sync::RwLock<Option<crate::wallet::wallet::TollWallet>>>,
     pub sessions: Arc<tokio::sync::Mutex<crate::session::SessionManager>>,
     pub portal: Arc<dyn crate::portal::CaptivePortal>,
     /// Shared token verifier — reuses the internal reqwest::Client across

@@ -8,7 +8,7 @@ use crate::mac_resolver::resolve_ip_from_mac;
 use {async_trait::async_trait, std::collections::HashMap, std::sync::Mutex};
 
 #[cfg(feature = "embedded-portal")]
-use {super::nft_manager::NftManager, super::CaptivePortal};
+use {super::nft_manager::NftManager, super::CaptivePortal, crate::error::AppError};
 
 #[cfg(feature = "embedded-portal")]
 pub struct EmbeddedPortal {
@@ -32,12 +32,12 @@ impl EmbeddedPortal {
         }
     }
 
-    pub fn install(&self) -> Result<(), String> {
-        self.nft.install().map_err(|e| e.to_string())
+    pub fn install(&self) -> Result<(), crate::portal::nft_manager::NftError> {
+        self.nft.install()
     }
 
-    pub fn teardown(&self) -> Result<(), String> {
-        self.nft.teardown().map_err(|e| e.to_string())
+    pub fn teardown(&self) -> Result<(), crate::portal::nft_manager::NftError> {
+        self.nft.teardown()
     }
 }
 
@@ -49,58 +49,63 @@ impl Default for EmbeddedPortal {
 }
 
 #[cfg(test)]
-fn resolve_or_err(mac: &str) -> Result<IpAddr, String> {
-    resolve_ip_from_mac(mac).ok_or_else(|| format!("no IP address found for MAC {mac}"))
+fn resolve_or_err(mac: &str) -> Result<IpAddr, crate::error::AppError> {
+    resolve_ip_from_mac(mac).ok_or_else(|| {
+        crate::error::AppError::Internal(format!("no IP address found for MAC {mac}"))
+    })
 }
 
 #[cfg(feature = "embedded-portal")]
 #[async_trait]
 impl CaptivePortal for EmbeddedPortal {
-    async fn grant_access(&self, mac: &str) -> Result<(), String> {
+    async fn grant_access(&self, mac: &str) -> Result<(), AppError> {
         let mac_owned = mac.to_string();
         let nft = self.nft.clone();
-        let handles = tokio::task::spawn_blocking(move || -> Result<Vec<(IpAddr, u32)>, String> {
-            let ips = crate::mac_resolver::resolve_all_ips_from_mac(&mac_owned);
-            if ips.is_empty() {
-                return Err(format!("no IP address found for MAC {mac_owned}"));
-            }
-            let mut installed = Vec::new();
-            for ip in &ips {
-                if let Err(e) = nft.add_client(*ip) {
-                    for (done_ip, done_h) in &installed {
-                        let _ = nft.delete_rule(*done_h);
-                        let _ = nft.remove_client(*done_ip);
-                        let _ = nft.delete_counter(done_ip);
-                    }
-                    return Err(e.to_string());
+        let handles =
+            tokio::task::spawn_blocking(move || -> Result<Vec<(IpAddr, u32)>, AppError> {
+                let ips = crate::mac_resolver::resolve_all_ips_from_mac(&mac_owned);
+                if ips.is_empty() {
+                    return Err(AppError::Internal(format!(
+                        "no IP address found for MAC {mac_owned}"
+                    )));
                 }
-                if let Err(e) = nft.create_counter(*ip) {
-                    let _ = nft.remove_client(*ip);
-                    for (done_ip, done_h) in &installed {
-                        let _ = nft.delete_rule(*done_h);
-                        let _ = nft.remove_client(*done_ip);
-                        let _ = nft.delete_counter(done_ip);
+                let mut installed = Vec::new();
+                for ip in &ips {
+                    if let Err(e) = nft.add_client(*ip) {
+                        for (done_ip, done_h) in &installed {
+                            let _ = nft.delete_rule(*done_h);
+                            let _ = nft.remove_client(*done_ip);
+                            let _ = nft.delete_counter(done_ip);
+                        }
+                        return Err(e.into());
                     }
-                    return Err(e.to_string());
-                }
-                match nft.add_counter_rule(*ip) {
-                    Ok(h) => installed.push((*ip, h)),
-                    Err(e) => {
-                        let _ = nft.delete_counter(ip);
+                    if let Err(e) = nft.create_counter(*ip) {
                         let _ = nft.remove_client(*ip);
                         for (done_ip, done_h) in &installed {
                             let _ = nft.delete_rule(*done_h);
                             let _ = nft.remove_client(*done_ip);
                             let _ = nft.delete_counter(done_ip);
                         }
-                        return Err(e.to_string());
+                        return Err(e.into());
+                    }
+                    match nft.add_counter_rule(*ip) {
+                        Ok(h) => installed.push((*ip, h)),
+                        Err(e) => {
+                            let _ = nft.delete_counter(ip);
+                            let _ = nft.remove_client(*ip);
+                            for (done_ip, done_h) in &installed {
+                                let _ = nft.delete_rule(*done_h);
+                                let _ = nft.remove_client(*done_ip);
+                                let _ = nft.delete_counter(done_ip);
+                            }
+                            return Err(e.into());
+                        }
                     }
                 }
-            }
-            Ok(installed)
-        })
-        .await
-        .map_err(|e| e.to_string())??;
+                Ok(installed)
+            })
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))??;
 
         let mut map = self.rule_handles.lock().unwrap();
         for (ip, handle) in handles {
@@ -109,7 +114,7 @@ impl CaptivePortal for EmbeddedPortal {
         Ok(())
     }
 
-    async fn revoke_access(&self, mac: &str) -> Result<(), String> {
+    async fn revoke_access(&self, mac: &str) -> Result<(), AppError> {
         let mac_owned = mac.to_string();
         let nft = self.nft.clone();
         let handles_snapshot: std::collections::HashMap<IpAddr, u32> = {
@@ -118,7 +123,7 @@ impl CaptivePortal for EmbeddedPortal {
         };
 
         let cleaned_ips: Vec<IpAddr> =
-            tokio::task::spawn_blocking(move || -> Result<Vec<IpAddr>, String> {
+            tokio::task::spawn_blocking(move || -> Result<Vec<IpAddr>, AppError> {
                 let ips = crate::mac_resolver::resolve_all_ips_from_mac(&mac_owned);
                 let mut cleaned = Vec::new();
                 for ip in &ips {
@@ -132,7 +137,7 @@ impl CaptivePortal for EmbeddedPortal {
                 Ok(cleaned)
             })
             .await
-            .map_err(|e| e.to_string())??;
+            .map_err(|e| AppError::Internal(e.to_string()))??;
 
         let mut map = self.rule_handles.lock().unwrap();
         for ip in &cleaned_ips {
@@ -141,13 +146,15 @@ impl CaptivePortal for EmbeddedPortal {
         Ok(())
     }
 
-    async fn poll_usage(&self, mac: &str) -> Result<(u64, u64), String> {
+    async fn poll_usage(&self, mac: &str) -> Result<(u64, u64), AppError> {
         let mac_owned = mac.to_string();
         let nft = self.nft.clone();
-        tokio::task::spawn_blocking(move || -> Result<(u64, u64), String> {
+        tokio::task::spawn_blocking(move || -> Result<(u64, u64), AppError> {
             let ips = crate::mac_resolver::resolve_all_ips_from_mac(&mac_owned);
             if ips.is_empty() {
-                return Err(format!("no IP address found for MAC {mac_owned}"));
+                return Err(AppError::Internal(format!(
+                    "no IP address found for MAC {mac_owned}"
+                )));
             }
             let mut total_bytes = 0u64;
             for ip in &ips {
@@ -158,7 +165,7 @@ impl CaptivePortal for EmbeddedPortal {
             Ok((total_bytes, 0))
         })
         .await
-        .map_err(|e| e.to_string())?
+        .map_err(|e| AppError::Internal(e.to_string()))?
     }
 
     async fn is_authenticated(&self, mac: &str) -> bool {
@@ -193,7 +200,10 @@ mod tests {
     fn resolve_or_err_returns_error_for_missing_mac() {
         let result = resolve_or_err("aa:bb:cc:dd:ee:ff");
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("no IP address found"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("no IP address found"));
     }
 
     #[cfg(feature = "embedded-portal")]

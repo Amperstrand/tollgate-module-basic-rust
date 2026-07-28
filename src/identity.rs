@@ -4,6 +4,7 @@
 //! keypair and stores it. On subsequent runs, loads from disk. File mode 0600.
 
 use crate::config::schema::{IdentitiesConfig, OwnedIdentity};
+use crate::error::ConfigError;
 use secp256k1::{Secp256k1, SecretKey};
 
 /// A Nostr keypair for event signing.
@@ -15,7 +16,7 @@ pub struct MerchantIdentity {
 
 impl MerchantIdentity {
     /// Load the merchant identity from identities.json, or generate a new one.
-    pub fn load_or_generate() -> Result<Self, String> {
+    pub fn load_or_generate() -> Result<Self, ConfigError> {
         let identities = crate::config::load_identities();
 
         if let Ok(Some(config)) = identities {
@@ -25,7 +26,7 @@ impl MerchantIdentity {
                 .find(|o| o.name == "merchant")
             {
                 let secret_key = SecretKey::from_str(&owned.privatekey)
-                    .map_err(|e| format!("invalid merchant private key: {e}"))?;
+                    .map_err(|e| ConfigError::InvalidKey(e.to_string()))?;
                 return Ok(MerchantIdentity {
                     name: "merchant".to_string(),
                     secret_key,
@@ -50,20 +51,18 @@ impl MerchantIdentity {
             public_identities: vec![],
         };
 
-        let json = serde_json::to_string_pretty(&new_config)
-            .map_err(|e| format!("serialize identities: {e}"))?;
+        let json = serde_json::to_string_pretty(&new_config)?;
 
         let path = crate::config::identities_path();
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&path, json).map_err(|e| e.to_string())?;
+        std::fs::write(&path, json)?;
 
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-                .map_err(|e| e.to_string())?;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
         }
 
         Ok(MerchantIdentity {

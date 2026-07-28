@@ -112,9 +112,9 @@ struct RawGateway {
 }
 
 /// Read default gateway(s) from /proc/net/route + /proc/net/arp.
-fn read_default_gateways() -> Result<Vec<RawGateway>, String> {
+fn read_default_gateways() -> Result<Vec<RawGateway>, crate::error::DetectorError> {
     let route_data = std::fs::read_to_string("/proc/net/route")
-        .map_err(|e| format!("read /proc/net/route: {e}"))?;
+        .map_err(|e| crate::error::DetectorError::RouteRead(e.to_string()))?;
 
     let mut gateways = Vec::new();
     for line in route_data.lines().skip(1) {

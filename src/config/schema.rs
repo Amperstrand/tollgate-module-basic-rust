@@ -91,17 +91,19 @@ impl Config {
     }
 
     /// Validate that profit_share factors sum to ~1.0.
-    pub fn validate_profit_share(&self) -> Result<(), String> {
+    pub fn validate_profit_share(&self) -> Result<(), crate::error::ConfigError> {
         if self.profit_share.is_empty() {
-            return Err("profit_share is empty: at least one entry required".to_string());
+            return Err(crate::error::ConfigError::Validation(
+                "profit_share is empty: at least one entry required".to_string(),
+            ));
         }
         let sum: f64 = self.profit_share.iter().map(|p| p.factor).sum();
         if (sum - 1.0).abs() > 1e-6 {
-            return Err(format!(
+            return Err(crate::error::ConfigError::Validation(format!(
                 "profit_share factors must sum to 1.0, got {} ({:.1}% will remain in wallet each payout cycle)",
                 sum,
                 (1.0 - sum) * 100.0
-            ));
+            )));
         }
         Ok(())
     }
@@ -111,7 +113,7 @@ impl Config {
         let mut errors = Vec::new();
 
         if let Err(e) = self.validate_profit_share() {
-            errors.push(e);
+            errors.push(e.to_string());
         }
 
         if self.accepted_mints.is_empty() {

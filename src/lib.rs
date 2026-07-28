@@ -3,6 +3,7 @@
 pub mod cli;
 pub mod config;
 pub mod degraded;
+pub mod error;
 pub mod http;
 pub mod identity;
 pub mod mac_resolver;

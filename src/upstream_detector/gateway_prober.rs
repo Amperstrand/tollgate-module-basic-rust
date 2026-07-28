@@ -1,5 +1,6 @@
 //! Gateway prober — HTTP probe to check if a gateway is a TollGate.
 
+use crate::error::DetectorError;
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -33,29 +34,32 @@ impl GatewayProber {
 
     /// Probe a gateway IP to check if it's a TollGate.
     /// A TollGate responds on port 2121 with a Nostr kind 10021 discovery event.
-    pub async fn probe(&self, gateway_ip: &str) -> Result<GatewayInfo, String> {
+    pub async fn probe(&self, gateway_ip: &str) -> Result<GatewayInfo, DetectorError> {
         let url = format!("http://{gateway_ip}:2121/");
         let resp = self
             .client
             .get(&url)
             .send()
             .await
-            .map_err(|e| format!("probe {url}: {e}"))?;
+            .map_err(|e| DetectorError::ProbeRequest {
+                url: url.clone(),
+                reason: e.to_string(),
+            })?;
 
         if !resp.status().is_success() {
-            return Err(format!("probe {url}: HTTP {}", resp.status()));
+            return Err(DetectorError::ProbeStatus {
+                url,
+                status: resp.status().to_string(),
+            });
         }
 
         let event: DiscoveryEvent = resp
             .json()
             .await
-            .map_err(|e| format!("parse discovery event: {e}"))?;
+            .map_err(|e| DetectorError::ProbeParse(e.to_string()))?;
 
         if event.kind != 10021 {
-            return Err(format!(
-                "not a TollGate (kind={}, expected 10021)",
-                event.kind
-            ));
+            return Err(DetectorError::NotTollGate { kind: event.kind });
         }
 
         let mut info = GatewayInfo {
@@ -83,7 +87,7 @@ impl GatewayProber {
         }
 
         if info.mint_url.is_empty() {
-            return Err("no mint URL in discovery event".to_string());
+            return Err(DetectorError::NoMintUrl);
         }
 
         Ok(info)

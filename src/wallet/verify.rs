@@ -3,6 +3,7 @@
 //! Ported from tollgate-rs/crates/tollgate-net/src/wallet.rs (BootstrapWallet).
 //! Read-only: verifies proofs are unspent at the mint. No spending/receiving.
 
+use crate::error::VerifyError;
 use cashu::nuts::Token;
 use std::collections::HashSet;
 
@@ -35,14 +36,14 @@ impl TokenVerifier {
     }
 
     /// Parse and verify a Cashu token. Returns amount in milli-sat.
-    pub async fn verify(&self, token_str: &str) -> Result<(u64, String), String> {
+    pub async fn verify(&self, token_str: &str) -> Result<(u64, String), VerifyError> {
         let token: Token = token_str
-            .parse()
-            .map_err(|e| format!("invalid Cashu token: {e}"))?;
+            .parse::<Token>()
+            .map_err(|e| VerifyError::InvalidToken(e.to_string()))?;
 
         let mint_url = token
             .mint_url()
-            .map_err(|e| format!("token has no mint URL: {e}"))?;
+            .map_err(|e| VerifyError::NoMintUrl(e.to_string()))?;
         let mint_url_str = mint_url.to_string();
         let mint_base = mint_url_str.trim_end_matches('/').to_string();
 
@@ -50,17 +51,17 @@ impl TokenVerifier {
             && !self.accepted_mints.contains(&mint_base)
             && !self.accepted_mints.contains(&mint_url_str)
         {
-            return Err(format!("mint {} not accepted", mint_url_str));
+            return Err(VerifyError::MintNotAccepted(mint_url_str));
         }
 
         let amount_sat: u64 = token
             .value()
-            .map_err(|e| format!("could not sum token value: {e}"))?
+            .map_err(|e| VerifyError::ValueSum(e.to_string()))?
             .into();
 
         let ys = token_proof_ys(&token);
         if ys.is_empty() {
-            return Err("token contains no proofs".to_string());
+            return Err(VerifyError::NoProofs);
         }
 
         self.check_proofs_unspent(&mint_base, &ys).await?;
@@ -69,7 +70,11 @@ impl TokenVerifier {
     }
 
     /// NUT-07: check all Y-values are UNSPENT.
-    async fn check_proofs_unspent(&self, mint_base: &str, ys: &[String]) -> Result<(), String> {
+    async fn check_proofs_unspent(
+        &self,
+        mint_base: &str,
+        ys: &[String],
+    ) -> Result<(), VerifyError> {
         let url = format!("{mint_base}/v1/checkstate");
         let body = serde_json::json!({ "Ys": ys });
 
@@ -79,21 +84,21 @@ impl TokenVerifier {
             .json(&body)
             .send()
             .await
-            .map_err(|e| format!("mint check-state request failed: {e}"))?
+            .map_err(|e| VerifyError::CheckStateRequest(e.to_string()))?
             .error_for_status()
-            .map_err(|e| format!("mint returned error: {e}"))?
+            .map_err(|e| VerifyError::CheckStateStatus(e.to_string()))?
             .json()
             .await
-            .map_err(|e| format!("mint response not JSON: {e}"))?;
+            .map_err(|e| VerifyError::CheckStateParse(e.to_string()))?;
 
         let states = resp["states"]
             .as_array()
-            .ok_or("mint response missing 'states'")?;
+            .ok_or(VerifyError::MissingStates)?;
 
         for state in states {
             let s = state["state"].as_str().unwrap_or("");
             if s.to_uppercase() != "UNSPENT" {
-                return Err(format!("one or more proofs already spent (state: {s})"));
+                return Err(VerifyError::Spent(s.to_string()));
             }
         }
         Ok(())
@@ -152,7 +157,7 @@ mod tests {
         let wallet = TokenVerifier::new(vec!["https://allowed-mint.example".to_string()]);
         let result = rt().block_on(wallet.verify(SAMPLE_TOKEN));
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("not accepted"));
+        assert!(result.unwrap_err().to_string().contains("not accepted"));
     }
 
     #[test]
@@ -182,7 +187,7 @@ mod tests {
         let wallet = TokenVerifier::new(vec![]);
         let result = rt().block_on(wallet.verify(""));
         assert!(result.is_err());
-        let err = result.unwrap_err();
+        let err = result.unwrap_err().to_string();
         assert!(
             err.contains("invalid Cashu token"),
             "expected parse error, got: {err}"
@@ -202,7 +207,10 @@ mod tests {
         let result = rt().block_on(wallet.verify("cashuB!!!not-valid-base64!!!"));
         assert!(result.is_err());
         assert!(
-            result.unwrap_err().contains("invalid Cashu token"),
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("invalid Cashu token"),
             "expected parse error"
         );
     }
@@ -212,7 +220,7 @@ mod tests {
         let wallet = TokenVerifier::new(vec!["https://treasury.cashu.exchange".to_string()]);
         let result = rt().block_on(wallet.verify(SAMPLE_TOKEN));
         assert!(result.is_err());
-        let err = result.unwrap_err();
+        let err = result.unwrap_err().to_string();
         assert!(err.contains("not accepted"), "got: {err}");
         assert!(
             err.contains("testnut") || err.contains("cashu"),
@@ -227,9 +235,10 @@ mod tests {
         // Can't reach a real mint in unit tests, but the error must NOT be
         // a "not accepted" rejection — that would mean slash-normalization failed.
         if let Err(ref e) = result {
+            let msg = e.to_string();
             assert!(
-                !e.contains("not accepted"),
-                "trailing slash should still match: {e}"
+                !msg.contains("not accepted"),
+                "trailing slash should still match: {msg}"
             );
         }
     }
@@ -243,9 +252,10 @@ mod tests {
         ]);
         let result = rt().block_on(wallet.verify(SAMPLE_TOKEN));
         if let Err(ref e) = result {
+            let msg = e.to_string();
             assert!(
-                !e.contains("not accepted"),
-                "testnut should be in accepted list: {e}"
+                !msg.contains("not accepted"),
+                "testnut should be in accepted list: {msg}"
             );
         }
     }

@@ -1,6 +1,7 @@
 //! WiFi connector — manages STA interfaces and connections via UCI commands.
 
 use super::types::{Gateway, StaSection};
+use crate::error::WirelessError;
 use std::process::Command;
 
 pub struct Connector {
@@ -16,11 +17,11 @@ impl Connector {
 
     /// Execute a UCI command and return stdout.
     /// Handles "Entry not found" gracefully for delete/get operations.
-    pub fn execute_uci(args: &[&str]) -> Result<String, String> {
+    pub fn execute_uci(args: &[&str]) -> Result<String, WirelessError> {
         let output = Command::new("uci")
             .args(args)
             .output()
-            .map_err(|e| format!("execute uci: {e}"))?;
+            .map_err(|e| WirelessError::UciSpawn(e.to_string()))?;
 
         let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -31,27 +32,30 @@ impl Connector {
                 if args.first() == Some(&"delete") {
                     return Ok(String::new());
                 }
-                return Err("uci: Entry not found".to_string());
+                return Err(WirelessError::UciEntryNotFound);
             }
-            return Err(format!("uci {} failed: {}", args.join(" "), stderr.trim()));
+            return Err(WirelessError::UciFailed {
+                args: args.join(" "),
+                stderr: stderr.trim().to_string(),
+            });
         }
 
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
 
     /// Reload WiFi configuration.
-    pub fn reload_wifi() -> Result<(), String> {
+    pub fn reload_wifi() -> Result<(), WirelessError> {
         Command::new("wifi")
             .arg("reload")
             .status()
-            .map_err(|e| format!("wifi reload: {e}"))?
+            .map_err(|e| WirelessError::WifiReloadSpawn(e.to_string()))?
             .success()
             .then_some(())
-            .ok_or_else(|| "wifi reload failed".to_string())
+            .ok_or(WirelessError::WifiReloadFailed)
     }
 
     /// Connect to a gateway by configuring a STA interface.
-    pub fn connect(&self, gateway: &Gateway, password: &str) -> Result<(), String> {
+    pub fn connect(&self, gateway: &Gateway, password: &str) -> Result<(), WirelessError> {
         let sta = self.find_available_sta_interface()?;
 
         self.disable_other_sta_interfaces(&sta)?;
@@ -81,7 +85,7 @@ impl Connector {
     }
 
     /// Disconnect by disabling all STA interfaces.
-    pub fn disconnect() -> Result<(), String> {
+    pub fn disconnect() -> Result<(), WirelessError> {
         let stas = Self::get_sta_sections()?;
         for sta in &stas {
             Self::execute_uci(&["set", &format!("{}.disabled=1", sta.name)])?;
@@ -92,18 +96,18 @@ impl Connector {
     }
 
     /// Get the currently connected SSID from `iw dev <iface> link`.
-    pub fn get_connected_ssid(iface: &str) -> Result<String, String> {
+    pub fn get_connected_ssid(iface: &str) -> Result<String, WirelessError> {
         let output = Command::new("iw")
             .args(["dev", iface, "link"])
             .output()
-            .map_err(|e| format!("iw dev link: {e}"))?;
+            .map_err(|e| WirelessError::IwSpawn(e.to_string()))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         Self::parse_connected_ssid(&stdout)
     }
 
     /// Parse SSID from `iw dev <iface> link` output.
-    pub fn parse_connected_ssid(output: &str) -> Result<String, String> {
+    pub fn parse_connected_ssid(output: &str) -> Result<String, WirelessError> {
         for line in output.lines() {
             let trimmed = line.trim();
             if trimmed.starts_with("SSID:") {
@@ -117,7 +121,7 @@ impl Connector {
                 }
             }
         }
-        Err("no SSID found in iw link output".to_string())
+        Err(WirelessError::NoSsid)
     }
 
     /// Parse signal strength (dBm) from `iw dev <iface> link` output.
@@ -148,7 +152,7 @@ impl Connector {
         Self::parse_signal_dbm(&stdout)
     }
 
-    fn find_available_sta_interface(&self) -> Result<String, String> {
+    fn find_available_sta_interface(&self) -> Result<String, WirelessError> {
         let sections = Self::get_sta_sections()?;
         for sta in &sections {
             if sta.disabled {
@@ -161,7 +165,7 @@ impl Connector {
         Self::create_sta_interface()
     }
 
-    fn disable_other_sta_interfaces(&self, active: &str) -> Result<(), String> {
+    fn disable_other_sta_interfaces(&self, active: &str) -> Result<(), WirelessError> {
         let sections = Self::get_sta_sections()?;
         for sta in &sections {
             if sta.name != active {
@@ -171,11 +175,11 @@ impl Connector {
         Ok(())
     }
 
-    fn create_sta_interface() -> Result<String, String> {
+    fn create_sta_interface() -> Result<String, WirelessError> {
         let output = Self::execute_uci(&["add", "wireless", "wifi-iface"])?;
         let name = output.trim().to_string();
         if name.is_empty() {
-            return Err("failed to create STA interface".to_string());
+            return Err(WirelessError::StaCreateFailed);
         }
 
         let suffix = format!("{:04x}", rand::random::<u16>());
@@ -189,7 +193,7 @@ impl Connector {
     }
 
     /// Get all STA interface sections from UCI wireless config.
-    pub fn get_sta_sections() -> Result<Vec<super::types::StaSection>, String> {
+    pub fn get_sta_sections() -> Result<Vec<super::types::StaSection>, WirelessError> {
         let output = Self::execute_uci(&["show", "wireless"])?;
         Ok(Self::parse_sta_sections(&output))
     }

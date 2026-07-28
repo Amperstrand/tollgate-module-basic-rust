@@ -99,7 +99,7 @@ async fn handle_connection(stream: tokio::net::UnixStream, state: Arc<AppState>)
 }
 
 async fn handle_wallet_drain(state: &AppState) -> String {
-    let wallet_guard = state.wallet.lock().await;
+    let wallet_guard = state.wallet.read().await;
     if let Some(ref wallet) = *wallet_guard {
         let balances = wallet.get_balance_by_mint().await.unwrap_or_default();
 
@@ -138,7 +138,7 @@ async fn handle_wallet_drain(state: &AppState) -> String {
 }
 
 async fn handle_wallet_fund(state: &AppState, token: &str) -> String {
-    let wallet_guard = state.wallet.lock().await;
+    let wallet_guard = state.wallet.read().await;
     if let Some(ref wallet) = *wallet_guard {
         match wallet.receive(token).await {
             Ok(amount) => {
@@ -169,7 +169,7 @@ async fn handle_wallet_fund(state: &AppState, token: &str) -> String {
 }
 
 async fn handle_health(state: &AppState) -> String {
-    let wallet_loaded = state.wallet.lock().await.is_some();
+    let wallet_loaded = state.wallet.read().await.is_some();
     let active_sessions = state.sessions.lock().await.sessions.len();
 
     let health = serde_json::json!({
@@ -302,7 +302,7 @@ async fn handle_command(cmd: &str, state: &AppState) -> String {
                 + "\n"
         }
         "wallet info" => {
-            let wallet_guard = state.wallet.lock().await;
+            let wallet_guard = state.wallet.read().await;
             if let Some(ref wallet) = *wallet_guard {
                 let balances = wallet.get_balance_by_mint().await.unwrap_or_default();
                 let mints: Vec<serde_json::Value> = balances
@@ -326,7 +326,7 @@ async fn handle_command(cmd: &str, state: &AppState) -> String {
             }
         }
         "wallet balance" => {
-            let wallet_guard = state.wallet.lock().await;
+            let wallet_guard = state.wallet.read().await;
             if let Some(ref wallet) = *wallet_guard {
                 match wallet.get_balance().await {
                     Ok(balance) => {
@@ -418,18 +418,24 @@ async fn handle_command(cmd: &str, state: &AppState) -> String {
 /// optionally advances keyset counters using keyset_counters.json.
 ///
 /// Returns a JSON report string with imported/failed counts.
-async fn run_migration(tokens_path: &str, state: &AppState) -> Result<String, String> {
-    let content = tokio::fs::read_to_string(tokens_path)
-        .await
-        .map_err(|e| format!("failed to read {tokens_path}: {e}"))?;
+async fn run_migration(
+    tokens_path: &str,
+    state: &AppState,
+) -> Result<String, crate::error::CliError> {
+    let content = tokio::fs::read_to_string(tokens_path).await.map_err(|e| {
+        crate::error::CliError::TokenFileRead {
+            path: tokens_path.to_string(),
+            reason: e.to_string(),
+        }
+    })?;
 
     let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
     let total = lines.len();
 
-    let wallet_guard = state.wallet.lock().await;
+    let wallet_guard = state.wallet.read().await;
     let wallet = wallet_guard
         .as_ref()
-        .ok_or_else(|| "no wallet configured".to_string())?;
+        .ok_or(crate::error::CliError::NoWallet)?;
 
     let mut imported: u64 = 0;
     let mut failed: u64 = 0;
@@ -491,7 +497,7 @@ mod tests {
             secret_key,
         });
 
-        let wallet = Arc::new(tokio::sync::Mutex::new(Some(TollWallet::new(
+        let wallet = Arc::new(tokio::sync::RwLock::new(Some(TollWallet::new(
             [0u8; 64],
             vec![],
             std::path::PathBuf::from("/tmp"),

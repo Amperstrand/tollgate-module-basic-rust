@@ -37,24 +37,7 @@ use tokio::time::{timeout, Duration};
 /// Default receive/send/melt timeout (matches Go's 30s).
 const OP_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Errors returned by TollWallet operations.
-#[derive(Debug, thiserror::Error)]
-pub enum WalletError {
-    #[error("CDK error: {0}")]
-    Cdk(#[from] cdk::Error),
-    #[error("database error: {0}")]
-    Database(String),
-    #[error("timeout after {0:?}")]
-    Timeout(Duration),
-    #[error("mint {0} not in accepted mints list")]
-    MintNotAccepted(String),
-    #[error("io error: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("wallet not initialized for mint {0}")]
-    WalletNotFound(String),
-    #[error("token parse error: {0}")]
-    TokenParse(String),
-}
+pub use crate::error::WalletError;
 
 /// TollWallet wraps multiple CDK Wallet instances (one per mint URL) behind
 /// a tokio Mutex for thread-safe serialized access. CDK's saga pattern

@@ -8,6 +8,16 @@
 use std::collections::HashMap;
 use std::io;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+const SAVE_DEBOUNCE_MS: u64 = 5000;
+
+fn epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
 
 /// A single customer session keyed by MAC address.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -29,6 +39,8 @@ pub struct CustomerSession {
 /// Session manager with disk persistence to `sessions.json`.
 pub struct SessionManager {
     pub sessions: HashMap<String, CustomerSession>,
+    dirty: AtomicBool,
+    last_save_ms: AtomicU64,
 }
 
 impl SessionManager {
@@ -36,6 +48,8 @@ impl SessionManager {
     pub fn new() -> Self {
         SessionManager {
             sessions: HashMap::new(),
+            dirty: AtomicBool::new(false),
+            last_save_ms: AtomicU64::new(0),
         }
     }
 
@@ -145,10 +159,35 @@ impl SessionManager {
 
     /// Save all active sessions to disk as JSON (`sessions.json`).
     ///
-    /// Expired sessions are filtered out before writing so the file does not
-    /// grow unbounded. The write is atomic: data goes to a `.tmp` file first,
-    /// then is renamed into place.
+    /// Debounced: if called again within `SAVE_DEBOUNCE_MS` of the last
+    /// successful write, marks dirty and returns `Ok(())` without writing.
+    /// The monitor's periodic `flush_if_dirty` call ensures the final state
+    /// is eventually persisted. This reduces flash write amplification on
+    /// OpenWrt routers.
+    ///
+    /// Expired sessions are filtered out before writing. The write is atomic:
+    /// data goes to a `.tmp` file first, then is renamed into place.
     pub fn save_to_disk(&self, dir: &Path) -> io::Result<()> {
+        self.dirty.store(true, Ordering::Release);
+        let now = epoch_ms();
+        let last = self.last_save_ms.load(Ordering::Acquire);
+        if now.saturating_sub(last) < SAVE_DEBOUNCE_MS {
+            return Ok(());
+        }
+        self.do_save(dir)
+    }
+
+    /// Force a disk write if there are unsaved changes. Called by the
+    /// monitor on each tick to ensure throttled saves eventually persist.
+    pub fn flush_if_dirty(&self, dir: &Path) -> io::Result<()> {
+        if self.dirty.load(Ordering::Acquire) {
+            self.do_save(dir)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn do_save(&self, dir: &Path) -> io::Result<()> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -160,6 +199,8 @@ impl SessionManager {
         let tmp = dir.join("sessions.json.tmp");
         std::fs::write(&tmp, json)?;
         std::fs::rename(&tmp, &path)?;
+        self.last_save_ms.store(epoch_ms(), Ordering::Release);
+        self.dirty.store(false, Ordering::Release);
         Ok(())
     }
 

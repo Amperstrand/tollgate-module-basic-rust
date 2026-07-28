@@ -118,6 +118,8 @@ async fn run_tick(sessions: &Arc<Mutex<SessionManager>>, portal: &Arc<dyn Captiv
             if let Err(e) = mgr.save_to_disk(&crate::config::config_dir()) {
                 tracing::warn!(error = %e, "failed to persist session updates to disk");
             }
+        } else if let Err(e) = mgr.flush_if_dirty(&crate::config::config_dir()) {
+            tracing::warn!(error = %e, "failed to flush dirty sessions to disk");
         }
     }
 
@@ -176,19 +178,21 @@ mod tests {
 
     #[async_trait]
     impl CaptivePortal for MockPortal {
-        async fn grant_access(&self, mac: &str) -> Result<(), String> {
+        async fn grant_access(&self, mac: &str) -> Result<(), crate::error::AppError> {
             self.granted.lock().unwrap().push(mac.to_string());
             Ok(())
         }
 
-        async fn revoke_access(&self, mac: &str) -> Result<(), String> {
+        async fn revoke_access(&self, mac: &str) -> Result<(), crate::error::AppError> {
             self.revoked.lock().unwrap().push(mac.to_string());
             Ok(())
         }
 
-        async fn poll_usage(&self, mac: &str) -> Result<(u64, u64), String> {
+        async fn poll_usage(&self, mac: &str) -> Result<(u64, u64), crate::error::AppError> {
             if *self.fail_poll.lock().unwrap() {
-                return Err("mock poll failure".to_string());
+                return Err(crate::error::AppError::Internal(
+                    "mock poll failure".to_string(),
+                ));
             }
             let usage = self
                 .usage_map

@@ -141,7 +141,7 @@ pub async fn handle_pay(
     };
 
     // Step 2: receive token into wallet
-    let wallet_guard = state.wallet.lock().await;
+    let wallet_guard = state.wallet.read().await;
     let received_amount = if let Some(ref wallet) = *wallet_guard {
         match wallet.receive(&token).await {
             Ok(amount_sat) => {

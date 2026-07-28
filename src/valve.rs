@@ -16,6 +16,7 @@
 //! as success: re-authorizing an authed client and deauthing an absent one
 //! are both no-ops from the portal's perspective.
 
+use crate::error::SessionError;
 use std::time::Duration;
 use tokio::process::Command;
 use tokio::sync::Mutex;
@@ -50,14 +51,14 @@ fn ndsctl_bin() -> String {
 /// Open the gate: authorize `mac` via `ndsctl auth`, granting internet
 /// access. Retries because NoDogSplash may not have registered the client
 /// session at the moment of the first attempt.
-pub async fn open_gate(mac: &str) -> Result<(), String> {
+pub async fn open_gate(mac: &str) -> Result<(), SessionError> {
     let bin = ndsctl_bin();
     run_ndsctl_with_retry(&bin, "auth", mac, AUTH_MAX_ATTEMPTS, AUTH_RETRY_DELAY_MS).await
 }
 
 /// Close the gate: deauthorize `mac` via `ndsctl deauth`, revoking internet
 /// access.
-pub async fn close_gate(mac: &str) -> Result<(), String> {
+pub async fn close_gate(mac: &str) -> Result<(), SessionError> {
     let bin = ndsctl_bin();
     run_ndsctl_with_retry(
         &bin,
@@ -81,7 +82,7 @@ async fn run_ndsctl_with_retry(
     mac: &str,
     max_retries: u32,
     delay_ms: u64,
-) -> Result<(), String> {
+) -> Result<(), SessionError> {
     // Held until the function returns — see NDSCTL_MUTEX docs.
     let _lock = NDSCTL_MUTEX.lock().await;
 
@@ -90,7 +91,10 @@ async fn run_ndsctl_with_retry(
             .args([action, mac])
             .output()
             .await
-            .map_err(|e| format!("ndsctl {action} failed to start: {e}"))?;
+            .map_err(|e| SessionError::GateSpawn {
+                action: action.to_string(),
+                reason: e.to_string(),
+            })?;
 
         if output.status.success() {
             tracing::debug!(
@@ -145,9 +149,11 @@ async fn run_ndsctl_with_retry(
         }
     }
 
-    Err(format!(
-        "ndsctl {action} {mac} failed after {max_retries} attempts"
-    ))
+    Err(SessionError::GateExhausted {
+        action: action.to_string(),
+        mac: mac.to_string(),
+        attempts: max_retries,
+    })
 }
 
 #[cfg(test)]
@@ -272,7 +278,7 @@ exit 0\n";
             "expected Err after exhausting retries, got {:?}",
             res
         );
-        let err = res.unwrap_err();
+        let err = res.unwrap_err().to_string();
         assert!(
             err.contains("failed after 3 attempts"),
             "error should mention retry exhaustion, got: {err}"
@@ -296,7 +302,7 @@ exit 0\n";
             "expected Err for missing binary, got {:?}",
             res
         );
-        let err = res.unwrap_err();
+        let err = res.unwrap_err().to_string();
         assert!(
             err.contains("failed to start"),
             "error should mention start failure, got: {err}"

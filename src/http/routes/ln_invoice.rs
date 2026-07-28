@@ -85,7 +85,7 @@ pub async fn handle_create_ln_invoice(
         }
     };
 
-    let wallet_guard = state.wallet.lock().await;
+    let wallet_guard = state.wallet.read().await;
     let wallet = match wallet_guard.as_ref() {
         Some(w) => w,
         None => {
@@ -163,7 +163,7 @@ pub async fn handle_get_ln_invoice(
     };
 
     let (state_str, check_state_str, expiry) = {
-        let wallet_guard = state.wallet.lock().await;
+        let wallet_guard = state.wallet.read().await;
         match wallet_guard.as_ref() {
             Some(wallet) => match wallet.check_mint_quote(&stored.mint_url, &q.quote).await {
                 Ok(raw) => {

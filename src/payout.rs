@@ -26,7 +26,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 
 use crate::mint_health::MintHealthTracker;
 use crate::wallet::TollWallet;
@@ -102,7 +102,7 @@ impl PayoutRoutine {
     ///
     /// Consumes `self`. Each task loops forever: wait for interval tick,
     /// check mint health, process payout.
-    pub fn start(self, wallet: Arc<Mutex<Option<TollWallet>>>, health: Arc<MintHealthTracker>) {
+    pub fn start(self, wallet: Arc<RwLock<Option<TollWallet>>>, health: Arc<MintHealthTracker>) {
         for config in &self.configs {
             let config = config.clone();
             let profit_shares = self.profit_shares.clone();
@@ -136,7 +136,7 @@ impl PayoutRoutine {
                     }
 
                     // Lock wallet. In degraded mode the Option is None.
-                    let guard = wallet.lock().await;
+                    let guard = wallet.read().await;
                     if let Some(ref wallet) = *guard {
                         Self::process_payout(&config, &profit_shares, wallet).await;
                     }
@@ -381,46 +381,46 @@ async fn melt_to_lightning(
     amount_sats: u64,
     _max_cost_sats: u64,
     lightning_address: &str,
-) -> Result<(), String> {
-    let wallet = wallet.ok_or("wallet not available")?;
+) -> Result<(), crate::error::PayoutError> {
+    let wallet = wallet.ok_or(crate::error::PayoutError::NoWallet)?;
 
     let bolt11 = if lightning_address.starts_with("lnbc") {
         lightning_address.to_string()
     } else {
         let (user, domain) = lightning_address
             .split_once('@')
-            .ok_or("invalid lightning address")?;
+            .ok_or(crate::error::PayoutError::InvalidAddress)?;
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .build()
-            .map_err(|e| format!("HTTP client build failed: {e}"))?;
+            .map_err(|e| crate::error::PayoutError::HttpClientBuild(e.to_string()))?;
         let lnurl_url = format!("https://{}/.well-known/lnurlp/{}", domain, user);
         let resp: serde_json::Value = client
             .get(&lnurl_url)
             .send()
             .await
-            .map_err(|e| format!("LNURL fetch failed: {e}"))?
+            .map_err(|e| crate::error::PayoutError::LnurlFetch(e.to_string()))?
             .json()
             .await
-            .map_err(|e| format!("LNURL parse failed: {e}"))?;
+            .map_err(|e| crate::error::PayoutError::LnurlParse(e.to_string()))?;
         let callback = resp
             .get("callback")
             .and_then(|v| v.as_str())
-            .ok_or("no callback in LNURL response")?;
+            .ok_or(crate::error::PayoutError::NoCallback)?;
         let invoice_url = format!("{}?amount={}", callback, amount_sats * 1000);
         let invoice_resp: serde_json::Value = client
             .get(&invoice_url)
             .send()
             .await
-            .map_err(|e| format!("invoice fetch failed: {e}"))?
+            .map_err(|e| crate::error::PayoutError::InvoiceFetch(e.to_string()))?
             .json()
             .await
-            .map_err(|e| format!("invoice parse failed: {e}"))?;
+            .map_err(|e| crate::error::PayoutError::InvoiceParse(e.to_string()))?;
         invoice_resp
             .get("pr")
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
-            .ok_or("no BOLT11 invoice in response")?
+            .ok_or(crate::error::PayoutError::NoInvoice)?
             .to_string()
     };
 
@@ -431,7 +431,7 @@ async fn melt_to_lightning(
         }
         Err(e) => {
             tracing::error!(mint_url, %lightning_address, error = %e, "melt failed");
-            Err(format!("melt failed: {e}"))
+            Err(crate::error::PayoutError::Melt(e.to_string()))
         }
     }
 }

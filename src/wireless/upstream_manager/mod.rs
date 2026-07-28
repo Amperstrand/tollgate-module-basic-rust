@@ -122,7 +122,9 @@ impl UpstreamManager {
         self.state = ManagerState::Scanning;
         tracing::info!("scanning for upstream gateways...");
 
-        let networks = Scanner::scan_all();
+        let networks = tokio::task::spawn_blocking(Scanner::scan_all)
+            .await
+            .unwrap_or_default();
         if networks.is_empty() {
             self.consecutive_failures += 1;
             tracing::warn!(
@@ -142,11 +144,17 @@ impl UpstreamManager {
             }
         };
 
-        let connector = Connector::new();
         self.state = ManagerState::Connecting(gateway.ssid.clone());
 
-        match connector.connect(&gateway, "") {
-            Ok(()) => {
+        let gateway_for_connect = gateway.clone();
+        let connect_outcome = tokio::task::spawn_blocking(move || {
+            let connector = Connector::new();
+            connector.connect(&gateway_for_connect, "")
+        })
+        .await;
+
+        match connect_outcome {
+            Ok(Ok(())) => {
                 tracing::info!(ssid = %gateway.ssid, signal = gateway.signal, "connected to gateway");
 
                 let mut session = UpstreamSession::new("gateway", &gateway.radio);
@@ -175,12 +183,21 @@ impl UpstreamManager {
                 self.state = ManagerState::Connected;
                 ManagerAction::Connected(gateway)
             }
-            Err(e) => {
-                tracing::warn!(error = %e, ssid = %gateway.ssid, "connection failed");
+            Ok(Err(e)) => {
+                let msg = e.to_string();
+                tracing::warn!(error = %msg, ssid = %gateway.ssid, "connection failed");
                 self.blacklist_gateway(&gateway.bssid);
                 self.consecutive_failures += 1;
                 self.state = ManagerState::Idle;
-                ManagerAction::ConnectionFailed(e)
+                ManagerAction::ConnectionFailed(msg)
+            }
+            Err(e) => {
+                let msg = format!("spawn_blocking panicked: {e}");
+                tracing::warn!(error = %msg, ssid = %gateway.ssid, "connection task failed");
+                self.blacklist_gateway(&gateway.bssid);
+                self.consecutive_failures += 1;
+                self.state = ManagerState::Idle;
+                ManagerAction::ConnectionFailed(msg)
             }
         }
     }
@@ -194,8 +211,10 @@ impl UpstreamManager {
             }
         };
 
-        let iface = self.sta_interface.as_deref().unwrap_or("wlan0");
-        let signal = Connector::get_signal(iface);
+        let iface = self.sta_interface.as_deref().unwrap_or("wlan0").to_string();
+        let signal = tokio::task::spawn_blocking(move || Connector::get_signal(&iface))
+            .await
+            .unwrap_or(None);
         let _now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()

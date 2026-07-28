@@ -38,3 +38,5 @@ pub mod verify;
 pub mod wallet;
 
 pub use wallet::TollWallet;
+
+pub use crate::error::WalletError;

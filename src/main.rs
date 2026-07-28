@@ -164,7 +164,7 @@ async fn main() {
     let state = Arc::new(http::AppState {
         config: Arc::new(config_obj),
         identity: Arc::new(identity),
-        wallet: Arc::new(tokio::sync::Mutex::new(Some(toll_wallet))),
+        wallet: Arc::new(tokio::sync::RwLock::new(Some(toll_wallet))),
         sessions: Arc::new(tokio::sync::Mutex::new(sessions)),
         portal: portal.clone(),
         verifier,
@@ -188,7 +188,7 @@ async fn main() {
             loop {
                 interval.tick().await;
                 let token: Option<String> = {
-                    let w = wallet_arc.lock().await;
+                    let w = wallet_arc.read().await;
                     if let Some(wallet) = w.as_ref() {
                         match wallet.get_balance().await {
                             Ok(0) => None,
