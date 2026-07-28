@@ -15,7 +15,6 @@
 use crate::http::AppState;
 use crate::mac_resolver::{get_client_ip, get_mac_address};
 use crate::nostr_event;
-use crate::wallet::verify::TokenVerifier;
 use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
@@ -116,15 +115,7 @@ pub async fn handle_pay(
     };
 
     // Step 1: verify token via NUT-07 checkstate
-    let mints: Vec<String> = state
-        .config
-        .accepted_mints
-        .iter()
-        .map(|m| m.url.clone())
-        .collect();
-
-    let verifier = TokenVerifier::new(mints);
-    let (verified_amount, token_mint_url) = match verifier.verify(&token).await {
+    let (verified_amount, token_mint_url) = match state.verifier.verify(&token).await {
         Ok((amount_msat, mint_url)) => (amount_msat, mint_url),
         Err(e) => {
             tracing::warn!(error = %e, "token verification failed");

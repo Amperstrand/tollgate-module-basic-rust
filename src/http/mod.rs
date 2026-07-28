@@ -14,6 +14,9 @@ pub struct AppState {
     pub wallet: Arc<tokio::sync::Mutex<Option<crate::wallet::wallet::TollWallet>>>,
     pub sessions: Arc<tokio::sync::Mutex<crate::session::SessionManager>>,
     pub portal: Arc<dyn crate::portal::CaptivePortal>,
+    /// Shared token verifier — reuses the internal reqwest::Client across
+    /// all payment requests instead of constructing one per POST /.
+    pub verifier: Arc<crate::wallet::verify::TokenVerifier>,
 }
 
 /// Build the main HTTP router with all routes.

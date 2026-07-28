@@ -498,12 +498,14 @@ mod tests {
         ))));
         let sessions = Arc::new(tokio::sync::Mutex::new(SessionManager::new()));
         let portal: Arc<dyn CaptivePortal> = Arc::new(NdsPortal::new());
+        let verifier = Arc::new(crate::wallet::verify::TokenVerifier::new(vec![]));
         Arc::new(AppState {
             config,
             identity,
             wallet,
             sessions,
             portal,
+            verifier,
         })
     }
 

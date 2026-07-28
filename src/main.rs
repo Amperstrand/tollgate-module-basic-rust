@@ -89,6 +89,7 @@ async fn main() {
         .iter()
         .map(|m| m.url.clone())
         .collect();
+    let verifier = Arc::new(wallet::verify::TokenVerifier::new(mint_urls.clone()));
     let mut toll_wallet = wallet::TollWallet::new(seed, mint_urls, db_dir.clone());
     for mint in &config_obj.accepted_mints {
         match toll_wallet.ensure_mint(&mint.url).await {
@@ -166,6 +167,7 @@ async fn main() {
         wallet: Arc::new(tokio::sync::Mutex::new(Some(toll_wallet))),
         sessions: Arc::new(tokio::sync::Mutex::new(sessions)),
         portal: portal.clone(),
+        verifier,
     });
 
     let monitor_handle = {
