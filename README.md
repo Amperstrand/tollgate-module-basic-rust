@@ -1,9 +1,9 @@
 # tollgate-module-basic-rust
 
-> **Status: WIP — Phase 7 (test parity on physical hardware) in progress.**
-> Phases 0–6 are complete (210 unit tests passing). The Go original remains
-> the production binary until this Rust clone passes full test-parity on
-> real OpenWrt hardware.
+> **Status: WIP — Phase 14 (physical hardware validation) pending.**
+> Phases 0–13 are complete (438 tests passing: 210 default + 228 embedded-portal).
+> The Go original remains the production binary until this Rust clone passes
+> full test-parity on real OpenWrt hardware.
 
 Rust rewrite of `tollgate-module-basic-go` — a drop-in replacement that
 uses [CDK](https://github.com/cashubtc/cdk) (Cashu Dev Kit) instead of
@@ -72,12 +72,20 @@ A single Rust binary that is a **drop-in replacement** for
 | 4 | Session management + metering + payment wiring | ✅ Complete |
 | 5 | OpenWrt packaging (Makefile, procd init, ARM cross-build) | ✅ Complete |
 | 6 | Wallet migration (gonuts-export → CDK receive) | ✅ Complete |
-| 7 | **Test parity on physical hardware** | **🔄 In progress** |
+| 7 | HTTP API parity + monitoring + mint health checks | ✅ Complete |
+| 8 | Payment, degradation mode, CLI, config migration | ✅ Complete |
+| 9 | CaptivePortal trait + NdsPortal | ✅ Complete |
+| 10 | NftManager + EmbeddedPortal + counter rules | ✅ Complete |
+| 11 | Port 80 redirect + IPv6 dual-stack | ✅ Complete |
+| 12 | `.ipk` packaging + CI cross-compile (5 architectures) | ✅ Complete |
+| 13 | Full audit (security, spec, architecture, CI/CD, tests, quality) | ✅ Complete |
+| 14 | **Physical hardware validation** | **⏳ Pending hardware** |
 
-**210 unit tests pass** (`cargo test`). **21/21 PRTA integration tests pass**
-locally. What remains is validation on real OpenWrt routers — verifying
-end-to-end payment flows, ndsctl integration, and migration of production
-wallets under live network conditions.
+**438 tests pass** (210 default + 228 with `--features embedded-portal`).
+**24 PRTA parity tests** (16 pass, 4 skip, 4 xfail). Full captive portal
+end-to-end verified on local KVM. What remains is validation on real
+OpenWrt routers — verifying end-to-end payment flows, ndsctl integration,
+and migration of production wallets under live network conditions.
 
 ## Tech Stack
 
@@ -147,7 +155,7 @@ Aggressive size optimization is configured in `Cargo.toml`:
 
 ```toml
 [profile.release]
-panic = "abort"      # no unwinding tables
+panic = "unwind"     # musl segfaults with abort; unwind is safe
 strip = true         # strip debug symbols
 opt-level = "z"      # optimize for size
 lto = true           # link-time optimization across all crates
@@ -321,7 +329,7 @@ echo "migrate /etc/tollgate/tokens.jsonl" | socat - UNIX-CONNECT:/var/run/tollga
 # Run all 210 unit tests (default features)
 cargo test
 
-# Run all 228 tests including embedded portal
+# Run all 438 tests including embedded portal (210 default + 228 embedded)
 cargo test --features embedded-portal
 
 # Run with output visible
@@ -355,13 +363,13 @@ cargo test monitor
 
 - **ndsctl integration** on real OpenWrt (the parse function is tested; the
   `poll_usage` subprocess call is not exercised in CI).
-- **Physical hardware deployment** — this is Phase 7.
+- **Physical hardware deployment** — this is Phase 14.
 - **Bricked wallet detection** — documented in
   [`docs/brick-detection.md`](docs/brick-detection.md) but **not implemented
   in code** (the migration sidesteps it by importing tokens into a fresh
   CDK wallet).
 
-### PRTA integration tests (21/21 pass locally)
+### PRTA integration tests (24 tests: 16 pass, 4 skip, 4 xfail)
 
 End-to-end payment flow IS tested against a live mint (testnut.cashu.exchange)
 via the [Physical Router Test Automation](https://github.com/OpenTollGate/physical-router-test-automation)
@@ -395,20 +403,17 @@ diagram, data flow, and design rationale covering:
 
 ## Binary Size
 
-The Rust binary is dramatically smaller than the Go original:
-
-| Target | Size (stripped) | Linking |
-|--------|----------------|---------|
-| `x86_64-unknown-linux-musl` | ~1.5 MB | static-pie |
-| `x86_64-unknown-linux-gnu` | ~1.4 MB | dynamic (glibc) |
+| Target | Size (stripped, release) | Linking |
+|--------|--------------------------|---------|
+| `x86_64-unknown-linux-gnu` | ~9.5 MB | dynamic (glibc) |
+| `x86_64-unknown-linux-musl` | ~10 MB | static |
 | Go original (stripped est.) | ~12 MB | dynamic |
 
-> The 1.5 MB figure is from the Phase 0 smoke test. With full HTTP routing
-> and CDK wallet integration, the binary is expected to settle around
-> 3–5 MB — still 3–4× smaller than Go.
-
-See [`docs/binary-size-baseline.md`](docs/binary-size-baseline.md) for
-detailed analysis.
+The Phase 0 smoke test (~1.5 MB) measured only the scaffolding binary.
+With full HTTP routing, CDK wallet, reqwest (rustls), secp256k1, and
+serde, the binary grew to ~9.5 MB — still smaller than Go but larger
+than the initial estimate. Future size reduction options are documented
+in [`docs/binary-size-baseline.md`](docs/binary-size-baseline.md).
 
 ## License
 
