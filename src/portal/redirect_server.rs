@@ -26,6 +26,7 @@ pub async fn handle_port80(
         .unwrap_or("gateway");
 
     let gateway = host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host);
+    let gateway = gateway.replace(['<', '>', '&', '"', '\'', '`'], "_");
 
     let html = format!(
         r#"<!DOCTYPE html>

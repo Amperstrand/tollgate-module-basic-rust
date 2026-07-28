@@ -35,7 +35,7 @@ impl TokenVerifier {
     }
 
     /// Parse and verify a Cashu token. Returns amount in milli-sat.
-    pub async fn verify(&self, token_str: &str) -> Result<u64, String> {
+    pub async fn verify(&self, token_str: &str) -> Result<(u64, String), String> {
         let token: Token = token_str
             .parse()
             .map_err(|e| format!("invalid Cashu token: {e}"))?;
@@ -65,7 +65,7 @@ impl TokenVerifier {
 
         self.check_proofs_unspent(&mint_base, &ys).await?;
 
-        Ok(amount_sat * 1_000)
+        Ok((amount_sat * 1_000, mint_base))
     }
 
     /// NUT-07: check all Y-values are UNSPENT.

@@ -124,8 +124,8 @@ pub async fn handle_pay(
         .collect();
 
     let verifier = TokenVerifier::new(mints);
-    let verified_amount = match verifier.verify(&token).await {
-        Ok(amount_msat) => amount_msat,
+    let (verified_amount, token_mint_url) = match verifier.verify(&token).await {
+        Ok((amount_msat, mint_url)) => (amount_msat, mint_url),
         Err(e) => {
             tracing::warn!(error = %e, "token verification failed");
             let event = nostr_event::create_event(
@@ -205,9 +205,17 @@ pub async fn handle_pay(
     drop(wallet_guard);
 
     // Step 3: create session — allotment in the metric's unit (bytes or ms)
-    let duration_secs = 3600u64; // default 1 hour session
-    let mint = state.config.accepted_mints.first();
-    let price_per_step = mint.map(|m| m.price_per_step).unwrap_or(1).max(1); // avoid div-by-zero
+    let duration_secs = 3600u64;
+    let mint_config = state
+        .config
+        .accepted_mints
+        .iter()
+        .find(|m| {
+            let cfg_url = m.url.trim_end_matches('/');
+            cfg_url == token_mint_url || m.url == token_mint_url
+        })
+        .or_else(|| state.config.accepted_mints.first());
+    let price_per_step = mint_config.map(|m| m.price_per_step).unwrap_or(1).max(1);
 
     // Validate minimum purchase (payment too small)
     let steps = received_amount / price_per_step;

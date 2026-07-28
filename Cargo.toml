@@ -68,7 +68,7 @@ tempfile = "3"
 serial_test = "3"
 
 [patch.crates-io]
-cdk-common = { git = "https://github.com/Amperstrand/cdk-common", branch = "main" }
+cdk-common = { git = "https://github.com/Amperstrand/cdk-common", rev = "524e9c922805b624efe88b7c5e00b7e40db7dfbe" }
 
 [profile.release]
 # Aggressive size optimization — tollgate ships on resource-constrained OpenWrt routers
