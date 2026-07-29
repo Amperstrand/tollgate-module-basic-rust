@@ -18,6 +18,7 @@ pub struct AppState {
     /// Shared token verifier — reuses the internal reqwest::Client across
     /// all payment requests instead of constructing one per POST /.
     pub verifier: Arc<crate::wallet::verify::TokenVerifier>,
+    pub rate_limiter: Arc<crate::rate_limiter::RateLimiter>,
 }
 
 /// Build the main HTTP router with all routes.

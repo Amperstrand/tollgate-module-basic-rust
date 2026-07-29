@@ -90,6 +90,7 @@ async fn main() {
         .map(|m| m.url.clone())
         .collect();
     let verifier = Arc::new(wallet::verify::TokenVerifier::new(mint_urls.clone()));
+    let rate_limiter = Arc::new(tollgate_module_basic_rust::rate_limiter::RateLimiter::from_env());
     let mut toll_wallet = wallet::TollWallet::new(seed, mint_urls, db_dir.clone());
     for mint in &config_obj.accepted_mints {
         match toll_wallet.ensure_mint(&mint.url).await {
@@ -168,6 +169,7 @@ async fn main() {
         sessions: Arc::new(tokio::sync::Mutex::new(sessions)),
         portal: portal.clone(),
         verifier,
+        rate_limiter,
     });
 
     let monitor_handle = {

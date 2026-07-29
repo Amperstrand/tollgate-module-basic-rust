@@ -505,6 +505,7 @@ mod tests {
         let sessions = Arc::new(tokio::sync::Mutex::new(SessionManager::new()));
         let portal: Arc<dyn CaptivePortal> = Arc::new(NdsPortal::new());
         let verifier = Arc::new(crate::wallet::verify::TokenVerifier::new(vec![]));
+        let rate_limiter = Arc::new(crate::rate_limiter::RateLimiter::new(1000));
         Arc::new(AppState {
             config,
             identity,
@@ -512,6 +513,7 @@ mod tests {
             sessions,
             portal,
             verifier,
+            rate_limiter,
         })
     }
 

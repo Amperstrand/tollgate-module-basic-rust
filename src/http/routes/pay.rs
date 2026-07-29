@@ -90,6 +90,20 @@ pub async fn handle_pay(
     };
 
     let client_ip = get_client_ip(&headers, Some(remote_addr));
+
+    if let Ok(ip) = client_ip.parse() {
+        if !state.rate_limiter.allow(ip).await {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                [
+                    ("content-type", "text/plain"),
+                    ("access-control-allow-origin", "*"),
+                ],
+                "rate limited".to_string(),
+            );
+        }
+    }
+
     let mac = match get_mac_address(&client_ip) {
         Some(m) => m,
         None => {

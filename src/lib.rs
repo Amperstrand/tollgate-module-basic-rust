@@ -13,6 +13,7 @@ pub mod monitor;
 pub mod nostr_event;
 pub mod payout;
 pub mod portal;
+pub mod rate_limiter;
 pub mod reseller;
 pub mod session;
 pub mod tracing_setup;

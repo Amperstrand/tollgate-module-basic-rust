@@ -75,6 +75,7 @@ impl TokenVerifier {
     }
 
     /// NUT-07: check all Y-values are UNSPENT.
+    /// Retries on HTTP 429 with exponential backoff (2s, 4s, 8s).
     async fn check_proofs_unspent(
         &self,
         mint_base: &str,
@@ -83,30 +84,56 @@ impl TokenVerifier {
         let url = format!("{mint_base}/v1/checkstate");
         let body = serde_json::json!({ "Ys": ys });
 
-        let resp: serde_json::Value = self
-            .client
-            .post(&url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| VerifyError::CheckStateRequest(e.to_string()))?
-            .error_for_status()
-            .map_err(|e| VerifyError::CheckStateStatus(e.to_string()))?
-            .json()
-            .await
-            .map_err(|e| VerifyError::CheckStateParse(e.to_string()))?;
+        let mut last_err: Option<VerifyError> = None;
+        for attempt in 0..3u32 {
+            if attempt > 0 {
+                let delay = std::time::Duration::from_secs(1 << attempt);
+                tracing::warn!(
+                    attempt,
+                    delay_ms = delay.as_millis(),
+                    "mint returned 429, retrying"
+                );
+                tokio::time::sleep(delay).await;
+            }
 
-        let states = resp["states"]
-            .as_array()
-            .ok_or(VerifyError::MissingStates)?;
+            let resp = self.client.post(&url).json(&body).send().await;
 
-        for state in states {
-            let s = state["state"].as_str().unwrap_or("");
-            if s.to_uppercase() != "UNSPENT" {
-                return Err(VerifyError::Spent(s.to_string()));
+            match resp {
+                Ok(r) if r.status().as_u16() == 429 => {
+                    last_err = Some(VerifyError::CheckStateStatus(
+                        "mint rate limited (429)".to_string(),
+                    ));
+                    continue;
+                }
+                Ok(r) => {
+                    let resp: serde_json::Value = r
+                        .error_for_status()
+                        .map_err(|e| VerifyError::CheckStateStatus(e.to_string()))?
+                        .json()
+                        .await
+                        .map_err(|e| VerifyError::CheckStateParse(e.to_string()))?;
+
+                    let states = resp["states"]
+                        .as_array()
+                        .ok_or(VerifyError::MissingStates)?;
+
+                    for state in states {
+                        let s = state["state"].as_str().unwrap_or("");
+                        if s.to_uppercase() != "UNSPENT" {
+                            return Err(VerifyError::Spent(s.to_string()));
+                        }
+                    }
+                    return Ok(());
+                }
+                Err(e) => {
+                    last_err = Some(VerifyError::CheckStateRequest(e.to_string()));
+                    continue;
+                }
             }
         }
-        Ok(())
+        Err(last_err.unwrap_or(VerifyError::CheckStateStatus(
+            "max retries exceeded".to_string(),
+        )))
     }
 }
 
