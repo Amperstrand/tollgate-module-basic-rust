@@ -2,6 +2,7 @@
 
 pub mod routes;
 
+use axum::extract::DefaultBodyLimit;
 use axum::Router;
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
@@ -43,5 +44,6 @@ pub fn create_router(state: AppState) -> Router {
                 .get(routes::ln_invoice::handle_get_ln_invoice),
         )
         .layer(cors)
+        .layer(DefaultBodyLimit::max(1_000_000))
         .with_state(state)
 }

@@ -6,6 +6,7 @@
 use crate::error::VerifyError;
 use cashu::nuts::Token;
 use std::collections::HashSet;
+use std::convert::TryFrom;
 
 /// TLS 1.2 hard-pinned HTTP client (matches Go behavior — Go audit §2.4).
 fn build_http_client() -> reqwest::Client {
@@ -59,6 +60,10 @@ impl TokenVerifier {
             .map_err(|e| VerifyError::ValueSum(e.to_string()))?
             .into();
 
+        if has_locked_proofs(&token) {
+            return Err(VerifyError::LockedToken);
+        }
+
         let ys = token_proof_ys(&token);
         if ys.is_empty() {
             return Err(VerifyError::NoProofs);
@@ -102,6 +107,29 @@ impl TokenVerifier {
             }
         }
         Ok(())
+    }
+}
+
+/// Check if a proof secret is a NUT-10 spending condition (P2PK or HTLC).
+/// Plain secrets fail NUT-10 deserialization and return false.
+fn is_locked_secret(secret: &cashu::secret::Secret) -> bool {
+    cashu::nuts::nut10::Secret::try_from(secret).is_ok()
+}
+
+/// Check if any proof in the token has a spending condition that prevents
+/// the gateway from spending it upstream. Rejects P2PK and HTLC locked tokens.
+fn has_locked_proofs(token: &Token) -> bool {
+    match token {
+        Token::TokenV3(t) => t
+            .token
+            .iter()
+            .flat_map(|e| e.proofs.iter())
+            .any(|p| is_locked_secret(&p.secret)),
+        Token::TokenV4(t) => t
+            .token
+            .iter()
+            .flat_map(|e| e.proofs.iter())
+            .any(|p| is_locked_secret(&p.secret)),
     }
 }
 
@@ -258,5 +286,27 @@ mod tests {
                 "testnut should be in accepted list: {msg}"
             );
         }
+    }
+
+    #[test]
+    fn detects_p2pk_secret_as_locked() {
+        let p2pk = r#"["P2PK",{"nonce":"5d11913e","data":"026562efcfadc8e86d44da6a8adf80633d974302e62c850774db1fb36ff4cc7198"}]"#;
+        assert!(is_locked_secret(&cashu::secret::Secret::new(p2pk)));
+    }
+
+    #[test]
+    fn detects_htlc_secret_as_locked() {
+        let htlc = r#"["HTLC",{"nonce":"abc","data":"","tags":[["payment_hash","xyz"]]}]"#;
+        assert!(is_locked_secret(&cashu::secret::Secret::new(htlc)));
+    }
+
+    #[test]
+    fn allows_plain_secret() {
+        assert!(!is_locked_secret(&cashu::secret::Secret::new(
+            "deadbeef00aabb"
+        )));
+        assert!(!is_locked_secret(&cashu::secret::Secret::new(
+            "plain-secret-string"
+        )));
     }
 }

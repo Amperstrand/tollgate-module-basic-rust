@@ -131,6 +131,8 @@ pub enum VerifyError {
     MissingStates,
     #[error("one or more proofs already spent (state: {0})")]
     Spent(String),
+    #[error("token has spending conditions (P2PK/HTLC) and cannot be spent by the gateway")]
+    LockedToken,
 }
 
 // ---------------------------------------------------------------------------
@@ -247,7 +249,8 @@ impl IntoResponse for AppError {
             Self::Verify(VerifyError::InvalidToken(_))
             | Self::Verify(VerifyError::NoProofs)
             | Self::Verify(VerifyError::MintNotAccepted(_))
-            | Self::Verify(VerifyError::Spent(_)) => StatusCode::BAD_REQUEST,
+            | Self::Verify(VerifyError::Spent(_))
+            | Self::Verify(VerifyError::LockedToken) => StatusCode::BAD_REQUEST,
 
             // Config validation errors are client-side fixable.
             Self::Config(ConfigError::Validation(_)) | Self::Config(ConfigError::InvalidKey(_)) => {
