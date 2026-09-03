@@ -26,8 +26,8 @@ tower-http = { version = "0.6", features = ["cors", "timeout", "trace"] }
 http-body-util = "0.1"
 
 # Cashu Development Kit (wallet side — we are a wallet talking to mints)
-cdk = { version = "0.17", default-features = false, features = ["wallet"] }
-cdk-sqlite = "0.17"
+cdk = { version = "0.18", default-features = false, features = ["wallet"] }
+cdk-sqlite = "0.18"
 
 cashu = "0.17"
 
@@ -67,8 +67,9 @@ embedded-portal = ["dep:nftables"]
 tempfile = "3"
 serial_test = "3"
 
-[patch.crates-io]
-cdk-common = { git = "https://github.com/Amperstrand/cdk-common", rev = "524e9c922805b624efe88b7c5e00b7e40db7dfbe" }
+# mipsel_24kc has no 64-bit atomics: if a cdk-common release reintroduces
+# AtomicU64, patch it via [patch.crates-io] (Amperstrand/cdk-common carries
+# the AtomicU64→AtomicUsize port for exactly this).
 
 [profile.release]
 # Aggressive size optimization — tollgate ships on resource-constrained OpenWrt routers
