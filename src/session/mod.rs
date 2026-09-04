@@ -8,7 +8,8 @@
 use std::collections::HashMap;
 use std::io;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
 const SAVE_DEBOUNCE_MS: u64 = 5000;
 
@@ -40,7 +41,9 @@ pub struct CustomerSession {
 pub struct SessionManager {
     pub sessions: HashMap<String, CustomerSession>,
     dirty: AtomicBool,
-    last_save_ms: AtomicU64,
+    /// `Mutex<u64>` rather than `AtomicU64`: mips32 has no native 64-bit
+    /// atomics, and epoch-millis overflows 32-bit `AtomicUsize`.
+    last_save_ms: Mutex<u64>,
 }
 
 impl SessionManager {
@@ -49,7 +52,7 @@ impl SessionManager {
         SessionManager {
             sessions: HashMap::new(),
             dirty: AtomicBool::new(false),
-            last_save_ms: AtomicU64::new(0),
+            last_save_ms: Mutex::new(0),
         }
     }
 
@@ -170,7 +173,7 @@ impl SessionManager {
     pub fn save_to_disk(&self, dir: &Path) -> io::Result<()> {
         self.dirty.store(true, Ordering::Release);
         let now = epoch_ms();
-        let last = self.last_save_ms.load(Ordering::Acquire);
+        let last = self.last_save_epoch_ms();
         if now.saturating_sub(last) < SAVE_DEBOUNCE_MS {
             return Ok(());
         }
@@ -187,6 +190,15 @@ impl SessionManager {
         }
     }
 
+    fn last_save_epoch_ms(&self) -> u64 {
+        // Poison can only mean a panic mid-save; the stale value is still
+        // safe for debouncing.
+        *self
+            .last_save_ms
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn do_save(&self, dir: &Path) -> io::Result<()> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -199,7 +211,7 @@ impl SessionManager {
         let tmp = dir.join("sessions.json.tmp");
         std::fs::write(&tmp, json)?;
         std::fs::rename(&tmp, &path)?;
-        self.last_save_ms.store(epoch_ms(), Ordering::Release);
+        *self.last_save_ms.lock().unwrap_or_else(|p| p.into_inner()) = epoch_ms();
         self.dirty.store(false, Ordering::Release);
         Ok(())
     }
