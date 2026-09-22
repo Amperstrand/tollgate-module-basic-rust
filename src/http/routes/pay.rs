@@ -38,6 +38,63 @@ fn extract_token_from_nostr_event(body: &str) -> Option<String> {
     None
 }
 
+/// Locally-checkable payment validation, run BEFORE any value moves
+/// (issue #4: the old ordering received the token first and confiscated
+/// below-minimum payments with no refund).
+#[derive(Debug)]
+pub(crate) struct PaymentPrecheck {
+    pub price_per_step: u64,
+}
+
+#[derive(Debug)]
+pub(crate) enum PrecheckError {
+    /// The token's mint is not in the accepted-mint config: pricing by an
+    /// arbitrary other mint would misprice the payment, and receiving an
+    /// unconfigured mint's value is not this router's contract.
+    MintNotAccepted(String),
+    BelowMinimum {
+        steps: u64,
+        min_steps: u64,
+        price_per_step: u64,
+    },
+}
+
+/// Validate and price a payment from pre-receive facts only.
+///
+/// The token's face value (verified amount) prices the minimum check;
+/// mint-specific pricing comes from the token's OWN mint config — never
+/// a fallback to another mint's price.
+pub(crate) fn precheck_payment(
+    verified_amount_msat: u64,
+    token_mint_url: &str,
+    accepted_mints: &[crate::config::MintConfig],
+) -> Result<PaymentPrecheck, PrecheckError> {
+    let mint_config = accepted_mints.iter().find(|m| {
+        let cfg_url = m.url.trim_end_matches('/');
+        cfg_url == token_mint_url || m.url == token_mint_url
+    });
+
+    let mint_config = match mint_config {
+        Some(m) => m,
+        None => return Err(PrecheckError::MintNotAccepted(token_mint_url.to_string())),
+    };
+
+    let price_per_step = mint_config.price_per_step.max(1);
+    let min_steps = mint_config.min_purchase_steps.max(1);
+    let verified_sat = verified_amount_msat / 1000;
+    let steps = verified_sat / price_per_step;
+
+    if steps < min_steps {
+        return Err(PrecheckError::BelowMinimum {
+            steps,
+            min_steps,
+            price_per_step,
+        });
+    }
+
+    Ok(PaymentPrecheck { price_per_step })
+}
+
 pub async fn handle_pay(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -154,6 +211,46 @@ pub async fn handle_pay(
         }
     };
 
+    // Step 1.5: every locally-checkable validation runs BEFORE receive —
+    // after `wallet.receive()` the token is consumed and a rejection here
+    // would confiscate it (issue #4).
+    let precheck = match precheck_payment(verified_amount, &token_mint_url, &state.config.accepted_mints) {
+        Ok(p) => p,
+        Err(e) => {
+            let (code, msg) = match &e {
+                PrecheckError::MintNotAccepted(mint) => (
+                    "mint-not-accepted",
+                    format!("payment rejected: mint {mint} is not configured on this TollGate"),
+                ),
+                PrecheckError::BelowMinimum { steps, min_steps, price_per_step } => (
+                    "payment-error-below-minimum",
+                    format!(
+                        "payment rejected: {steps} step(s) at {price_per_step} sat/step is below the minimum purchase of {min_steps} step(s)"
+                    ),
+                ),
+            };
+            tracing::warn!(code, error = ?e, "payment rejected by pre-receive check");
+            let event = nostr_event::create_event(
+                21023,
+                vec![
+                    vec!["level".to_string(), "error".to_string()],
+                    vec!["code".to_string(), code.to_string()],
+                ],
+                &msg,
+                &state.identity.secret_key,
+            );
+            let json = serde_json::to_string(&event).unwrap_or_default();
+            return (
+                StatusCode::BAD_REQUEST,
+                [
+                    ("content-type", "application/json"),
+                    ("access-control-allow-origin", "*"),
+                ],
+                json,
+            );
+        }
+    };
+
     // Step 2: receive token into wallet
     let wallet_guard = state.wallet.read().await;
     let received_amount = if let Some(ref wallet) = *wallet_guard {
@@ -211,39 +308,24 @@ pub async fn handle_pay(
 
     // Step 3: create session — allotment in the metric's unit (bytes or ms)
     let duration_secs = 3600u64;
-    let mint_config = state
-        .config
-        .accepted_mints
-        .iter()
-        .find(|m| {
-            let cfg_url = m.url.trim_end_matches('/');
-            cfg_url == token_mint_url || m.url == token_mint_url
-        })
-        .or_else(|| state.config.accepted_mints.first());
-    let price_per_step = mint_config.map(|m| m.price_per_step).unwrap_or(1).max(1);
+    let price_per_step = precheck.price_per_step;
 
-    // Validate minimum purchase (payment too small)
+    // The mint may have charged swap fees, so the received amount can be
+    // lower than the verified face value. Allotment follows the value that
+    // actually arrived; a received amount too small to buy a step after
+    // fees is logged (and shortchanges the customer by at most one step's
+    // price) — it must never reject after value moved.
     let steps = received_amount / price_per_step;
     if steps == 0 {
-        let event = nostr_event::create_event(
-            21023,
-            vec![],
-            "payment rejected: amount below minimum purchase",
-            &state.identity.secret_key,
-        );
-        let json = serde_json::to_string(&event).unwrap_or_default();
-        return (
-            StatusCode::BAD_REQUEST,
-            [
-                ("content-type", "application/json"),
-                ("access-control-allow-origin", "*"),
-            ],
-            json,
+        tracing::warn!(
+            received_sat = received_amount,
+            price_per_step,
+            "received amount bought zero steps after swap fees; granting empty session is impossible — reconcile via payment record (issue #5)"
         );
     }
 
     let step_size = state.config.step_size;
-    let allotment = (received_amount / price_per_step) * step_size;
+    let allotment = steps * step_size;
 
     let mut sessions = state.sessions.lock().await;
     let _session = sessions.create_session(&mac, allotment, &state.config.metric, duration_secs);
@@ -400,6 +482,63 @@ mod tests {
         let price_per_step: u64 = 2;
         let steps = received_amount / price_per_step;
         assert_eq!(steps, 0, "amount < price_per_step must yield zero steps");
+    }
+
+    fn mint_cfg(url: &str, price_per_step: u64, min_purchase_steps: u64) -> crate::config::MintConfig {
+        crate::config::MintConfig {
+            url: url.to_string(),
+            price_per_step,
+            min_purchase_steps,
+            ..crate::config::MintConfig::default_production("https://unused.example")
+        }
+    }
+
+    #[test]
+    fn precheck_rejects_below_minimum_before_receive() {
+        // 1 sat against a 2 sat/step mint: zero steps must be rejected by
+        // the pre-receive check, not after the wallet consumed the token.
+        let err = precheck_payment(1_000, "https://mint.example", &[mint_cfg("https://mint.example", 2, 0)])
+            .expect_err("below-minimum must fail precheck");
+        match err {
+            PrecheckError::BelowMinimum { steps, min_steps, price_per_step } => {
+                assert_eq!((steps, min_steps, price_per_step), (0, 1, 2));
+            }
+            other => panic!("expected BelowMinimum, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn precheck_honors_min_purchase_steps() {
+        let mints = [mint_cfg("https://mint.example", 1, 3)];
+        assert!(precheck_payment(2_000, "https://mint.example", &mints).is_err());
+        assert!(precheck_payment(3_000, "https://mint.example", &mints).is_ok());
+    }
+
+    #[test]
+    fn precheck_rejects_unconfigured_mint_no_pricing_fallback() {
+        // A token from an unconfigured mint must be rejected outright,
+        // never priced with another mint's price_per_step.
+        let mints = [mint_cfg("https://a.example", 5, 0), mint_cfg("https://b.example", 1, 0)];
+        let err = precheck_payment(10_000, "https://unknown.example", &mints)
+            .expect_err("unconfigured mint must fail precheck");
+        match err {
+            PrecheckError::MintNotAccepted(m) => assert_eq!(m, "https://unknown.example"),
+            other => panic!("expected MintNotAccepted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn precheck_prices_with_the_tokens_own_mint() {
+        let mints = [mint_cfg("https://a.example", 5, 0), mint_cfg("https://b.example", 1, 0)];
+        let ok = precheck_payment(10_000, "https://b.example", &mints)
+            .expect("token mint is configured");
+        assert_eq!(ok.price_per_step, 1, "pricing must come from the token's mint, not mints[0]");
+    }
+
+    #[test]
+    fn precheck_matches_trailing_slash_variant() {
+        let mints = [mint_cfg("https://mint.example/", 1, 0)];
+        assert!(precheck_payment(1_000, "https://mint.example", &mints).is_ok());
     }
 
     #[test]

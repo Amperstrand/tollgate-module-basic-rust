@@ -8,7 +8,7 @@
 
 pub mod schema;
 
-pub use schema::{Config, IdentitiesConfig, InstallConfig};
+pub use schema::{Config, IdentitiesConfig, InstallConfig, MintConfig};
 
 #[cfg(test)]
 mod tests;
