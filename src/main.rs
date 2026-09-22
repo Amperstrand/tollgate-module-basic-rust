@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 use tollgate_module_basic_rust::{
-    cli, config, http, identity, monitor,
+    cli, config, http, identity, migration, monitor,
     portal::{self, CaptivePortal},
     session, tracing_setup, wallet, wireless,
 };
@@ -36,46 +36,21 @@ async fn main() {
         let _ = std::fs::create_dir_all(parent);
     }
 
-    // First-boot auto-migration: if gonuts bbolt wallet.db exists AND CDK
-    // wallet.sqlite does NOT exist AND migration marker is absent:
-    // 1. Run gonuts-export → tokens.jsonl
-    // 2. Import tokens via wallet.receive()
-    // 3. Write .migration_complete marker
-    // 4. Rename wallet.db → wallet.db.pre-migration
-    let old_db = db_dir.join("wallet.db");
-    let new_db = db_dir.join("wallet.sqlite");
-    let migration_marker = db_dir.join(".migration_complete");
-    let tokens_file_exists = old_db.exists() && !new_db.exists() && !migration_marker.exists();
-
-    if tokens_file_exists {
+    // First-boot gonuts → CDK migration (value-retaining, #12)
+    let migration = migration::FirstBootMigration::new(&db_dir);
+    if migration.should_run() {
         tracing::info!("detected gonuts bbolt wallet, attempting auto-migration");
         let export_tool = std::env::var("GONUTS_EXPORT_PATH")
             .unwrap_or_else(|_| "/usr/bin/gonuts-export".to_string());
-        let tokens_file = db_dir.join("tokens.jsonl");
-
-        let export_result = tokio::process::Command::new(&export_tool)
-            .arg(&old_db)
-            .arg(&tokens_file)
+        let exported = tokio::process::Command::new(&export_tool)
+            .arg(&migration.old_db)
+            .arg(&migration.tokens_file)
             .output()
             .await;
-
-        match export_result {
-            Ok(output) if output.status.success() => {
-                tracing::info!(tokens_file = %tokens_file.display(), "gonuts-export completed");
-            }
-            Ok(output) => {
-                tracing::warn!(
-                    stderr = String::from_utf8_lossy(&output.stderr).to_string(),
-                    "gonuts-export failed, starting with empty wallet"
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    export_tool = %export_tool,
-                    "gonuts-export not found, starting with empty wallet. Manual: gonuts-export wallet.db tokens.jsonl"
-                );
-            }
+        match exported {
+            Ok(o) if o.status.success() => tracing::info!(tokens_file = %migration.tokens_file.display(), "gonuts-export completed"),
+            Ok(o) => tracing::error!(stderr = String::from_utf8_lossy(&o.stderr).to_string(), "gonuts-export failed; migration will retry next boot (wallet.db retained)"),
+            Err(e) => tracing::error!(error = %e, export_tool = %export_tool, "gonuts-export not found; manual: gonuts-export wallet.db tokens.jsonl — migration will retry next boot (wallet.db retained)"),
         }
     }
 
@@ -99,50 +74,27 @@ async fn main() {
         }
     }
 
-    if tokens_file_exists {
-        tracing::info!("importing tokens from gonuts migration");
-        let tokens_path = db_dir.join("tokens.jsonl");
-        match std::fs::read_to_string(&tokens_path) {
-            Ok(content) => {
-                let mut imported = 0u64;
-                let mut failed = 0u64;
-                for line in content.lines() {
-                    let line = line.trim();
-                    if line.is_empty() || line.starts_with('#') {
-                        continue;
-                    }
-                    match toll_wallet.receive(line).await {
-                        Ok(amount) => {
-                            tracing::info!(amount, "token imported");
-                            imported += amount;
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "failed to import token");
-                            failed += 1;
-                        }
-                    }
-                }
-                tracing::info!(imported, failed, "migration import complete");
-
-                let _ = std::fs::write(
-                    &migration_marker,
-                    format!(
-                        "imported={imported}\nfailed={failed}\ndate={}\n",
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs()
-                    ),
+    if migration.should_run() && migration.tokens_file.exists() {
+        match migration.import_tokens(&toll_wallet).await {
+            Ok(summary) => {
+                tracing::info!(
+                    imported_sat = summary.imported,
+                    failed = summary.failed,
+                    skipped_already_imported = summary.skipped_already_imported,
+                    "migration import pass complete"
                 );
-
-                if let Err(e) = std::fs::rename(&old_db, db_dir.join("wallet.db.pre-migration")) {
-                    tracing::warn!(error = %e, "failed to rename old wallet.db");
+                match migration.finish(summary) {
+                    Ok(migration::MigrationFinish::Complete) => tracing::info!(
+                        "migration complete: all tokens imported, wallet.db renamed to wallet.db.pre-migration"
+                    ),
+                    Ok(migration::MigrationFinish::Partial) => tracing::error!(
+                        "migration PARTIAL: failed token(s) retained in {}; wallet.db kept as recovery source; retry happens on next boot",
+                        migration.journal.display()
+                    ),
+                    Err(e) => tracing::error!(error = %e, "migration finalize failed; will retry next boot"),
                 }
-                tracing::info!("migration complete: marker written, old wallet.db renamed");
             }
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to read tokens.jsonl for import");
-            }
+            Err(e) => tracing::error!(error = %e, "migration import pass failed; will retry next boot"),
         }
     }
 
