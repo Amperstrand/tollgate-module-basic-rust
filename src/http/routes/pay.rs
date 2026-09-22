@@ -214,7 +214,11 @@ pub async fn handle_pay(
     // Step 1.5: every locally-checkable validation runs BEFORE receive —
     // after `wallet.receive()` the token is consumed and a rejection here
     // would confiscate it (issue #4).
-    let precheck = match precheck_payment(verified_amount, &token_mint_url, &state.config.accepted_mints) {
+    let precheck = match precheck_payment(
+        verified_amount,
+        &token_mint_url,
+        &state.config.accepted_mints,
+    ) {
         Ok(p) => p,
         Err(e) => {
             let (code, msg) = match &e {
@@ -484,7 +488,11 @@ mod tests {
         assert_eq!(steps, 0, "amount < price_per_step must yield zero steps");
     }
 
-    fn mint_cfg(url: &str, price_per_step: u64, min_purchase_steps: u64) -> crate::config::MintConfig {
+    fn mint_cfg(
+        url: &str,
+        price_per_step: u64,
+        min_purchase_steps: u64,
+    ) -> crate::config::MintConfig {
         crate::config::MintConfig {
             url: url.to_string(),
             price_per_step,
@@ -497,10 +505,18 @@ mod tests {
     fn precheck_rejects_below_minimum_before_receive() {
         // 1 sat against a 2 sat/step mint: zero steps must be rejected by
         // the pre-receive check, not after the wallet consumed the token.
-        let err = precheck_payment(1_000, "https://mint.example", &[mint_cfg("https://mint.example", 2, 0)])
-            .expect_err("below-minimum must fail precheck");
+        let err = precheck_payment(
+            1_000,
+            "https://mint.example",
+            &[mint_cfg("https://mint.example", 2, 0)],
+        )
+        .expect_err("below-minimum must fail precheck");
         match err {
-            PrecheckError::BelowMinimum { steps, min_steps, price_per_step } => {
+            PrecheckError::BelowMinimum {
+                steps,
+                min_steps,
+                price_per_step,
+            } => {
                 assert_eq!((steps, min_steps, price_per_step), (0, 1, 2));
             }
             other => panic!("expected BelowMinimum, got {other:?}"),
@@ -518,7 +534,10 @@ mod tests {
     fn precheck_rejects_unconfigured_mint_no_pricing_fallback() {
         // A token from an unconfigured mint must be rejected outright,
         // never priced with another mint's price_per_step.
-        let mints = [mint_cfg("https://a.example", 5, 0), mint_cfg("https://b.example", 1, 0)];
+        let mints = [
+            mint_cfg("https://a.example", 5, 0),
+            mint_cfg("https://b.example", 1, 0),
+        ];
         let err = precheck_payment(10_000, "https://unknown.example", &mints)
             .expect_err("unconfigured mint must fail precheck");
         match err {
@@ -529,10 +548,16 @@ mod tests {
 
     #[test]
     fn precheck_prices_with_the_tokens_own_mint() {
-        let mints = [mint_cfg("https://a.example", 5, 0), mint_cfg("https://b.example", 1, 0)];
+        let mints = [
+            mint_cfg("https://a.example", 5, 0),
+            mint_cfg("https://b.example", 1, 0),
+        ];
         let ok = precheck_payment(10_000, "https://b.example", &mints)
             .expect("token mint is configured");
-        assert_eq!(ok.price_per_step, 1, "pricing must come from the token's mint, not mints[0]");
+        assert_eq!(
+            ok.price_per_step, 1,
+            "pricing must come from the token's mint, not mints[0]"
+        );
     }
 
     #[test]
