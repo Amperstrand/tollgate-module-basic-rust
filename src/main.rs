@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 use tollgate_module_basic_rust::{
-    cli, config, http, identity, migration, monitor,
+    cli, config, http, identity, lightning_quotes, migration, monitor,
     portal::{self, CaptivePortal},
     session, tracing_setup, wallet, wireless,
 };
@@ -123,6 +123,7 @@ async fn main() {
         Arc::new(embedded)
     };
 
+    let ln_quotes = Arc::new(lightning_quotes::QuoteStore::load(&config::config_dir()));
     let state = Arc::new(http::AppState {
         config: Arc::new(config_obj),
         identity: Arc::new(identity),
@@ -131,7 +132,15 @@ async fn main() {
         portal: portal.clone(),
         verifier,
         rate_limiter,
+        ln_quotes: ln_quotes.clone(),
     });
+
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            lightning_quotes::run_monitor(state, ln_quotes, std::time::Duration::from_secs(5)).await
+        });
+    }
 
     let monitor_handle = {
         let sessions = state.sessions.clone();
