@@ -6,6 +6,7 @@ pub mod degraded;
 pub mod error;
 pub mod http;
 pub mod identity;
+pub mod lightning_quotes;
 pub mod mac_resolver;
 pub mod metering;
 pub mod migration;

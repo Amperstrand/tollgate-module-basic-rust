@@ -19,6 +19,9 @@ pub struct AppState {
     /// all payment requests instead of constructing one per POST /.
     pub verifier: Arc<crate::wallet::verify::TokenVerifier>,
     pub rate_limiter: Arc<crate::rate_limiter::RateLimiter>,
+    /// Durable Lightning quote store — paid invoices must remain
+    /// settleable across restarts (issue #9).
+    pub ln_quotes: Arc<crate::lightning_quotes::QuoteStore>,
 }
 
 /// Build the main HTTP router with all routes.
