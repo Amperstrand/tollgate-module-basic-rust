@@ -137,17 +137,26 @@ impl FirstBootMigration {
                 Err(e) => {
                     tracing::warn!(error = %e, "migration: token import failed (retained in journal)");
                     failed += 1;
-                    TokenOutcome::Failed { reason: e.to_string() }
+                    TokenOutcome::Failed {
+                        reason: e.to_string(),
+                    }
                 }
             };
-            append_entry(&mut journal_file, &JournalEntry {
-                token: token.clone(),
-                outcome,
-            })?;
+            append_entry(
+                &mut journal_file,
+                &JournalEntry {
+                    token: token.clone(),
+                    outcome,
+                },
+            )?;
         }
         journal_file.sync_all()?;
 
-        Ok(MigrationSummary { imported, failed, skipped_already_imported: skipped })
+        Ok(MigrationSummary {
+            imported,
+            failed,
+            skipped_already_imported: skipped,
+        })
     }
 
     /// Finalize the migration: rename the old DB only on a fully clean
@@ -169,7 +178,11 @@ impl FirstBootMigration {
 
         let marker_body = format!(
             "state={}\nimported_sat={}\nfailed={}\nskipped_already_imported={}\ndate={}\n",
-            if summary.failed == 0 { "complete" } else { "partial" },
+            if summary.failed == 0 {
+                "complete"
+            } else {
+                "partial"
+            },
             summary.imported,
             summary.failed,
             summary.skipped_already_imported,
@@ -179,7 +192,8 @@ impl FirstBootMigration {
                 .as_secs(),
         );
         let mut f = File::create(&self.marker).map_err(MigrationError::Io)?;
-        f.write_all(marker_body.as_bytes()).map_err(MigrationError::Io)?;
+        f.write_all(marker_body.as_bytes())
+            .map_err(MigrationError::Io)?;
         f.sync_all().map_err(MigrationError::Io)?;
 
         Ok(finish)
@@ -254,11 +268,7 @@ mod tests {
 
     fn setup(dir: &Path, tokens: &[&str], journal: &[JournalEntry]) -> FirstBootMigration {
         std::fs::create_dir_all(dir).unwrap();
-        std::fs::write(
-            dir.join(OLD_DB_NAME),
-            b"fake bbolt db",
-        )
-        .unwrap();
+        std::fs::write(dir.join(OLD_DB_NAME), b"fake bbolt db").unwrap();
         std::fs::write(
             dir.join(TOKENS_FILE_NAME),
             tokens.iter().map(|t| token_line(t)).collect::<String>(),
@@ -281,7 +291,10 @@ mod tests {
         let m = setup(dir.path(), &["cashuAtoken1", "cashuAtoken2"], &[]);
         assert!(m.should_run());
 
-        let summary = m.import_tokens(&wallet_with_no_mints(dir.path())).await.unwrap();
+        let summary = m
+            .import_tokens(&wallet_with_no_mints(dir.path()))
+            .await
+            .unwrap();
         assert_eq!(summary.failed, 2);
         assert_eq!(summary.imported, 0);
 
@@ -289,10 +302,15 @@ mod tests {
             MigrationFinish::Partial => {}
             other => panic!("expected Partial, got {other:?}"),
         }
-        assert!(m.old_db.exists(), "old wallet.db must be retained on partial");
+        assert!(
+            m.old_db.exists(),
+            "old wallet.db must be retained on partial"
+        );
         let entries = read_journal(&m.journal);
         assert_eq!(entries.len(), 2);
-        assert!(entries.iter().all(|e| matches!(e.outcome, TokenOutcome::Failed { .. })));
+        assert!(entries
+            .iter()
+            .all(|e| matches!(e.outcome, TokenOutcome::Failed { .. })));
         let marker = std::fs::read_to_string(&m.marker).unwrap();
         assert!(marker.contains("state=partial"));
         assert!(m.should_run(), "partial marker must allow a retry run");
@@ -310,9 +328,15 @@ mod tests {
             }],
         );
 
-        let summary = m.import_tokens(&wallet_with_no_mints(dir.path())).await.unwrap();
+        let summary = m
+            .import_tokens(&wallet_with_no_mints(dir.path()))
+            .await
+            .unwrap();
         assert_eq!(summary.skipped_already_imported, 1);
-        assert_eq!(summary.failed, 1, "only the never-imported token is re-attempted");
+        assert_eq!(
+            summary.failed, 1,
+            "only the never-imported token is re-attempted"
+        );
     }
 
     #[test]
@@ -322,7 +346,11 @@ mod tests {
         assert!(m.should_run());
 
         let finish = m
-            .finish(MigrationSummary { imported: 9, failed: 0, skipped_already_imported: 0 })
+            .finish(MigrationSummary {
+                imported: 9,
+                failed: 0,
+                skipped_already_imported: 0,
+            })
             .unwrap();
         assert_eq!(finish, MigrationFinish::Complete);
         assert!(!m.old_db.exists(), "old db renamed away on clean finish");
@@ -342,7 +370,11 @@ mod tests {
         std::fs::write(dir.path().join(JOURNAL_NAME), body).unwrap();
 
         let entries = read_journal(&dir.path().join(JOURNAL_NAME));
-        assert_eq!(entries.len(), 1, "torn trailing line must be skipped, not fatal");
+        assert_eq!(
+            entries.len(),
+            1,
+            "torn trailing line must be skipped, not fatal"
+        );
     }
 
     #[test]

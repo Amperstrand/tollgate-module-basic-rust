@@ -48,9 +48,16 @@ async fn main() {
             .output()
             .await;
         match exported {
-            Ok(o) if o.status.success() => tracing::info!(tokens_file = %migration.tokens_file.display(), "gonuts-export completed"),
-            Ok(o) => tracing::error!(stderr = String::from_utf8_lossy(&o.stderr).to_string(), "gonuts-export failed; migration will retry next boot (wallet.db retained)"),
-            Err(e) => tracing::error!(error = %e, export_tool = %export_tool, "gonuts-export not found; manual: gonuts-export wallet.db tokens.jsonl — migration will retry next boot (wallet.db retained)"),
+            Ok(o) if o.status.success() => {
+                tracing::info!(tokens_file = %migration.tokens_file.display(), "gonuts-export completed")
+            }
+            Ok(o) => tracing::error!(
+                stderr = String::from_utf8_lossy(&o.stderr).to_string(),
+                "gonuts-export failed; migration will retry next boot (wallet.db retained)"
+            ),
+            Err(e) => {
+                tracing::error!(error = %e, export_tool = %export_tool, "gonuts-export not found; manual: gonuts-export wallet.db tokens.jsonl — migration will retry next boot (wallet.db retained)")
+            }
         }
     }
 
@@ -94,7 +101,9 @@ async fn main() {
                     Err(e) => tracing::error!(error = %e, "migration finalize failed; will retry next boot"),
                 }
             }
-            Err(e) => tracing::error!(error = %e, "migration import pass failed; will retry next boot"),
+            Err(e) => {
+                tracing::error!(error = %e, "migration import pass failed; will retry next boot")
+            }
         }
     }
 
@@ -129,12 +138,7 @@ async fn main() {
     {
         let state = state.clone();
         tokio::spawn(async move {
-            lightning_quotes::run_monitor(
-                state,
-                ln_quotes,
-                std::time::Duration::from_secs(5),
-            )
-            .await
+            lightning_quotes::run_monitor(state, ln_quotes, std::time::Duration::from_secs(5)).await
         });
     }
 

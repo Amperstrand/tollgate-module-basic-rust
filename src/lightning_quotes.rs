@@ -60,7 +60,10 @@ impl QuoteStore {
             .and_then(|body| serde_json::from_str::<Vec<LightningQuoteRecord>>(&body).ok())
             .map(|v| v.into_iter().map(|q| (q.quote.clone(), q)).collect())
             .unwrap_or_default();
-        QuoteStore { path, quotes: RwLock::new(quotes) }
+        QuoteStore {
+            path,
+            quotes: RwLock::new(quotes),
+        }
     }
 
     pub async fn upsert(&self, record: LightningQuoteRecord) {
@@ -101,7 +104,10 @@ fn persist(path: &Path, quotes: &[LightningQuoteRecord]) {
         return;
     };
     let tmp = path.with_extension("json.tmp");
-    if std::fs::write(&tmp, json).and_then(|_| std::fs::rename(&tmp, path)).is_err() {
+    if std::fs::write(&tmp, json)
+        .and_then(|_| std::fs::rename(&tmp, path))
+        .is_err()
+    {
         tracing::warn!(path = %path.display(), "failed to persist lightning quotes");
     }
 }
@@ -118,7 +124,9 @@ pub fn now_secs() -> u64 {
 #[derive(Debug, Clone, PartialEq)]
 pub enum SettleOutcome {
     StillUnpaid,
-    Granted { allotment: u64 },
+    Granted {
+        allotment: u64,
+    },
     /// Paid and minted, but the session/gate step failed; retried on the
     /// next tick without re-minting.
     GrantFailed,
@@ -140,7 +148,10 @@ pub async fn settle_quote(
     let mut record = record;
 
     if !record.minted {
-        let status = match wallet.check_mint_quote(&record.mint_url, &record.quote).await {
+        let status = match wallet
+            .check_mint_quote(&record.mint_url, &record.quote)
+            .await
+        {
             Ok(s) => s,
             Err(e) => return SettleOutcome::Failed(e.to_string()),
         };
@@ -309,17 +320,17 @@ mod tests {
         let store = Arc::new(QuoteStore::load(dir.path()));
         store.upsert(record("q1", true)).await;
 
-        let mut wallet = crate::wallet::wallet::TollWallet::new(
-            [0u8; 64],
-            vec![],
-            dir.path().to_path_buf(),
-        );
+        let mut wallet =
+            crate::wallet::wallet::TollWallet::new([0u8; 64], vec![], dir.path().to_path_buf());
         // No mints are registered, but with minted=true the settle path
         // never touches the wallet — minting must not repeat.
         let _ = &mut wallet;
 
         let sessions = Mutex::new(SessionManager::new());
-        let portal = FakePortal { grant_fails: false, granted: std::sync::Mutex::new(vec![]) };
+        let portal = FakePortal {
+            grant_fails: false,
+            granted: std::sync::Mutex::new(vec![]),
+        };
         let config = Config::default();
 
         let outcome = settle_quote(
@@ -332,8 +343,16 @@ mod tests {
         )
         .await;
 
-        assert_eq!(outcome, SettleOutcome::Granted { allotment: 10 * config.step_size });
-        assert_eq!(*portal.granted.lock().unwrap(), vec!["aa:bb:cc:dd:ee:ff".to_string()]);
+        assert_eq!(
+            outcome,
+            SettleOutcome::Granted {
+                allotment: 10 * config.step_size
+            }
+        );
+        assert_eq!(
+            *portal.granted.lock().unwrap(),
+            vec!["aa:bb:cc:dd:ee:ff".to_string()]
+        );
         assert!(sessions.lock().await.is_active("aa:bb:cc:dd:ee:ff"));
         assert!(store.get("q1").await.unwrap().session_granted);
     }
@@ -344,27 +363,35 @@ mod tests {
         let store = Arc::new(QuoteStore::load(dir.path()));
         store.upsert(record("q2", true)).await;
 
-        let wallet = crate::wallet::wallet::TollWallet::new(
-            [0u8; 64],
-            vec![],
-            dir.path().to_path_buf(),
-        );
+        let wallet =
+            crate::wallet::wallet::TollWallet::new([0u8; 64], vec![], dir.path().to_path_buf());
         let sessions = Mutex::new(SessionManager::new());
-        let portal = FakePortal { grant_fails: true, granted: std::sync::Mutex::new(vec![]) };
+        let portal = FakePortal {
+            grant_fails: true,
+            granted: std::sync::Mutex::new(vec![]),
+        };
         let config = Config::default();
 
         let rec = store.get("q2").await.unwrap();
-        let outcome =
-            settle_quote(store.clone(), &wallet, &sessions, &portal, &config, rec).await;
+        let outcome = settle_quote(store.clone(), &wallet, &sessions, &portal, &config, rec).await;
         assert_eq!(outcome, SettleOutcome::GrantFailed);
 
         let rec = store.get("q2").await.unwrap();
-        assert!(rec.minted, "minted stays recorded so the retry never mints twice");
-        assert!(rec.allotment_added, "allotment was added once despite the gate failure");
+        assert!(
+            rec.minted,
+            "minted stays recorded so the retry never mints twice"
+        );
+        assert!(
+            rec.allotment_added,
+            "allotment was added once despite the gate failure"
+        );
         assert!(!rec.session_granted);
 
         let sessions2 = Mutex::new(SessionManager::new());
-        let portal2 = FakePortal { grant_fails: false, granted: std::sync::Mutex::new(vec![]) };
+        let portal2 = FakePortal {
+            grant_fails: false,
+            granted: std::sync::Mutex::new(vec![]),
+        };
         let outcome = settle_quote(
             store.clone(),
             &wallet,
@@ -374,7 +401,12 @@ mod tests {
             store.get("q2").await.unwrap(),
         )
         .await;
-        assert_eq!(outcome, SettleOutcome::Granted { allotment: 10 * config.step_size });
+        assert_eq!(
+            outcome,
+            SettleOutcome::Granted {
+                allotment: 10 * config.step_size
+            }
+        );
     }
 
     #[tokio::test]
@@ -392,8 +424,12 @@ mod tests {
 
         store.upsert(record("live", false)).await;
 
-        let pending: Vec<String> =
-            store.ungranted().await.into_iter().map(|q| q.quote).collect();
+        let pending: Vec<String> = store
+            .ungranted()
+            .await
+            .into_iter()
+            .map(|q| q.quote)
+            .collect();
         assert_eq!(pending, vec!["live".to_string()]);
     }
 }

@@ -506,7 +506,9 @@ mod tests {
         let portal: Arc<dyn CaptivePortal> = Arc::new(NdsPortal::new());
         let verifier = Arc::new(crate::wallet::verify::TokenVerifier::new(vec![]));
         let rate_limiter = Arc::new(crate::rate_limiter::RateLimiter::new(1000));
-        let ln_quotes = Arc::new(crate::lightning_quotes::QuoteStore::load(std::path::Path::new("/tmp")));
+        let ln_quotes = Arc::new(crate::lightning_quotes::QuoteStore::load(
+            std::path::Path::new("/tmp"),
+        ));
         Arc::new(AppState {
             config,
             identity,
