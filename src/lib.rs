@@ -8,6 +8,7 @@ pub mod http;
 pub mod identity;
 pub mod mac_resolver;
 pub mod metering;
+pub mod migration;
 pub mod mint_health;
 pub mod monitor;
 pub mod nostr_event;
