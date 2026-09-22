@@ -1,11 +1,9 @@
 use crate::http::AppState;
 use axum::extract::{Query, State};
+use axum::http::HeaderMap;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::sync::OnceLock;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Deserialize)]
 pub struct CreateInvoiceRequest {
@@ -45,21 +43,6 @@ pub struct InvoiceQuery {
     pub quote: String,
 }
 
-#[derive(Debug, Clone)]
-struct StoredQuote {
-    mint_url: String,
-    expiry: u64,
-    created_at: u64,
-}
-
-type QuoteMap = std::sync::Mutex<HashMap<String, StoredQuote>>;
-
-static QUOTE_STORE: OnceLock<QuoteMap> = OnceLock::new();
-
-fn quote_store() -> &'static QuoteMap {
-    QUOTE_STORE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
-}
-
 fn json_response(status: StatusCode, body: impl Serialize) -> Response {
     let json = serde_json::to_string(&body).unwrap_or_default();
     (
@@ -75,6 +58,8 @@ fn json_response(status: StatusCode, body: impl Serialize) -> Response {
 
 pub async fn handle_create_ln_invoice(
     State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::ConnectInfo(remote_addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
     axum::Json(req): axum::Json<CreateInvoiceRequest>,
 ) -> Response {
     if req.amount == 0 {
@@ -94,24 +79,50 @@ pub async fn handle_create_ln_invoice(
         }
     };
 
+    // The MAC is resolved at creation time and stored with the quote: the
+    // monitor that later grants the session (possibly after a restart)
+    // cannot see the original HTTP client anymore.
+    let client_ip = crate::mac_resolver::get_client_ip(&headers, Some(remote_addr));
+    let mac = match crate::mac_resolver::get_mac_address(&client_ip) {
+        Some(m) => m,
+        None => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                LightningInvoiceResponse {
+                    status: 0,
+                    quote: String::new(),
+                    invoice: String::new(),
+                    mint_url: String::new(),
+                    amount: req.amount,
+                    expiry: 0,
+                    state: "error".to_string(),
+                    access_granted: false,
+                    allotment: 0,
+                    metric: String::new(),
+                    error: "mac-address-lookup-failed".to_string(),
+                },
+            );
+        }
+    };
+
     let wallet_guard = state.wallet.read().await;
     let wallet = match wallet_guard.as_ref() {
         Some(w) => w,
         None => {
             return json_response(
-                StatusCode::OK,
+                StatusCode::SERVICE_UNAVAILABLE,
                 LightningInvoiceResponse {
-                    status: 1,
-                    quote: format!("stub-quote-{}", req.amount),
-                    invoice: "stub-invoice".to_string(),
-                    mint_url: mint_url.clone(),
+                    status: 0,
+                    quote: String::new(),
+                    invoice: String::new(),
+                    mint_url,
                     amount: req.amount,
                     expiry: 0,
-                    state: "unpaid".to_string(),
+                    state: "error".to_string(),
                     access_granted: false,
                     allotment: 0,
                     metric: String::new(),
-                    error: String::new(),
+                    error: "wallet not initialized".to_string(),
                 },
             );
         }
@@ -119,23 +130,19 @@ pub async fn handle_create_ln_invoice(
 
     match wallet.request_mint_quote(&mint_url, req.amount).await {
         Ok(info) => {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-
-            {
-                let mut store = quote_store().lock().unwrap_or_else(|e| e.into_inner());
-                store.insert(
-                    info.id.clone(),
-                    StoredQuote {
-                        mint_url: mint_url.clone(),
-                        expiry: info.expiry,
-                        created_at: now,
-                    },
-                );
-                store.retain(|_, q| now - q.created_at < 1800);
-            }
+            let now = crate::lightning_quotes::now_secs();
+            let record = crate::lightning_quotes::LightningQuoteRecord {
+                quote: info.id.clone(),
+                mint_url: mint_url.clone(),
+                mac: mac.clone(),
+                amount_sat: req.amount,
+                created_at: now,
+                expiry: info.expiry,
+                minted: false,
+                allotment_added: false,
+                session_granted: false,
+            };
+            state.ln_quotes.upsert(record).await;
 
             json_response(
                 StatusCode::OK,
@@ -157,19 +164,19 @@ pub async fn handle_create_ln_invoice(
         Err(e) => {
             tracing::warn!(error = ?e, "ln-invoice: mint quote failed");
             json_response(
-                StatusCode::OK,
+                StatusCode::BAD_GATEWAY,
                 LightningInvoiceResponse {
-                    status: 1,
-                    quote: format!("stub-quote-{}", req.amount),
-                    invoice: "stub-invoice".to_string(),
+                    status: 0,
+                    quote: String::new(),
+                    invoice: String::new(),
                     mint_url: mint_url.clone(),
                     amount: req.amount,
                     expiry: 0,
-                    state: "unpaid".to_string(),
+                    state: "error".to_string(),
                     access_granted: false,
                     allotment: 0,
                     metric: String::new(),
-                    error: String::new(),
+                    error: format!("mint quote failed: {e}"),
                 },
             )
         }
@@ -180,10 +187,7 @@ pub async fn handle_get_ln_invoice(
     State(state): State<AppState>,
     Query(q): Query<InvoiceQuery>,
 ) -> Response {
-    let stored = {
-        let store = quote_store().lock().unwrap_or_else(|e| e.into_inner());
-        store.get(&q.quote).cloned()
-    };
+    let stored = state.ln_quotes.get(&q.quote).await;
 
     let stored = match stored {
         Some(s) => s,
@@ -207,6 +211,33 @@ pub async fn handle_get_ln_invoice(
         }
     };
 
+    if stored.session_granted {
+        let price_per_step = state
+            .config
+            .accepted_mints
+            .iter()
+            .find(|m| m.url.trim_end_matches('/') == stored.mint_url.trim_end_matches('/'))
+            .map(|m| m.price_per_step.max(1))
+            .unwrap_or(1);
+        let allotment = (stored.amount_sat / price_per_step) * state.config.step_size;
+        return json_response(
+            StatusCode::OK,
+            LightningInvoiceResponse {
+                status: 1,
+                quote: stored.quote,
+                invoice: String::new(),
+                mint_url: stored.mint_url,
+                amount: stored.amount_sat,
+                expiry: stored.expiry,
+                state: "paid".to_string(),
+                access_granted: true,
+                allotment,
+                metric: state.config.metric.clone(),
+                error: String::new(),
+            },
+        );
+    }
+
     let (state_str, expiry) = {
         let wallet_guard = state.wallet.read().await;
         match wallet_guard.as_ref() {
@@ -227,10 +258,10 @@ pub async fn handle_get_ln_invoice(
         StatusCode::OK,
         LightningInvoiceResponse {
             status: 1,
-            quote: q.quote,
+            quote: stored.quote,
             invoice: String::new(),
             mint_url: stored.mint_url,
-            amount: 0,
+            amount: stored.amount_sat,
             expiry,
             state: state_str,
             access_granted: false,
