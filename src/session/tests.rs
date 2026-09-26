@@ -131,14 +131,40 @@ fn test_add_allotment_extends_existing_session() {
 }
 
 #[test]
-fn test_add_allotment_resets_used() {
+fn test_add_allotment_preserves_used() {
+    // Go AddAllotment parity: the consumed counter is NOT reset on
+    // extension — resetting it would refund already-consumed bytes for
+    // free on the bytes metric.
     let mut mgr = SessionManager::new();
     mgr.create_session("aa:bb:cc:dd:ee:ff", 1000, "bytes", 3600);
     mgr.update_usage("aa:bb:cc:dd:ee:ff", 500);
     let extended = mgr.add_allotment("aa:bb:cc:dd:ee:ff", "bytes", 500, 3600, None);
     assert!(extended);
     let s = mgr.get_session("aa:bb:cc:dd:ee:ff").unwrap();
-    assert_eq!(s.used, 0, "used should be reset to 0 on extension");
+    assert_eq!(
+        s.used, 500,
+        "used must be preserved on extension (Go parity)"
+    );
+    assert_eq!(s.allotment, 1500);
+}
+
+#[test]
+fn test_rollback_session_restores_snapshot() {
+    let mut mgr = SessionManager::new();
+    let original = mgr.create_session("aa:bb:cc:dd:ee:ff", 1000, "bytes", 3600);
+    let snapshot = mgr.snapshot_session("aa:bb:cc:dd:ee:ff");
+    mgr.add_allotment("aa:bb:cc:dd:ee:ff", "bytes", 500, 3600, None);
+    mgr.rollback_session("aa:bb:cc:dd:ee:ff", snapshot);
+    let s = mgr.get_session("aa:bb:cc:dd:ee:ff").unwrap();
+    assert_eq!(
+        s.allotment, original.allotment,
+        "rollback restores allotment"
+    );
+
+    let snapshot2 = mgr.snapshot_session("aa:bb:cc:dd:ee:ff");
+    mgr.rollback_session("aa:bb:cc:dd:ee:ff", None);
+    assert!(mgr.get_session("aa:bb:cc:dd:ee:ff").is_none());
+    let _ = snapshot2;
 }
 
 #[test]

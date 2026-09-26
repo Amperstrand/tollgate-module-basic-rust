@@ -310,21 +310,55 @@ pub async fn handle_pay(
     };
     drop(wallet_guard);
 
-    // Step 3: create session — allotment in the metric's unit (bytes or ms)
+    // Step 3 (Go grantSessionAccess parity): snapshot → extend-or-create →
+    // gate open with rollback on failure. A failed gate must roll the
+    // session back and answer with a session-error notice — never a 200
+    // claiming a grant that did not happen.
     let duration_secs = 3600u64;
     let price_per_step = precheck.price_per_step;
 
     // The mint may have charged swap fees, so the received amount can be
     // lower than the verified face value. Allotment follows the value that
-    // actually arrived; a received amount too small to buy a step after
-    // fees is logged (and shortchanges the customer by at most one step's
-    // price) — it must never reject after value moved.
+    // actually arrived. If the fee-reduced amount no longer buys the
+    // configured minimum, Go rejects with a session-error notice; parity
+    // does the same (the value is in the wallet; the discrepancy is
+    // reconciled operationally via the wallet balance).
     let steps = received_amount / price_per_step;
-    if steps == 0 {
+    let min_steps = state
+        .config
+        .accepted_mints
+        .iter()
+        .find(|m| {
+            let cfg_url = m.url.trim_end_matches('/');
+            cfg_url == token_mint_url || m.url == token_mint_url
+        })
+        .map(|m| m.min_purchase_steps.max(1))
+        .unwrap_or(1);
+    if steps < min_steps {
+        let msg = format!(
+            "payment rejected: {steps} step(s) at {price_per_step} sat/step is below the minimum purchase of {min_steps} step(s) after swap fees"
+        );
         tracing::warn!(
             received_sat = received_amount,
-            price_per_step,
-            "received amount bought zero steps after swap fees; granting empty session is impossible — reconcile via payment record (issue #5)"
+            "post-fee amount below minimum"
+        );
+        let event = nostr_event::create_event(
+            21023,
+            vec![
+                vec!["level".to_string(), "error".to_string()],
+                vec!["code".to_string(), "session-error".to_string()],
+            ],
+            &msg,
+            &state.identity.secret_key,
+        );
+        let json = serde_json::to_string(&event).unwrap_or_default();
+        return (
+            StatusCode::BAD_REQUEST,
+            [
+                ("content-type", "application/json"),
+                ("access-control-allow-origin", "*"),
+            ],
+            json,
         );
     }
 
@@ -332,28 +366,69 @@ pub async fn handle_pay(
     let allotment = steps * step_size;
 
     let mut sessions = state.sessions.lock().await;
-    let _session = sessions.create_session(&mac, allotment, &state.config.metric, duration_secs);
+    let snapshot = sessions.snapshot_session(&mac);
+    let extended =
+        sessions.add_allotment(&mac, &state.config.metric, allotment, duration_secs, None);
+    // The event reports the session's accumulated total (Go parity), not
+    // just this payment's delta.
+    let total_allotment = sessions
+        .get_session(&mac)
+        .map(|s| s.allotment)
+        .unwrap_or(allotment);
+    // Payment-grant durability: bypass the debounce so the grant is on disk
+    // before the customer is told it exists.
     sessions
-        .save_to_disk(&crate::config::config_dir())
+        .save_now(&crate::config::config_dir())
         .unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "failed to save sessions to disk");
+            tracing::error!(error = %e, "failed to persist session after payment");
         });
     drop(sessions);
 
-    // Open the gate to grant network access via ndsctl.
+    // Open the gate to grant network access via ndsctl. Failure rolls the
+    // session back (Go: restoreSession) and answers with a session-error
+    // notice instead of a success event.
     if let Err(e) = state.portal.grant_access(&mac).await {
-        tracing::warn!(mac = %mac, error = %e, "failed to open gate");
-        // Continue anyway — session is created, gate may be opened manually.
+        tracing::warn!(mac = %mac, error = %e, "failed to open gate; rolling session back");
+        let mut sessions = state.sessions.lock().await;
+        sessions.rollback_session(&mac, snapshot);
+        sessions
+            .save_now(&crate::config::config_dir())
+            .unwrap_or_else(|err| {
+                tracing::error!(error = %err, "failed to persist session rollback");
+            });
+        drop(sessions);
+        let msg = format!("failed to open gate: {e}");
+        let event = nostr_event::create_event(
+            21023,
+            vec![
+                vec!["level".to_string(), "error".to_string()],
+                vec!["code".to_string(), "session-error".to_string()],
+            ],
+            &msg,
+            &state.identity.secret_key,
+        );
+        let json = serde_json::to_string(&event).unwrap_or_default();
+        return (
+            StatusCode::BAD_REQUEST,
+            [
+                ("content-type", "application/json"),
+                ("access-control-allow-origin", "*"),
+            ],
+            json,
+        );
     }
 
     tracing::info!(
         verified_msat = verified_amount,
         received_sat = received_amount,
         allotment = allotment,
+        extended,
         "session granted"
     );
 
-    // Step 4: return kind 1022 session-granted event
+    // Step 4: return kind 1022 session-granted event (start-time always
+    // present — observed Go behavior renews StartTime on AddAllotment).
+    let _ = extended;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -365,7 +440,7 @@ pub async fn handle_pay(
             "mac".to_string(),
             mac.clone(),
         ],
-        vec!["allotment".to_string(), allotment.to_string()],
+        vec!["allotment".to_string(), total_allotment.to_string()],
         vec!["metric".to_string(), state.config.metric.clone()],
         vec!["start-time".to_string(), now.to_string()],
     ];
