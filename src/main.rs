@@ -95,6 +95,7 @@ async fn main() {
         .map(|m| m.url.clone())
         .collect();
     let verifier = Arc::new(wallet::verify::TokenVerifier::new(mint_urls.clone()));
+    let mint_urls_for_retry = mint_urls.clone();
     let rate_limiter = Arc::new(tollgate_module_basic_rust::rate_limiter::RateLimiter::from_env());
     let mut toll_wallet = wallet::TollWallet::new(seed, mint_urls, db_dir.clone());
     for mint in &config_obj.accepted_mints {
@@ -177,6 +178,37 @@ async fn main() {
         let portal = state.portal.clone();
         monitor::Monitor::new(sessions, portal).start()
     };
+
+    // Re-register configured mints that failed at boot (mint/WAN down when
+    // the process started). ensure_mint is idempotent, so retrying the full
+    // configured set until every mint is live heals without a restart —
+    // the in-process counterpart of Go's hotplug one-shot service restart.
+    let mint_retry_wallet = state.wallet.clone();
+    let mint_retry_mints: Vec<String> = mint_urls_for_retry.clone();
+    let mint_retry_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        interval.tick().await; // first tick fires immediately; skip it
+        loop {
+            interval.tick().await;
+            let mut all_live = true;
+            for mint in &mint_retry_mints {
+                let mut w = mint_retry_wallet.write().await;
+                if let Some(wallet) = w.as_mut() {
+                    match wallet.ensure_mint(mint).await {
+                        Ok(()) => {}
+                        Err(e) => {
+                            all_live = false;
+                            tracing::warn!(mint = %mint, error = %e, "mint registration retry failed");
+                        }
+                    }
+                }
+            }
+            if all_live {
+                tracing::info!("all configured mints registered");
+                return;
+            }
+        }
+    });
 
     let upstream_handle = {
         let upstream_config = wireless::UpstreamWifiConfig::default();
