@@ -33,7 +33,10 @@ echo "=== Building .ipk for $ARCH ($MUSL_TARGET) v$VERSION ==="
 echo "--- Building binary ---"
 cd "$REPO_DIR"
 cargo build --release --target "$MUSL_TARGET"
-BINARY="target/$MUSL_TARGET/release/tollgate-module-basic-rust"
+# Resolve via cargo metadata: CARGO_TARGET_DIR redirects builds away from ./target
+TARGET_DIR="$(cargo metadata --format-version 1 --no-deps 2>/dev/null | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')"
+[ -n "$TARGET_DIR" ] || TARGET_DIR="$REPO_DIR/target"
+BINARY="$TARGET_DIR/$MUSL_TARGET/release/tollgate-module-basic-rust"
 
 if [ ! -f "$BINARY" ]; then
     echo "ERROR: Binary not found at $BINARY" >&2
