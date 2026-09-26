@@ -119,6 +119,7 @@ async fn sub_minimum_amount_rejected_before_invoice_creation() {
             tollgate_module_basic_rust::http::routes::ln_invoice::CreateInvoiceRequest {
                 amount: 1,
                 unit: None,
+                mint_url: Some("https://mint.example".to_string()),
             },
         ),
     )
