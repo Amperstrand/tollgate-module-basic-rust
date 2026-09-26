@@ -69,3 +69,31 @@ Format: timestamp | commit | test command | failure | root cause | change | rete
 - VM prior state: Go tollgate-wrt v0.6.1-post-merge-14 running; /etc/tollgate
   has mixed Go (wallet.db) + Rust (wallet_seed.bin, per-mint sqlite) state
   from earlier experiments — will reset for clean baselines.
+
+2026-09-26 17:50 UTC | rust fa0d7a2 / prta 9d44c20+2735590
+- Differential parity suite (host, lab fakewallet mint, both binaries):
+  30 passed, 1 xfailed (CLI protocol xfail — fix in flight).
+- Go baseline binary initially built from a non-main branch: gonuts dev
+  build injected unreachable testnut mint (kind 21023 poisoning). Rebuilt
+  with production ldflags (config_manager.GitBranch=main, cli.Version) —
+  the VM ipk must be rebuilt the same way for the Go baseline. NOTE for
+  VM baseline: use ipk built AFTER this discovery; the earlier
+  tollgate-wrt_v0.6.1-parity-baseline_x86_64.ipk embeds the branch name.
+- Host-side Go payment needs a stub /usr/local/bin/ndsctl (exit 0) —
+  gate-open blocks otherwise. Installed (sudo) on the lab host.
+- Shared-host hazard: sibling omarchy-cashu testbed leaves orphaned
+  (ppid=1) mockgate/rust-gate daemons on :2121. Parity test now kills
+  orphaned holders / skips on actively-owned ones
+  (_free_port_2121_or_skip). Manual cleanup may still be needed
+  (`ss -tlnp | grep 2121` + kill by pid).
+- /tmp/dhcp.leases on lab hosts is a symlink to root-owned
+  /var/lib/misc/dnsmasq.leases — rust_basic_server fixture now swaps it
+  for a writable file and restores.
+- FUND-SAFETY RESULT: below-minimum purchase rejected on BOTH backends
+  with token UNSPENT at the mint (NUT-07) — the historical
+  "receive-before-validate" defect is NOT present in current rust main.
+- Go concurrent-receive defect (reference behavior): 5 parallel distinct
+  token payments → Go grants 2/5 (gonuts "Duplicate outputs" +
+  keyset-counter db race). Rust/CDK grants 5/5. Documented as deliberate
+  Rust improvement in the parity test docstring.
+- Go baseline VM suite: progressing (54+/107 files at time of writing).

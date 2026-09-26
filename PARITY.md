@@ -45,10 +45,16 @@ Status legend: PASS / PARTIAL / FAIL / NOT TESTED / BLOCKED.
 | # | Feature | Go ref location | Rust location | Go tests | Rust tests | PRTA | VM validated? | Status | Known semantic differences | Required work |
 |---|---|---|---|---|---|---|---|---|---|---|
 | 1 | PRTA rust-basic repo mapping | — | PRTA lib/backend.py:55 | — | — | yes | n/a | PASS | now Amperstrand (fork commit) | — |
-| 2 | Daemon binary path | pkg /usr/bin/tollgate-wrt | build-ipk.sh installs /usr/bin/tollgate | — | — | — | pending | FAIL | init.d/tollgate-wrt execs /usr/bin/tollgate-wrt — never installed | install binary as /usr/bin/tollgate-wrt |
-| 3 | Operator CLI client (`tollgate status/version/health/wallet/config…`) | /usr/bin/tollgate (cobra) | src/cli/mod.rs socket server only; no client, no arg dispatch in main.rs | yes | partial | partial | pending | FAIL | binary always runs server; socket protocol plain-text vs Go JSON CLIMessage | add client mode + subcommands |
-| 4 | gonuts-export migration helper shipped | n/a (Go native) | tools/gonuts-export (not packaged) | — | — | — | pending | FAIL | main.rs requires /usr/bin/gonuts-export at first boot | build+ship in ipk |
-| 5 | Packaging payload parity | 5 binaries, hotplug, 3×nft, man8 pages | 1 binary, 1×nft, no hotplug/ssl/first-login | — | — | — | pending | PARTIAL | see payload diff in worklog 2026-09-26 | port missing files |
-
-(Matrix continues as verification proceeds — see docs/parity-worklog.md for
-the append-only evidence log.)
+| 2 | Daemon binary path | pkg /usr/bin/tollgate-wrt | build-ipk.sh installs /usr/bin/tollgate-wrt | — | — | — | pending | PASS (fixed) | init.d/tollgate-wrt + openwrt Makefile aligned (commit f820a15) | VM install test |
+| 3 | Operator CLI client (`tollgate status/version/health/wallet/config…`) | /usr/bin/tollgate (cobra) | multi-call dispatch + JSON CLIMessage protocol (in flight) | yes | partial | partial | pending | PARTIAL | implementation underway | land + VM test |
+| 4 | gonuts-export migration helper shipped | n/a (Go native) | tools/gonuts-export | — | — | — | pending | PASS (fixed) | built+shipped in ipk (commit f820a15) | VM migration test |
+| 5 | Packaging payload parity | 5 binaries, hotplug, 3×nft, man8 | ported all but man pages + /usr/bin/tollgate symlink | — | — | — | pending | PARTIAL | man8 pages P3-deferred; CLI symlink lands with #3 | VM install/upgrade test |
+| 6 | GET /whoami semantics | main.go handler: 200 `mac=` always | whoami.rs: 200 `mac=` always | yes | yes | parity test | host | PASS (fixed fa0d7a2) | | |
+| 7 | POST/GET /ln-invoice semantics | main.go handleLightningInvoicePost/Get | ln_invoice.rs | yes | yes | parity test | host | PASS (fixed fa0d7a2) | code/retry_after fields, device-unresolved, quote-MAC binding, amount+mint_url required, 1M sats ceiling | VM: real quote lifecycle |
+| 8 | Payment: valid token | merchant.PurchaseSession | pay.rs | yes | yes | parity payment matrix | host | PASS | | |
+| 9 | Payment: double-spend rejection | merchant | pay.rs | yes | yes | parity payment matrix | host | PASS | | |
+| 10 | Payment: malformed/unknown-mint | main.go | pay.rs | yes | yes | parity payment matrix | host | PASS | | |
+| 11 | Payment: below-minimum fund safety | merchant (validate before receive) | pay.rs | yes | yes | parity payment matrix + NUT-07 | host | PASS | Rust does NOT consume the below-min token (old defect fixed in main) | |
+| 12 | Payment: concurrent receives | gonuts (races: duplicate outputs) | CDK atomic counters | yes | yes | parity payment matrix | host | PASS (Rust better) | Go 2/5 grants under concurrency (gonuts counter race); Rust 5/5 — documented deliberate improvement | Go-side known issue |
+| 13 | Payment: trailing-slash mint config | canonicalization | wallet | yes | yes | parity payment matrix | host | PASS | | |
+| 14 | Nostr discovery (kind 10021 tags) | main.go handler | routes/discovery.rs | yes | yes | parity test | host | PASS | | |
