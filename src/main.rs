@@ -189,22 +189,10 @@ async fn main() {
             interval.tick().await;
             loop {
                 interval.tick().await;
-                let token: Option<String> = {
+                let action = {
                     let w = wallet_arc.read().await;
-                    if let Some(wallet) = w.as_ref() {
-                        match wallet.get_balance().await {
-                            Ok(0) => None,
-                            Ok(balance) => {
-                                tracing::debug!(balance, "wallet has balance for upstream payment");
-                                None
-                            }
-                            Err(_) => None,
-                        }
-                    } else {
-                        None
-                    }
+                    mgr.tick(w.as_ref()).await
                 };
-                let action = mgr.tick(token.as_deref()).await;
                 if action != wireless::ManagerAction::NoAction {
                     tracing::info!(action = ?action, "upstream manager action");
                 }
