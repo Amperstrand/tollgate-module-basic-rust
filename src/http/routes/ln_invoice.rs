@@ -132,7 +132,7 @@ pub async fn handle_create_ln_invoice(
         .config
         .accepted_mints
         .iter()
-        .find(|m| crate::wallet::canonical_mint_url(&m.url) == mint_url);
+        .find(|m| crate::mint_url::mint_urls_equal(&m.url, &mint_url));
     let steps = if let Some(mint) = accepted {
         let price_per_step = mint.price_per_step.max(1);
         let min_steps = mint.min_purchase_steps.max(1);

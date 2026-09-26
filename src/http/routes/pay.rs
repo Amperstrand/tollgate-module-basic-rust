@@ -69,10 +69,9 @@ pub(crate) fn precheck_payment(
     token_mint_url: &str,
     accepted_mints: &[crate::config::MintConfig],
 ) -> Result<PaymentPrecheck, PrecheckError> {
-    let mint_config = accepted_mints.iter().find(|m| {
-        let cfg_url = m.url.trim_end_matches('/');
-        cfg_url == token_mint_url || m.url == token_mint_url
-    });
+    let mint_config = accepted_mints
+        .iter()
+        .find(|m| crate::mint_url::mint_urls_equal(&m.url, token_mint_url));
 
     let mint_config = match mint_config {
         Some(m) => m,
@@ -328,10 +327,7 @@ pub async fn handle_pay(
         .config
         .accepted_mints
         .iter()
-        .find(|m| {
-            let cfg_url = m.url.trim_end_matches('/');
-            cfg_url == token_mint_url || m.url == token_mint_url
-        })
+        .find(|m| crate::mint_url::mint_urls_equal(&m.url, &token_mint_url))
         .map(|m| m.min_purchase_steps.max(1))
         .unwrap_or(1);
     if steps < min_steps {
