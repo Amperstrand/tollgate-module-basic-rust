@@ -185,7 +185,7 @@ async fn main() {
     // the in-process counterpart of Go's hotplug one-shot service restart.
     let mint_retry_wallet = state.wallet.clone();
     let mint_retry_mints: Vec<String> = mint_urls_for_retry.clone();
-    let mint_retry_handle = tokio::spawn(async move {
+    let _mint_retry_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
         interval.tick().await; // first tick fires immediately; skip it
         loop {
@@ -349,6 +349,7 @@ async fn main() {
 
     http_handle.abort();
     cli_handle.abort();
+    _mint_retry_handle.abort();
     monitor_handle.abort();
     upstream_handle.abort();
     #[cfg(feature = "embedded-portal")]
