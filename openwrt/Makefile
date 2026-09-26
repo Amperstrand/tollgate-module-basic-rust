@@ -123,42 +123,44 @@ endef
 define Package/$(PKG_NAME)/install
 	$(INSTALL_DIR) $(1)/usr/bin
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/tollgate-module-basic-rust $(1)/usr/bin/tollgate-wrt
-	$(INSTALL_BIN) $(PKG_MAKEFILE_DIR)files/usr/bin/tollgate-apply-ssl $(1)/usr/bin/
-	$(INSTALL_BIN) $(PKG_MAKEFILE_DIR)files/usr/bin/tollgate-remove-ssl $(1)/usr/bin/
-	$(INSTALL_BIN) $(PKG_MAKEFILE_DIR)files/usr/bin/check_package_path $(1)/usr/bin/
+	ln -s tollgate-wrt $(1)/usr/bin/tollgate
+	$(INSTALL_BIN) $(PKG_MAKEFILE_DIR)../packaging/files/usr/bin/tollgate-apply-ssl $(1)/usr/bin/
+	$(INSTALL_BIN) $(PKG_MAKEFILE_DIR)../packaging/files/usr/bin/tollgate-remove-ssl $(1)/usr/bin/
+	$(INSTALL_BIN) $(PKG_MAKEFILE_DIR)../packaging/files/usr/bin/check_package_path $(1)/usr/bin/
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/gonuts-export $(1)/usr/bin/gonuts-export
 
 	$(INSTALL_DIR) $(1)/usr/local/bin
-	$(INSTALL_BIN) $(PKG_MAKEFILE_DIR)files/usr/local/bin/first-login-setup $(1)/usr/local/bin/
+	$(INSTALL_BIN) $(PKG_MAKEFILE_DIR)../packaging/files/usr/local/bin/first-login-setup $(1)/usr/local/bin/
 
 	$(INSTALL_DIR) $(1)/etc/init.d
-	$(INSTALL_BIN) $(PKG_MAKEFILE_DIR)files/etc/init.d/tollgate-wrt $(1)/etc/init.d/
+	$(INSTALL_BIN) $(PKG_MAKEFILE_DIR)../packaging/files/etc/init.d/tollgate-wrt $(1)/etc/init.d/
 
 	$(INSTALL_DIR) $(1)/etc/nftables.d
-	$(INSTALL_DATA) $(PKG_MAKEFILE_DIR)files/etc/nftables.d/20-nds-enforce.nft $(1)/etc/nftables.d/
-	$(INSTALL_DATA) $(PKG_MAKEFILE_DIR)files/etc/nftables.d/30-backend-firewall.nft $(1)/etc/nftables.d/
-	$(INSTALL_DATA) $(PKG_MAKEFILE_DIR)files/etc/nftables.d/31-admin-board-not-guest-reachable.nft $(1)/etc/nftables.d/
+	$(INSTALL_DATA) $(PKG_MAKEFILE_DIR)../packaging/files/etc/nftables.d/20-nds-enforce.nft $(1)/etc/nftables.d/
+	$(INSTALL_DATA) $(PKG_MAKEFILE_DIR)../packaging/files/etc/nftables.d/30-backend-firewall.nft $(1)/etc/nftables.d/
+	$(INSTALL_DATA) $(PKG_MAKEFILE_DIR)../packaging/files/etc/nftables.d/31-admin-board-not-guest-reachable.nft $(1)/etc/nftables.d/
 
 	$(INSTALL_DIR) $(1)/etc/uci-defaults
-	$(INSTALL_BIN) $(PKG_MAKEFILE_DIR)files/etc/uci-defaults/99-tollgate-setup $(1)/etc/uci-defaults/
-	$(INSTALL_BIN) $(PKG_MAKEFILE_DIR)files/etc/uci-defaults/90-tollgate-captive-portal-symlink $(1)/etc/uci-defaults/
+	$(INSTALL_BIN) $(PKG_MAKEFILE_DIR)../packaging/files/etc/uci-defaults/99-tollgate-setup $(1)/etc/uci-defaults/
+	$(INSTALL_BIN) $(PKG_MAKEFILE_DIR)../packaging/files/etc/uci-defaults/90-tollgate-captive-portal-symlink $(1)/etc/uci-defaults/
 
 	$(INSTALL_DIR) $(1)/etc/hotplug.d/iface
-	$(INSTALL_BIN) $(PKG_MAKEFILE_DIR)files/etc/hotplug.d/iface/95-tollgate-restart $(1)/etc/hotplug.d/iface/
+	$(INSTALL_BIN) $(PKG_MAKEFILE_DIR)../packaging/files/etc/hotplug.d/iface/95-tollgate-restart $(1)/etc/hotplug.d/iface/
 
 	$(INSTALL_DIR) $(1)/etc/tollgate
 	$(INSTALL_DIR) $(1)/etc/tollgate/ecash
-	$(INSTALL_DATA) $(PKG_MAKEFILE_DIR)files/etc/tollgate/emergency-clear.nft $(1)/etc/tollgate/
+	$(INSTALL_DATA) $(PKG_MAKEFILE_DIR)../packaging/files/etc/tollgate/emergency-clear.nft $(1)/etc/tollgate/
 
 	$(INSTALL_DIR) $(1)/etc/tollgate/tollgate-captive-portal-site
-	$(CP) $(PKG_MAKEFILE_DIR)files/tollgate-captive-portal-site/* $(1)/etc/tollgate/tollgate-captive-portal-site/
+	$(CP) $(PKG_MAKEFILE_DIR)../packaging/files/tollgate-captive-portal-site/* $(1)/etc/tollgate/tollgate-captive-portal-site/
 
 	$(INSTALL_DIR) $(1)/lib/upgrade/keep.d
-	$(INSTALL_DATA) $(PKG_MAKEFILE_DIR)files/lib/upgrade/keep.d/tollgate $(1)/lib/upgrade/keep.d/
+	$(INSTALL_DATA) $(PKG_MAKEFILE_DIR)../packaging/files/lib/upgrade/keep.d/tollgate $(1)/lib/upgrade/keep.d/
 endef
 
 FILES_$(PKG_NAME) += \
 	/usr/bin/tollgate-wrt \
+	/usr/bin/tollgate \
 	/usr/bin/gonuts-export \
 	/etc/init.d/tollgate-wrt \
 	/etc/tollgate/tollgate-captive-portal-site/* \

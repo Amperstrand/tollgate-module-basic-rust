@@ -69,6 +69,9 @@ mkdir -p "$STAGE/data/lib/upgrade/keep.d"
 cp "$BINARY" "$STAGE/data/usr/bin/tollgate-wrt"
 chmod 755 "$STAGE/data/usr/bin/tollgate-wrt"
 
+# Operator CLI: same binary in client mode (any argv arg => CLI, none => server)
+ln -s tollgate-wrt "$STAGE/data/usr/bin/tollgate"
+
 # SSL helper shims (Go parity: thin wrappers over `tollgate ssl …`)
 cp "$SCRIPT_DIR/files/usr/bin/tollgate-apply-ssl" "$STAGE/data/usr/bin/"
 cp "$SCRIPT_DIR/files/usr/bin/tollgate-remove-ssl" "$STAGE/data/usr/bin/"

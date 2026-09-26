@@ -1,4 +1,8 @@
 # This file is used to preserve configuration during sysupgrade
 /etc/config/network
 /etc/config/wireless
+# wallet_mnemonic.txt listed explicitly (with the /etc/tollgate dir entry)
+# so a future narrowing to per-file entries cannot drop the NUT-13 seed
+# recovery mnemonic (#37) — losing it orphans every derivation.
+/etc/tollgate/wallet_mnemonic.txt
 /etc/tollgate

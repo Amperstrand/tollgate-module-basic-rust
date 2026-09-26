@@ -11,6 +11,16 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[tokio::main]
 async fn main() {
+    // Multi-call dispatch: no argv args => run the server (this binary is
+    // installed as /usr/bin/tollgate-wrt); any args => behave as the
+    // `tollgate` operator CLI (a /usr/bin/tollgate symlink points here).
+    // Must run before tracing/server init so client mode never touches the
+    // socket, the wallet, or the log subscriber.
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.len() > 1 {
+        std::process::exit(cli::client::run(&argv).await);
+    }
+
     // Initialize tracing — must happen before anything else
     tracing_setup::init();
 
