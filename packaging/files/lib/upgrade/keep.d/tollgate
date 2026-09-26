@@ -1,7 +1,4 @@
-/etc/tollgate/
-/etc/tollgate/config.json
-/etc/tollgate/identities.json
-/etc/tollgate/install.json
-/etc/tollgate/wallet_seed.bin
-/etc/tollgate/sessions.json
-/etc/tollgate/quotes.json
+# This file is used to preserve configuration during sysupgrade
+/etc/config/network
+/etc/config/wireless
+/etc/tollgate

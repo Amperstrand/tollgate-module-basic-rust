@@ -10,7 +10,7 @@ set -euo pipefail
 # Examples:
 #   ./packaging/build-ipk.sh                    # builds x86_64
 #   ./packaging/build-ipk.sh aarch64             # builds aarch64
-#   ./packaging/build-ipk.sh mips /tmp/output    # builds MIPS, outputs to /tmp/output
+#   ./packaging/build-ipk.sh mips /tmp/output    # error: MIPS needs CI
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
@@ -19,9 +19,9 @@ OUTPUT_DIR="${2:-$REPO_DIR/dist}"
 VERSION="$(grep '^version' "$REPO_DIR/Cargo.toml" | head -1 | sed 's/.*"\(.*\)".*/\1/')"
 
 case "$ARCH" in
-    x86_64)   MUSL_TARGET="x86_64-unknown-linux-musl" ;;
-    aarch64)  MUSL_TARGET="aarch64-unknown-linux-musl" ;;
-    armv7)    MUSL_TARGET="armv7-unknown-linux-musleabihf" ;;
+    x86_64)   MUSL_TARGET="x86_64-unknown-linux-musl"; GOARCH="amd64" ;;
+    aarch64)  MUSL_TARGET="aarch64-unknown-linux-musl"; GOARCH="arm64" ;;
+    armv7)    MUSL_TARGET="armv7-unknown-linux-musleabihf"; GOARCH="arm"; GOARM="7" ;;
     mips)    echo "MIPS requires nightly + build-std. Use CI instead." >&2; exit 1 ;;
     mipsel)  echo "MIPSEL requires nightly + build-std. Use CI instead." >&2; exit 1 ;;
     *)       echo "Unknown architecture: $ARCH" >&2; exit 1 ;;
@@ -43,6 +43,14 @@ if [ ! -f "$BINARY" ]; then
     exit 1
 fi
 
+# gonuts-export: first-boot gonuts→CDK wallet migration helper (main.rs
+# invokes /usr/bin/gonuts-export when it finds a legacy Go wallet.db).
+GONUTS_EXPORT_DIR="$REPO_DIR/tools/gonuts-export"
+GONUTS_EXPORT="$SCRIPT_DIR/.gonuts-export-$ARCH"
+echo "--- Building gonuts-export ($GOARCH, static) ---"
+( cd "$GONUTS_EXPORT_DIR" && CGO_ENABLED=0 GOOS=linux GOARCH="$GOARCH" ${GOARM:+GOARM="$GOARM"} \
+    go build -trimpath -ldflags="-s -w" -o "$GONUTS_EXPORT" ./ )
+
 # Step 2: Create staging directory
 STAGE=$(mktemp -d)
 trap "rm -rf $STAGE" EXIT
@@ -50,29 +58,51 @@ trap "rm -rf $STAGE" EXIT
 echo "--- Staging files ---"
 mkdir -p "$STAGE/data/usr/bin"
 mkdir -p "$STAGE/data/etc/init.d"
+mkdir -p "$STAGE/data/usr/local/bin"
 mkdir -p "$STAGE/data/etc/nftables.d"
 mkdir -p "$STAGE/data/etc/uci-defaults"
+mkdir -p "$STAGE/data/etc/hotplug.d/iface"
 mkdir -p "$STAGE/data/etc/tollgate"
 mkdir -p "$STAGE/data/lib/upgrade/keep.d"
 
-# Binary
-cp "$BINARY" "$STAGE/data/usr/bin/tollgate"
-chmod 755 "$STAGE/data/usr/bin/tollgate"
+# Daemon binary — same path as the Go package it replaces
+cp "$BINARY" "$STAGE/data/usr/bin/tollgate-wrt"
+chmod 755 "$STAGE/data/usr/bin/tollgate-wrt"
 
-# Init scripts
-cp "$SCRIPT_DIR/files/etc/init.d/tollgate" "$STAGE/data/etc/init.d/"
+# SSL helper shims (Go parity: thin wrappers over `tollgate ssl …`)
+cp "$SCRIPT_DIR/files/usr/bin/tollgate-apply-ssl" "$STAGE/data/usr/bin/"
+cp "$SCRIPT_DIR/files/usr/bin/tollgate-remove-ssl" "$STAGE/data/usr/bin/"
+chmod 755 "$STAGE/data/usr/bin/tollgate-apply-ssl" "$STAGE/data/usr/bin/tollgate-remove-ssl"
+
+# Self-update helper + first-login hook (Go parity)
+cp "$SCRIPT_DIR/files/usr/bin/check_package_path" "$STAGE/data/usr/bin/"
+chmod 755 "$STAGE/data/usr/bin/check_package_path"
+cp "$SCRIPT_DIR/files/usr/local/bin/first-login-setup" "$STAGE/data/usr/local/bin/"
+chmod 755 "$STAGE/data/usr/local/bin/first-login-setup"
+
+# Migration helper
+cp "$GONUTS_EXPORT" "$STAGE/data/usr/bin/gonuts-export"
+chmod 755 "$STAGE/data/usr/bin/gonuts-export"
+
+# Init script
 cp "$SCRIPT_DIR/files/etc/init.d/tollgate-wrt" "$STAGE/data/etc/init.d/"
 chmod 755 "$STAGE/data/etc/init.d/"*
 
-# NDS enforcement
+# NDS enforcement + backend/admin firewall rules (Go parity)
 cp "$SCRIPT_DIR/files/etc/nftables.d/20-nds-enforce.nft" "$STAGE/data/etc/nftables.d/"
+cp "$SCRIPT_DIR/files/etc/nftables.d/30-backend-firewall.nft" "$STAGE/data/etc/nftables.d/"
+cp "$SCRIPT_DIR/files/etc/nftables.d/31-admin-board-not-guest-reachable.nft" "$STAGE/data/etc/nftables.d/"
 
-# UCI defaults
+# UCI defaults (Go parity)
 cp "$SCRIPT_DIR/files/etc/uci-defaults/99-tollgate-setup" "$STAGE/data/etc/uci-defaults/"
 cp "$SCRIPT_DIR/files/etc/uci-defaults/90-tollgate-captive-portal-symlink" "$STAGE/data/etc/uci-defaults/"
 chmod 755 "$STAGE/data/etc/uci-defaults/"*
 
-# Emergency clear
+# WAN-up service restart (Go parity)
+cp "$SCRIPT_DIR/files/etc/hotplug.d/iface/95-tollgate-restart" "$STAGE/data/etc/hotplug.d/iface/"
+chmod 755 "$STAGE/data/etc/hotplug.d/iface/"*
+
+# Emergency clear (Rust-specific extra)
 cp "$SCRIPT_DIR/files/etc/tollgate/emergency-clear.nft" "$STAGE/data/etc/tollgate/"
 
 # Upgrade keep
@@ -82,28 +112,28 @@ cp "$SCRIPT_DIR/files/lib/upgrade/keep.d/tollgate" "$STAGE/data/lib/upgrade/keep
 cp -r "$SCRIPT_DIR/files/tollgate-captive-portal-site" "$STAGE/data/etc/tollgate/"
 
 # License
-[ -f "$REPO_DIR/LICENSE-MIT" ] && cp "$REPO_DIR/LICENSE-MIT" "$STAGE/data/etc/tollgate/"
+[ -f "$REPO_DIR/LICENSE-MIT" ] && cp "$REPO_DIR/LICENSE-MIT" "$STAGE/data/usr/share/doc/tollgate-wrt/LICENSE" 2>/dev/null \
+    || { mkdir -p "$STAGE/data/usr/share/doc/tollgate-wrt"; cp "$REPO_DIR/LICENSE-MIT" "$STAGE/data/usr/share/doc/tollgate-wrt/LICENSE"; }
 
 # Step 3: Create control metadata
 echo "--- Creating control ---"
 mkdir -p "$STAGE/control"
 
 cat > "$STAGE/control/control" << CTRL
-Package: tollgate-rs
+Package: tollgate-wrt
 Version: $VERSION
 Architecture: $ARCH
 Maintainer: TollGate <tollgate@tollgate.me>
 Section: net
 Priority: optional
-Depends: nodogsplash, jq
-Provides: tollgate-wrt
-Conflicts: tollgate-wrt
-Replaces: tollgate-wrt
+Depends: libc, nodogsplash, jq
+Provides: nodogsplash-files
 Description: TollGate payment gateway for OpenWrt (Rust implementation).
- Powered by Cashu ecash and CDK (Cashu Dev Kit).
+ Powered by Cashu ecash and CDK (Cashu Dev Kit). Drop-in replacement
+ for the Go tollgate-wrt package.
 CTRL
 
-# Postinst
+# Postinst (mirrors Go's opkg behavior: run uci-defaults, restart services)
 cat > "$STAGE/control/postinst" << 'POST'
 #!/bin/sh
 echo "TollGate Rust post-installation..."
@@ -122,7 +152,7 @@ exit 0
 POST
 chmod 755 "$STAGE/control/postinst"
 
-# Preinst
+# Preinst (install_time stamp, same as Go)
 cat > "$STAGE/control/preinst" << 'PRE'
 #!/bin/sh
 mkdir -p /etc/tollgate
@@ -145,7 +175,7 @@ echo "2.0" > "$STAGE/debian-binary"
 ( cd "$STAGE/control" && tar czf "$STAGE/control.tar.gz" . )
 ( cd "$STAGE/data" && tar czf "$STAGE/data.tar.gz" . )
 
-IPK_NAME="tollgate-rs_${VERSION}_${ARCH}.ipk"
+IPK_NAME="tollgate-wrt_${VERSION}_${ARCH}.ipk"
 IPK_PATH="$OUTPUT_DIR/$IPK_NAME"
 
 ar rD "$IPK_PATH" \
@@ -157,7 +187,7 @@ echo ""
 echo "=== IPK BUILD COMPLETE ==="
 ls -lh "$IPK_PATH"
 echo ""
-echo "Package: tollgate-rs v$VERSION ($ARCH)"
+echo "Package: tollgate-wrt v$VERSION ($ARCH)"
 echo "Files: $(tar tzf "$STAGE/data.tar.gz" | wc -l)"
 echo ""
 echo "Install on OpenWrt:"

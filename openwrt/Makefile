@@ -6,8 +6,7 @@
 # CI cross-compiles the Rust binary for each target arch, stages it into
 # the package directory, and the OpenWrt SDK only packages the artifact.
 #
-# Service name is `tollgate-wrt` for interop with the existing init.d slot.
-# Binary installs to /usr/bin/tollgate-module-basic-rust.
+# Binary installs to /usr/bin/tollgate-wrt — same path as the Go package.
 
 PKG_MAKEFILE_DIR:=$(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
@@ -17,9 +16,10 @@ PKG_NAME:=tollgate-wrt
 PKG_VERSION:=$(if $(strip $(PACKAGE_VERSION)),$(PACKAGE_VERSION),0.1.0)
 PKG_FLAGS:=overwrite
 
-# The Rust binary is built natively by CI and staged into $(PKG_MAKEFILE_DIR)
-# as tollgate-module-basic-rust. The SDK only packages it.
+# The Rust binary + gonuts-export are built natively by CI and staged into
+# $(PKG_MAKEFILE_DIR). The SDK only packages them.
 PREBUILT_BIN:=$(PKG_MAKEFILE_DIR)tollgate-module-basic-rust
+PREBUILT_GONUTS_EXPORT:=$(PKG_MAKEFILE_DIR)gonuts-export
 
 PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)-$(PKG_VERSION)
 
@@ -95,6 +95,12 @@ define Build/Prepare
 	mkdir -p $(PKG_BUILD_DIR)
 	[ -f "$(PREBUILT_BIN)" ] || { echo "ERROR: prebuilt binary not found at $(PREBUILT_BIN). CI should stage it before invoking the SDK." >&2; exit 1; }
 	$(CP) $(PREBUILT_BIN) $(PKG_BUILD_DIR)/tollgate-module-basic-rust
+	if [ -f "$(PREBUILT_GONUTS_EXPORT)" ]; then \
+		$(CP) $(PREBUILT_GONUTS_EXPORT) $(PKG_BUILD_DIR)/gonuts-export; \
+	else \
+		echo "WARNING: prebuilt gonuts-export not found at $(PREBUILT_GONUTS_EXPORT) — package will lack the migration helper." >&2; \
+		touch $(PKG_BUILD_DIR)/gonuts-export; \
+	fi
 endef
 
 define Build/Configure
@@ -113,16 +119,36 @@ define Build/Compile
 	fi
 endef
 
-# ── Install: binary, init script, config dir, portal site, keep list ──
+# ── Install: mirror packaging/build-ipk.sh payload (Go parity) ────────
 define Package/$(PKG_NAME)/install
 	$(INSTALL_DIR) $(1)/usr/bin
-	$(INSTALL_BIN) $(PKG_BUILD_DIR)/tollgate-module-basic-rust $(1)/usr/bin/tollgate-module-basic-rust
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/tollgate-module-basic-rust $(1)/usr/bin/tollgate-wrt
+	$(INSTALL_BIN) $(PKG_MAKEFILE_DIR)files/usr/bin/tollgate-apply-ssl $(1)/usr/bin/
+	$(INSTALL_BIN) $(PKG_MAKEFILE_DIR)files/usr/bin/tollgate-remove-ssl $(1)/usr/bin/
+	$(INSTALL_BIN) $(PKG_MAKEFILE_DIR)files/usr/bin/check_package_path $(1)/usr/bin/
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/gonuts-export $(1)/usr/bin/gonuts-export
+
+	$(INSTALL_DIR) $(1)/usr/local/bin
+	$(INSTALL_BIN) $(PKG_MAKEFILE_DIR)files/usr/local/bin/first-login-setup $(1)/usr/local/bin/
 
 	$(INSTALL_DIR) $(1)/etc/init.d
 	$(INSTALL_BIN) $(PKG_MAKEFILE_DIR)files/etc/init.d/tollgate-wrt $(1)/etc/init.d/
 
+	$(INSTALL_DIR) $(1)/etc/nftables.d
+	$(INSTALL_DATA) $(PKG_MAKEFILE_DIR)files/etc/nftables.d/20-nds-enforce.nft $(1)/etc/nftables.d/
+	$(INSTALL_DATA) $(PKG_MAKEFILE_DIR)files/etc/nftables.d/30-backend-firewall.nft $(1)/etc/nftables.d/
+	$(INSTALL_DATA) $(PKG_MAKEFILE_DIR)files/etc/nftables.d/31-admin-board-not-guest-reachable.nft $(1)/etc/nftables.d/
+
+	$(INSTALL_DIR) $(1)/etc/uci-defaults
+	$(INSTALL_BIN) $(PKG_MAKEFILE_DIR)files/etc/uci-defaults/99-tollgate-setup $(1)/etc/uci-defaults/
+	$(INSTALL_BIN) $(PKG_MAKEFILE_DIR)files/etc/uci-defaults/90-tollgate-captive-portal-symlink $(1)/etc/uci-defaults/
+
+	$(INSTALL_DIR) $(1)/etc/hotplug.d/iface
+	$(INSTALL_BIN) $(PKG_MAKEFILE_DIR)files/etc/hotplug.d/iface/95-tollgate-restart $(1)/etc/hotplug.d/iface/
+
 	$(INSTALL_DIR) $(1)/etc/tollgate
 	$(INSTALL_DIR) $(1)/etc/tollgate/ecash
+	$(INSTALL_DATA) $(PKG_MAKEFILE_DIR)files/etc/tollgate/emergency-clear.nft $(1)/etc/tollgate/
 
 	$(INSTALL_DIR) $(1)/etc/tollgate/tollgate-captive-portal-site
 	$(CP) $(PKG_MAKEFILE_DIR)files/tollgate-captive-portal-site/* $(1)/etc/tollgate/tollgate-captive-portal-site/
@@ -132,7 +158,8 @@ define Package/$(PKG_NAME)/install
 endef
 
 FILES_$(PKG_NAME) += \
-	/usr/bin/tollgate-module-basic-rust \
+	/usr/bin/tollgate-wrt \
+	/usr/bin/gonuts-export \
 	/etc/init.d/tollgate-wrt \
 	/etc/tollgate/tollgate-captive-portal-site/* \
 	/lib/upgrade/keep.d/tollgate
