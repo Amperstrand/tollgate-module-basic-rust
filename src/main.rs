@@ -26,8 +26,12 @@ async fn main() {
 
     tracing::info!("RunInitialProbe: tollgate-module-basic-rust v{VERSION} starting");
 
-    // Load config
-    let config_obj = config::load_config().unwrap_or(None).unwrap_or_default();
+    // Load config (Go parity: a missing/empty/broken config.json is created
+    // from defaults on first boot — EnsureDefaultConfig).
+    let config_obj = config::ensure_default_config().unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "config ensure failed, using built-in defaults");
+        config::Config::new_default()
+    });
     tracing::info!(
         metric = %config_obj.metric,
         mints = config_obj.accepted_mints.len(),

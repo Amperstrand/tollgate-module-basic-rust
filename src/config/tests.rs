@@ -432,3 +432,78 @@ fn ensure_defaults_noop_when_already_set() {
     let mut cfg = Config::new_default();
     assert!(!cfg.ensure_defaults());
 }
+
+// --- ensure_default_config (Go EnsureDefaultConfig parity) ------------------
+//
+// Go's ConfigManager constructor (config_manager.go:46) calls
+// EnsureDefaultConfig, which WRITES a default config.json when the file is
+// missing, empty, or unparseable (backing the broken file up first). The Rust
+// backend used to keep defaults in memory only — a clean install never got a
+// config.json on disk, which poisons every external reader of the file.
+
+#[test]
+#[serial]
+fn ensure_default_config_creates_missing_file() {
+    let dir = with_test_dir(&[]);
+    let cfg = super::ensure_default_config().expect("ensure");
+    std::env::remove_var("TOLLGATE_TEST_CONFIG_DIR");
+
+    assert_eq!(cfg.config_version, "v0.0.8");
+    assert!(!cfg.accepted_mints.is_empty());
+    let on_disk = fs::read_to_string(dir.join("config.json")).expect("file written");
+    assert!(on_disk.contains("https://mint.coinos.io"));
+    // Written file must round-trip as the same config.
+    let reloaded: Config = serde_json::from_str(&on_disk).expect("valid json");
+    assert_eq!(reloaded.config_version, cfg.config_version);
+}
+
+#[test]
+#[serial]
+fn ensure_default_config_replaces_empty_file_with_backup() {
+    let dir = with_test_dir(&[("config.json", "")]);
+    let cfg = super::ensure_default_config().expect("ensure");
+    std::env::remove_var("TOLLGATE_TEST_CONFIG_DIR");
+
+    assert!(!cfg.accepted_mints.is_empty());
+    let on_disk = fs::read_to_string(dir.join("config.json")).expect("file rewritten");
+    assert!(on_disk.contains("https://mint.coinos.io"));
+    // Go backs the unusable file up before recreating it.
+    let backups: Vec<_> = fs::read_dir(dir.join("config_backups"))
+        .expect("backup dir")
+        .collect();
+    assert_eq!(backups.len(), 1);
+}
+
+#[test]
+#[serial]
+fn ensure_default_config_backs_up_invalid_json_and_recreates() {
+    let dir = with_test_dir(&[("config.json", "{ this is not json")]);
+    let cfg = super::ensure_default_config().expect("ensure");
+    std::env::remove_var("TOLLGATE_TEST_CONFIG_DIR");
+
+    assert_eq!(cfg.config_version, "v0.0.8");
+    let on_disk = fs::read_to_string(dir.join("config.json")).expect("file rewritten");
+    assert!(on_disk.contains("https://mint.coinos.io"));
+    let backups: Vec<_> = fs::read_dir(dir.join("config_backups"))
+        .expect("backup dir")
+        .collect();
+    assert_eq!(backups.len(), 1);
+    let backup_content =
+        fs::read_to_string(backups[0].as_ref().unwrap().path()).expect("backup readable");
+    assert_eq!(backup_content, "{ this is not json");
+}
+
+#[test]
+#[serial]
+fn ensure_default_config_preserves_valid_config() {
+    let dir = with_test_dir(&[("config.json", PRODUCTION_CONFIG_JSON)]);
+    let cfg = super::ensure_default_config().expect("ensure");
+    std::env::remove_var("TOLLGATE_TEST_CONFIG_DIR");
+
+    // Valid config is returned as-is and NOT rewritten (no backup either).
+    assert_eq!(cfg.accepted_mints.len(), 1);
+    assert_eq!(cfg.accepted_mints[0].url, "https://mint.coinos.io");
+    let on_disk = fs::read_to_string(dir.join("config.json")).expect("file intact");
+    assert_eq!(on_disk, PRODUCTION_CONFIG_JSON);
+    assert!(fs::read_dir(dir.join("config_backups")).is_err());
+}
