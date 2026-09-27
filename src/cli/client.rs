@@ -613,18 +613,35 @@ async fn cmd_wallet(sub: &[&str], parsed: &Parsed) -> i32 {
             eprintln!("Error: drain requires a type: 'cashu' (lightning not yet supported)");
             1
         }
-        [] => {
-            eprintln!("Error: wallet requires an action: balance, info, fund, drain cashu");
-            1
-        }
-        [other, ..] => {
-            eprintln!(
-                "Error: unknown wallet action \"{other}\" (supported: balance, info, fund, drain)"
-            );
-            1
+        // Go's cobra prints the wallet help to STDOUT (exit 0) for a missing
+        // or unknown subcommand — even under --json. Callers (and PRTA's
+        // cli_command) parse stdout, so an empty stdout reads as a crash.
+        [] | [_, ..] => {
+            println!("{WALLET_HELP}");
+            0
         }
     }
 }
+
+const WALLET_HELP: &str =
+    "Manage your TollGate wallet - check balance, drain funds, view information
+
+Usage:
+  tollgate wallet [command]
+
+Available Commands:
+  balance     Show wallet balance
+  drain       Drain wallet funds
+  fund        Fund wallet with a Cashu token
+  info        Show wallet information
+
+Flags:
+  -h, --help   help for wallet
+
+Global Flags:
+  -j, --json   Output results as JSON
+
+Use \"tollgate wallet [command] --help\" for more information about a command.";
 
 async fn cmd_config(sub: &[&str], parsed: &Parsed) -> i32 {
     match sub {

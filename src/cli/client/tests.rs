@@ -207,3 +207,26 @@ async fn drain_without_yes_and_declined_confirmation_fails() {
 
     std::env::remove_var("TOLLGATE_TEST_CONFIG_DIR");
 }
+
+#[test]
+fn wallet_help_matches_go_cobra_skip_contract() {
+    // PRTA's test_wallet_send_exercises_keyset_derivation skips on the Go
+    // cobra help markers; an unknown/missing wallet subcommand must print
+    // this help to stdout or the test reads an empty stdout as a crash.
+    for marker in [
+        "usage:",
+        "wallet [command]",
+        "Available Commands",
+        "balance",
+        "drain",
+        "fund",
+        "info",
+    ] {
+        assert!(
+            super::WALLET_HELP
+                .to_lowercase()
+                .contains(&marker.to_lowercase()),
+            "WALLET_HELP missing Go help marker: {marker}"
+        );
+    }
+}
