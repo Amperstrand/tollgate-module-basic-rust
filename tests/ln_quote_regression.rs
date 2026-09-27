@@ -14,6 +14,8 @@ fn quote_record(quote: &str) -> LightningQuoteRecord {
         created_at: now_secs(),
         expiry: now_secs() + 3600,
         minted: false,
+        allotment: 0,
+        metric: String::new(),
         allotment_added: false,
         session_granted: false,
     }
@@ -192,4 +194,78 @@ async fn expired_ungranted_quotes_stay_visible_to_settlement() {
         pending.iter().any(|q| q.quote == "paid-late"),
         "expired-but-ungranted records must reach settlement"
     );
+}
+
+struct FakePortal {
+    granted: std::sync::Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl tollgate_module_basic_rust::portal::CaptivePortal for FakePortal {
+    async fn grant_access(&self, mac: &str) -> Result<(), tollgate_module_basic_rust::error::AppError> {
+        self.granted.lock().unwrap().push(mac.to_string());
+        Ok(())
+    }
+    async fn revoke_access(&self, _mac: &str) -> Result<(), tollgate_module_basic_rust::error::AppError> {
+        Ok(())
+    }
+    async fn poll_usage(&self, _mac: &str) -> Result<(u64, u64), tollgate_module_basic_rust::error::AppError> {
+        Ok((0, 0))
+    }
+    async fn is_authenticated(&self, _mac: &str) -> bool {
+        false
+    }
+}
+
+/// PR #22 r4070018414 (P2): settlement must use the pricing terms frozen
+/// into the quote at creation, not a re-derivation from the (possibly
+/// changed) config — a config change + restart while a quote is payable
+/// used to grant a different product than the portal displayed.
+#[tokio::test]
+async fn settlement_uses_pricing_terms_frozen_at_creation() {
+    use tollgate_module_basic_rust::lightning_quotes::{settle_quote, SettleOutcome};
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = std::sync::Arc::new(QuoteStore::load(dir.path()));
+
+    // Quote created under: metric "bytes", allotment 999. Config NOW says
+    // metric "time", price 1 sat/step, step_size 100 → re-derivation
+    // would grant 1000 "time" units instead of the paid 999 "bytes".
+    let mut rec = quote_record("priced-then");
+    rec.minted = true;
+    rec.allotment = 999;
+    rec.metric = "bytes".to_string();
+    store.upsert(rec).await.unwrap();
+
+    let config = tollgate_module_basic_rust::config::Config {
+        metric: "time".to_string(),
+        step_size: 100,
+        ..tollgate_module_basic_rust::config::Config::default()
+    };
+
+    let wallet = tollgate_module_basic_rust::wallet::TollWallet::new(
+        [0u8; 64],
+        vec![],
+        dir.path().to_path_buf(),
+    );
+    let sessions = tokio::sync::Mutex::new(tollgate_module_basic_rust::session::SessionManager::new());
+    let portal = FakePortal {
+        granted: std::sync::Mutex::new(vec![]),
+    };
+
+    let outcome = settle_quote(
+        store.clone(),
+        &wallet,
+        &sessions,
+        &portal,
+        &config,
+        store.get("priced-then").await.unwrap(),
+    )
+    .await;
+
+    assert_eq!(outcome, SettleOutcome::Granted { allotment: 999 });
+    let guard = sessions.lock().await;
+    let session = guard.get_session("aa:bb:cc:dd:ee:ff").unwrap();
+    assert_eq!(session.allotment, 999, "stored allotment must win");
+    assert_eq!(session.metric, "bytes", "stored metric must win");
 }

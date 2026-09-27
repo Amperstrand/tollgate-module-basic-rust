@@ -31,6 +31,15 @@ pub struct LightningQuoteRecord {
     /// never run again for this quote (a second mint on an ISSUED quote
     /// fails at the mint).
     pub minted: bool,
+    /// Allotment priced at creation from the terms then in force;
+    /// settlement and status responses use this immutable value, never a
+    /// re-derivation from possibly-changed config (0 = legacy record
+    /// predating the field; priced then from current config).
+    #[serde(default)]
+    pub allotment: u64,
+    /// Metric in force at creation; empty = legacy record (use config).
+    #[serde(default)]
+    pub metric: String,
     /// The session's allotment was added exactly once. Gate retries must
     /// not accumulate allotment on every tick.
     pub allotment_added: bool,
@@ -283,14 +292,26 @@ pub async fn settle_quote(
         }
     }
 
-    let mint_cfg = find_mint_config(config, &record.mint_url);
-    let price_per_step = mint_cfg.map(|m| m.price_per_step.max(1)).unwrap_or(1);
-    let steps = record.amount_sat / price_per_step;
-    let allotment = steps * config.step_size;
+    // Pricing terms are frozen into the record at creation; only legacy
+    // records (allotment == 0) fall back to current config (PR #22
+    // r4070018414).
+    let allotment = if record.allotment > 0 {
+        record.allotment
+    } else {
+        let price_per_step = find_mint_config(config, &record.mint_url)
+            .map(|m| m.price_per_step.max(1))
+            .unwrap_or(1);
+        (record.amount_sat / price_per_step) * config.step_size
+    };
+    let metric = if record.metric.is_empty() {
+        config.metric.clone()
+    } else {
+        record.metric.clone()
+    };
 
     if !record.allotment_added {
         let mut sm = sessions.lock().await;
-        sm.add_allotment(&record.mac, &config.metric, allotment, 3600);
+        sm.add_allotment(&record.mac, &metric, allotment, 3600);
         if let Err(e) = sm.save_to_disk(&crate::config::config_dir()) {
             tracing::warn!(error = %e, "session save debounced; monitor flush will persist");
         }
@@ -413,6 +434,8 @@ mod tests {
             created_at: now_secs(),
             expiry: now_secs() + 3600,
             minted,
+            allotment: 0,
+            metric: String::new(),
             allotment_added: false,
             session_granted: false,
         }

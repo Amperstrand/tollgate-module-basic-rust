@@ -164,6 +164,8 @@ pub async fn handle_create_ln_invoice(
                 created_at: now,
                 expiry: info.expiry,
                 minted: false,
+                allotment: steps * state.config.step_size,
+                metric: state.config.metric.clone(),
                 allotment_added: false,
                 session_granted: false,
             };
@@ -258,13 +260,24 @@ pub async fn handle_get_ln_invoice(
     };
 
     if stored.session_granted {
-        let price_per_step = crate::lightning_quotes::find_mint_config(
-            &state.config,
-            &stored.mint_url,
-        )
-        .map(|m| m.price_per_step.max(1))
-        .unwrap_or(1);
-        let allotment = (stored.amount_sat / price_per_step) * state.config.step_size;
+        // Terms frozen at creation; legacy records (allotment == 0) fall
+        // back to current config pricing.
+        let allotment = if stored.allotment > 0 {
+            stored.allotment
+        } else {
+            let price_per_step = crate::lightning_quotes::find_mint_config(
+                &state.config,
+                &stored.mint_url,
+            )
+            .map(|m| m.price_per_step.max(1))
+            .unwrap_or(1);
+            (stored.amount_sat / price_per_step) * state.config.step_size
+        };
+        let metric = if stored.metric.is_empty() {
+            state.config.metric.clone()
+        } else {
+            stored.metric.clone()
+        };
         return json_response(
             StatusCode::OK,
             LightningInvoiceResponse {
@@ -277,7 +290,7 @@ pub async fn handle_get_ln_invoice(
                 state: "paid".to_string(),
                 access_granted: true,
                 allotment,
-                metric: state.config.metric.clone(),
+                metric,
                 error: String::new(),
             },
         );
