@@ -133,6 +133,28 @@ pub enum SettleOutcome {
     Failed(String),
 }
 
+/// Exact typed comparison: only `Paid` and `Issued` authorize a mint.
+///
+/// The debug name of `MintQuoteState::Unpaid` lowercased contains "paid",
+/// so substring matching on a formatted state reports every unpaid invoice
+/// as paid (AGENTS.md: do not parse protocol states as substrings).
+pub fn quote_state_allows_settlement(state: cdk::nuts::MintQuoteState) -> bool {
+    matches!(
+        state,
+        cdk::nuts::MintQuoteState::Paid | cdk::nuts::MintQuoteState::Issued
+    )
+}
+
+/// Portal-facing state string for an invoice query. Exact typed match:
+/// `Unpaid` must never display as "paid".
+pub fn quote_state_display(state: cdk::nuts::MintQuoteState) -> &'static str {
+    if quote_state_allows_settlement(state) {
+        "paid"
+    } else {
+        "unpaid"
+    }
+}
+
 /// Settle one quote: mint if paid-and-unminted, then grant session + gate.
 /// `minted`/`session_granted` transitions are persisted through the store
 /// as they happen, so a crash mid-settle resumes correctly: minting never
@@ -149,13 +171,13 @@ pub async fn settle_quote(
 
     if !record.minted {
         let status = match wallet
-            .check_mint_quote(&record.mint_url, &record.quote)
+            .check_mint_quote_state(&record.mint_url, &record.quote)
             .await
         {
             Ok(s) => s,
             Err(e) => return SettleOutcome::Failed(e.to_string()),
         };
-        if !status.to_lowercase().contains("paid") && !status.to_lowercase().contains("issued") {
+        if !quote_state_allows_settlement(status) {
             return SettleOutcome::StillUnpaid;
         }
         match wallet.mint_tokens(&record.mint_url, &record.quote).await {
@@ -431,5 +453,19 @@ mod tests {
             .map(|q| q.quote)
             .collect();
         assert_eq!(pending, vec!["live".to_string()]);
+    }
+
+    #[test]
+    fn unpaid_state_never_allows_settlement_or_displays_paid() {
+        use cdk::nuts::MintQuoteState;
+        // Regression (PR #22/#23 review): `"unpaid".contains("paid")` is
+        // true, so substring matching treated every unpaid invoice as paid
+        // and fired a mint attempt on every monitor tick.
+        assert!(!quote_state_allows_settlement(MintQuoteState::Unpaid));
+        assert_eq!(quote_state_display(MintQuoteState::Unpaid), "unpaid");
+        assert!(quote_state_allows_settlement(MintQuoteState::Paid));
+        assert_eq!(quote_state_display(MintQuoteState::Paid), "paid");
+        assert!(quote_state_allows_settlement(MintQuoteState::Issued));
+        assert_eq!(quote_state_display(MintQuoteState::Issued), "paid");
     }
 }

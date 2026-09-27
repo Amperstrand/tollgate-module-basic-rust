@@ -241,13 +241,11 @@ pub async fn handle_get_ln_invoice(
     let (state_str, expiry) = {
         let wallet_guard = state.wallet.read().await;
         match wallet_guard.as_ref() {
-            Some(wallet) => match wallet.check_mint_quote(&stored.mint_url, &q.quote).await {
-                Ok(raw) => {
-                    let lower = raw.to_lowercase();
-                    let is_paid = lower.contains("paid") || lower.contains("issued");
-                    let s = if is_paid { "paid" } else { "unpaid" };
-                    (s.to_string(), stored.expiry)
-                }
+            Some(wallet) => match wallet.check_mint_quote_state(&stored.mint_url, &q.quote).await {
+                Ok(raw) => (
+                    crate::lightning_quotes::quote_state_display(raw).to_string(),
+                    stored.expiry,
+                ),
                 Err(_) => ("unpaid".to_string(), stored.expiry),
             },
             None => ("unpaid".to_string(), stored.expiry),

@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use cdk::amount::SplitTarget;
-use cdk::nuts::{CurrencyUnit, PaymentMethod};
+use cdk::nuts::{CurrencyUnit, MintQuoteState, PaymentMethod};
 use cdk::wallet::{ReceiveOptions, SendOptions, Wallet};
 use cdk::Amount;
 use cdk_sqlite::wallet::WalletSqliteDatabase;
@@ -258,11 +258,16 @@ impl TollWallet {
     }
 
     /// Check mint quote status (maps gonuts `MintQuoteState`).
-    pub async fn check_mint_quote(
+    ///
+    /// Returns the typed NUT-04 state. Callers must compare the exact
+    /// variant: the debug name of `Unpaid` lowercased contains "paid", so
+    /// substring matching treats every unpaid invoice as paid
+    /// (AGENTS.md "do not guess about Cashu protocol behavior").
+    pub async fn check_mint_quote_state(
         &self,
         mint_url: &str,
         quote_id: &str,
-    ) -> Result<String, WalletError> {
+    ) -> Result<MintQuoteState, WalletError> {
         let normalized = mint_url.trim_end_matches('/');
         let wallet = self
             .wallets
@@ -277,7 +282,7 @@ impl TollWallet {
         .await;
 
         match result {
-            Ok(Ok(quote)) => Ok(format!("{:?}", quote.state)),
+            Ok(Ok(quote)) => Ok(quote.state),
             Ok(Err(e)) => Err(WalletError::Cdk(e)),
             Err(_) => Err(WalletError::Timeout(OP_TIMEOUT)),
         }
