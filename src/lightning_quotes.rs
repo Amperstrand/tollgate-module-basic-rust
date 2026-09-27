@@ -148,6 +148,19 @@ pub fn now_secs() -> u64 {
         .as_secs()
 }
 
+/// Find the config entry for a quote's mint by canonical identity
+/// (AGENTS.md: raw-string mint comparisons fork on alias spellings).
+pub(crate) fn find_mint_config<'a>(
+    config: &'a crate::config::Config,
+    mint_url: &str,
+) -> Option<&'a crate::config::MintConfig> {
+    let canonical = crate::wallet::canonical_mint_url(mint_url);
+    config
+        .accepted_mints
+        .iter()
+        .find(|m| crate::wallet::canonical_mint_url(&m.url) == canonical)
+}
+
 /// Settlement outcome for one monitored quote, returned for tests and
 /// logging.
 #[derive(Debug, Clone, PartialEq)]
@@ -254,10 +267,7 @@ pub async fn settle_quote(
         }
     }
 
-    let mint_cfg = config
-        .accepted_mints
-        .iter()
-        .find(|m| m.url.trim_end_matches('/') == record.mint_url.trim_end_matches('/'));
+    let mint_cfg = find_mint_config(config, &record.mint_url);
     let price_per_step = mint_cfg.map(|m| m.price_per_step.max(1)).unwrap_or(1);
     let steps = record.amount_sat / price_per_step;
     let allotment = steps * config.step_size;

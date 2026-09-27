@@ -78,7 +78,10 @@ pub async fn handle_create_ln_invoice(
             );
         }
     };
-    let mint_url = mint.url.clone();
+    // Store the CDK-canonical identity: a quote surviving a restart must
+    // match the wallet map and config even if the configured spelling
+    // changes to an equivalent alias (AGENTS.md mint-URL canonicalization).
+    let mint_url = crate::wallet::canonical_mint_url(&mint.url);
 
     // AGENTS.md: validations possible locally run before any value moves.
     // An invoice below price_per_step/min_purchase_steps would settle to a
@@ -255,13 +258,12 @@ pub async fn handle_get_ln_invoice(
     };
 
     if stored.session_granted {
-        let price_per_step = state
-            .config
-            .accepted_mints
-            .iter()
-            .find(|m| m.url.trim_end_matches('/') == stored.mint_url.trim_end_matches('/'))
-            .map(|m| m.price_per_step.max(1))
-            .unwrap_or(1);
+        let price_per_step = crate::lightning_quotes::find_mint_config(
+            &state.config,
+            &stored.mint_url,
+        )
+        .map(|m| m.price_per_step.max(1))
+        .unwrap_or(1);
         let allotment = (stored.amount_sat / price_per_step) * state.config.step_size;
         return json_response(
             StatusCode::OK,

@@ -133,3 +133,43 @@ async fn sub_minimum_amount_rejected_before_invoice_creation() {
 
     std::env::remove_var("TOLLGATE_TEST_CONFIG_DIR");
 }
+
+/// PR #22 r4070018389 / PR #23 r4070120810 (P1): alias-spelled mint URLs
+/// must resolve to the registered wallet (one canonical identity), or a
+/// quote surviving a restart with a re-spelled config is permanently
+/// WalletNotFound and a paid invoice never grants.
+#[tokio::test]
+async fn alias_spelled_mint_resolves_to_single_registered_wallet() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut wallet = tollgate_module_basic_rust::wallet::TollWallet::new(
+        [0u8; 64],
+        vec![],
+        dir.path().to_path_buf(),
+    );
+
+    wallet
+        .ensure_mint("https://mint.example")
+        .await
+        .unwrap();
+    wallet
+        .ensure_mint("HTTPS://Mint.Example/")
+        .await
+        .expect("alias spelling must resolve to the registered wallet");
+    assert_eq!(
+        wallet.get_balance_by_mint().await.unwrap().len(),
+        1,
+        "alias spelling must not fork the wallet map"
+    );
+
+    let err = wallet
+        .check_mint_quote_state("HTTPS://Mint.Example/", "nonexistent")
+        .await
+        .expect_err("unknown quote must error");
+    assert!(
+        !matches!(
+            err,
+            tollgate_module_basic_rust::error::WalletError::WalletNotFound(_)
+        ),
+        "alias spelling resolved past the wallet map, got {err:?}"
+    );
+}

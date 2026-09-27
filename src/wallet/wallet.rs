@@ -39,6 +39,18 @@ const OP_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub use crate::error::WalletError;
 
+/// One canonical mint identity for every persisted/compared URL
+/// (AGENTS.md: route mint URLs through CDK's `MintUrl` form — lowercase
+/// scheme/host, trailing slash trimmed — or alias spellings fork wallet
+/// map keys, quote records, and DB filenames).
+pub fn canonical_mint_url(url: &str) -> String {
+    use std::str::FromStr;
+    let trimmed = url.trim_end_matches('/');
+    cdk::mint_url::MintUrl::from_str(trimmed)
+        .map(|u| u.to_string())
+        .unwrap_or_else(|_| trimmed.to_string())
+}
+
 /// TollWallet wraps multiple CDK Wallet instances (one per mint URL) behind
 /// a tokio Mutex for thread-safe serialized access. CDK's saga pattern
 /// ensures operations are atomic — no swap-counter race.
@@ -65,7 +77,7 @@ impl TollWallet {
             || self
                 .accepted_mints
                 .iter()
-                .any(|m| m.trim_end_matches('/') == mint_url.trim_end_matches('/'))
+                .any(|m| canonical_mint_url(m) == canonical_mint_url(mint_url))
     }
 
     /// Register a mint and open a CDK wallet for it.
@@ -75,12 +87,12 @@ impl TollWallet {
             return Err(WalletError::MintNotAccepted(mint_url.to_string()));
         }
 
-        let normalized = mint_url.trim_end_matches('/');
-        if self.wallets.contains_key(normalized) {
+        let normalized = canonical_mint_url(mint_url);
+        if self.wallets.contains_key(normalized.as_str()) {
             return Ok(());
         }
 
-        let db_path = self.db_path_for_mint(normalized);
+        let db_path = self.db_path_for_mint(&normalized);
         if let Some(parent) = db_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
@@ -139,11 +151,11 @@ impl TollWallet {
             .mint_url()
             .map_err(|e| WalletError::TokenParse(format!("{e}")))?
             .to_string();
-        let normalized = mint_url.trim_end_matches('/');
+        let normalized = canonical_mint_url(&mint_url);
 
         let wallet = self
             .wallets
-            .get(normalized)
+            .get(normalized.as_str())
             .ok_or_else(|| WalletError::WalletNotFound(normalized.to_string()))?
             .clone();
 
@@ -171,10 +183,10 @@ impl TollWallet {
         amount_sat: u64,
         include_fee: bool,
     ) -> Result<String, WalletError> {
-        let normalized = mint_url.trim_end_matches('/');
+        let normalized = canonical_mint_url(mint_url);
         let wallet = self
             .wallets
-            .get(normalized)
+            .get(normalized.as_str())
             .ok_or_else(|| WalletError::WalletNotFound(normalized.to_string()))?
             .clone();
 
@@ -226,10 +238,10 @@ impl TollWallet {
         mint_url: &str,
         amount_sat: u64,
     ) -> Result<MintQuoteInfo, WalletError> {
-        let normalized = mint_url.trim_end_matches('/');
+        let normalized = canonical_mint_url(mint_url);
         let wallet = self
             .wallets
-            .get(normalized)
+            .get(normalized.as_str())
             .ok_or_else(|| WalletError::WalletNotFound(normalized.to_string()))?
             .clone();
 
@@ -268,10 +280,10 @@ impl TollWallet {
         mint_url: &str,
         quote_id: &str,
     ) -> Result<MintQuoteState, WalletError> {
-        let normalized = mint_url.trim_end_matches('/');
+        let normalized = canonical_mint_url(mint_url);
         let wallet = self
             .wallets
-            .get(normalized)
+            .get(normalized.as_str())
             .ok_or_else(|| WalletError::WalletNotFound(normalized.to_string()))?
             .clone();
 
@@ -291,10 +303,10 @@ impl TollWallet {
     /// Mint tokens from a paid quote (NUT-04, maps gonuts `MintTokens`).
     /// CDK API: `wallet.mint(quote_id, SplitTarget, Option<SpendingConditions>)`.
     pub async fn mint_tokens(&self, mint_url: &str, quote_id: &str) -> Result<u64, WalletError> {
-        let normalized = mint_url.trim_end_matches('/');
+        let normalized = canonical_mint_url(mint_url);
         let wallet = self
             .wallets
-            .get(normalized)
+            .get(normalized.as_str())
             .ok_or_else(|| WalletError::WalletNotFound(normalized.to_string()))?
             .clone();
 
@@ -316,10 +328,10 @@ impl TollWallet {
     /// Request a melt quote + prepare melt (NUT-05, maps gonuts `RequestMeltQuote` + `Melt`).
     /// CDK flow: `melt_quote(BOLT11, invoice)` → `prepare_melt(quote_id, meta)` → `confirm()`.
     pub async fn melt(&self, mint_url: &str, invoice: &str) -> Result<MeltQuoteInfo, WalletError> {
-        let normalized = mint_url.trim_end_matches('/');
+        let normalized = canonical_mint_url(mint_url);
         let wallet = self
             .wallets
-            .get(normalized)
+            .get(normalized.as_str())
             .ok_or_else(|| WalletError::WalletNotFound(normalized.to_string()))?
             .clone();
 
@@ -409,6 +421,50 @@ mod tests {
         let mut seed = [0u8; 64];
         rand::thread_rng().fill(&mut seed);
         TollWallet::new(seed, accepted_mints, dir.to_path_buf())
+    }
+
+    #[test]
+    fn canonical_mint_url_lowercases_host_and_trims_slash() {
+        assert_eq!(
+            canonical_mint_url("HTTPS://Mint.Example/"),
+            "https://mint.example"
+        );
+        assert_eq!(canonical_mint_url("https://mint.example/"), "https://mint.example");
+        // Path case is preserved per CDK MintUrl semantics.
+        assert_eq!(
+            canonical_mint_url("https://mint.example/Path/TO/mint"),
+            "https://mint.example/Path/TO/mint"
+        );
+    }
+
+    /// PR #22 r4070018389 / PR #23 r4070120810: an alias-spelled lookup
+    /// (uppercase host) must find the registered wallet — otherwise a
+    /// quote surviving a restart with a re-spelled config is permanently
+    /// `WalletNotFound` and a paid invoice never grants.
+    #[tokio::test]
+    async fn alias_spelled_mint_lookups_hit_the_registered_wallet() {
+        let tmp = TempDir::new().unwrap();
+        let mut wallet = make_test_wallet(tmp.path(), vec![]);
+
+        wallet.ensure_mint("https://mint.example").await.unwrap();
+        // Same mint, alias spelling: must not create a second wallet.
+        wallet
+            .ensure_mint("HTTPS://Mint.Example/")
+            .await
+            .expect("alias spelling must resolve to the registered wallet");
+        assert_eq!(wallet.wallets.len(), 1, "alias spelling must not fork the wallet map");
+
+        // Lookups through alias spellings resolve past the map to the
+        // store layer (a non-WalletNotFound error: UnknownQuote), proving
+        // the canonical key was found.
+        let err = wallet
+            .check_mint_quote_state("HTTPS://Mint.Example/", "nonexistent")
+            .await
+            .expect_err("unknown quote must error");
+        assert!(
+            !matches!(err, WalletError::WalletNotFound(_)),
+            "alias spelling resolved to a wallet, got {err:?}"
+        );
     }
 
     #[tokio::test]
