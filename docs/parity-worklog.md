@@ -97,3 +97,84 @@ Format: timestamp | commit | test command | failure | root cause | change | rete
   keyset-counter db race). Rust/CDK grants 5/5. Documented as deliberate
   Rust improvement in the parity test docstring.
 - Go baseline VM suite: progressing (54+/107 files at time of writing).
+
+2026-09-27 12:05 UTC | rust 44c3f3f (+uncommitted build-ipk tar.gz fix) | results/rust-run1 (TOLLGATE_BACKEND=rust-basic, 107 files, RUST_RUN_RC=1)
+- OUTCOME: 495 tests: 150 pass / 233 skip / 112 fail+error (86 unique).
+  Diff vs go-baseline (results/go-baseline, GO_BASELINE_RC=1, 512 tests:
+  215 pass / 243 skip / 54 fail+error): 44 both-fail, 68 rust-fail/go-ok,
+  7 rust-ok/go-fail. **run1 is NOT a valid Rust product verdict** — the
+  deployment it ran against was broken before pytest started:
+- ROOT CAUSE 1 (cascade, ~50 of 68 rust-only failures): clean-VM ipk
+  install leaves NO /etc/tollgate/config.json — Go's ConfigManager calls
+  EnsureDefaultConfig (config_manager_config.go:347) which WRITES the
+  default on first boot; Rust main.rs:30 does
+  `load_config().unwrap_or_default()` and never persists. Then
+  run-local-tests.sh configure_mint ran `jq ... config.json > /tmp/cfg.json`
+  against the missing file → jq errored → `mv` installed an EMPTY
+  config.json. Every config-reading fixture (mint_urls, mint_ip_map,
+  config, local_502_config, config_guard) then JSONDecodeError'd, and the
+  backend (default accepted_mints) rejected every lab token with
+  `payment rejected: mint http://10.99.99.2:8383 not accepted`
+  (token-verification-failed), incl. /ln-invoice 400.
+- ROOT CAUSE 2 (10 restart failures + teardown cascade): router has NO
+  curl (both runs; go pr193 shows same `ash: curl: not found`).
+  router.py restart_backend health-checks via router-side curl → can
+  never return 200 → "Rust backend did not become healthy" even when the
+  fallback `setsid /tmp/tollgate` started fine. Also kills pr193
+  identity tests on both backends. busybox wget IS present.
+- ROOT CAUSE 3: service restart path — /etc/init.d/tollgate-wrt could
+  not start the binary on the pre-f820a15 install (path bug, fixed
+  committed f820a15; run1's VM did have /usr/bin/tollgate-wrt 0.1.0
+  installed, so this contributed only via the pre-run health timeout).
+- BOTH-FAIL classes (env, not parity signal): bash_client ×5 (git clone
+  of sh1ftred/tollgate-bash-client fails, no route/branch), pr193 ×4
+  (curl), LuCI 8080 (Go: 307 redirect; Rust: no LuCI, known gap),
+  ssl lifecycle ×2 (443 still listening after remove — Go fails too),
+  lightning_backoff ×3 + swap_regression restart invoice (Go: 429
+  quote-rate-limited under hammering), keyset_id_versions (test bug:
+  compares 8-byte short keyset ID to full V2 ID from /v1/keys).
+- GENUINE RUST GAPS isolated so far (must re-verify on fixed deployment
+  before fixing more): (a) no EnsureDefaultConfig write — root cause 1;
+  (b) uncommitted build-ipk.sh ar→tar.gz ipk format fix is load-bearing
+  (opkg 24.10 rejects busybox-ar ipks) and must land; ln-invoice 400 and
+  degraded-mode results are unjudgeable under the poisoned config.
+- Harness fixes queued: configure_mint must abort when config.json
+  missing (never mv an empty file); restart_backend should use wget when
+  curl absent; VM prep should install curl (deploy.py TEST_DEPS already
+  lists it — local runner skips it).
+- Lab note: host did NOT reboot (uptime 45d, contradicting handoff
+  notes); OpenWrt 10.99.99.1 SSH-alive (ICMP filtered), Debian .100 up,
+  CDK mint :8383 listening.
+
+2026-09-27 13:00 UTC | rust 3054f82 + a7c2f06 + b223437 + 34714f4 / prta 2edf329
+- FIXES from run1 triage (each verified on the live VM before the next):
+  1. 3054f82 ensure_default_config: clean install now writes
+     /etc/tollgate/config.json (2061 B, 0600, defaults) — Go
+     EnsureDefaultConfig parity; empty/unparseable file backed up to
+     config_backups/. 4 new unit tests; suite 312/312, fmt+clippy clean.
+  2. 34714f4 ipk tar.gz format (busybox-ar rejected by opkg 24.10) —
+     clean-VM install now works: 46 files, service starts, gonuts-export
+     shipped.
+  3. a7c2f06 dual-stack [::]:2121 listener — [::1] probes answer (were
+     dead on 0.0.0.0-only bind); Go ":2121" parity with 0.0.0.0 fallback.
+  4. b223437 get_client_ip to_canonical() — IPv4 peers on the dual-stack
+     listener surfaced as ::ffff:10.99.99.100 and never matched
+     dhcp.leases/ARP (mac-address-lookup-failed on every payment; found
+     in run2's first file before relaunch).
+  5. prta 2edf329 harness: configure_mint aborts instead of mv-ing an
+     empty config (bootstraps default via restart first); --backend flag;
+     ensure_router_curl installs curl (was missing on the VM in BOTH
+     runs); restart_backend probes curl-else-wget; health window 20→600
+     chars (rust event puts kind at ~char 180).
+- VERIFICATION: clean-VM install → service up :::2121, config.json
+  created, [::1] answers; run-local --backend=rust-basic
+  test_access_denominated.py 3/3 PASSED (run1's price_per_step trio —
+  restart + payment + pricing asserts all green).
+- Full rust-run2 (107 files) relaunched against b223437 ipk →
+  results/rust-run2/. Side-by-side matrix vs go-baseline pending run2
+  completion.
+- Open framework issue (not fixed, deliberate): 15 test files gate
+  skips on `backend.is_rust` which is narrowly type=="rust"
+  (tollgate-rs) — under rust-basic those guards never fire. Left as-is
+  for now: rust-basic is a Go port, running the assertions is the
+  parity signal; revisit per-test if a calibration skip proves needed.
