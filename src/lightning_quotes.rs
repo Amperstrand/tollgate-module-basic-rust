@@ -119,11 +119,26 @@ impl QuoteStore {
     }
 }
 
+/// Durable atomic snapshot: tmp write → fsync → rename → dir fsync.
+///
+/// Without both syncs a power cut can leave the rename (or the tmp
+/// contents) only in the page cache, resurrecting the previous snapshot
+/// after restart — losing invoices and minted/granted transitions that
+/// were reported as persisted (AGENTS.md L31-L38).
 fn persist(path: &Path, quotes: &[LightningQuoteRecord]) -> std::io::Result<()> {
+    use std::io::Write;
+
     let json = serde_json::to_string_pretty(quotes)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, json).and_then(|_| std::fs::rename(&tmp, path))
+    let mut file = std::fs::File::create(&tmp)?;
+    file.write_all(json.as_bytes())?;
+    file.sync_all()?;
+    std::fs::rename(&tmp, path)?;
+    if let Some(dir) = path.parent() {
+        std::fs::File::open(dir)?.sync_all()?;
+    }
+    Ok(())
 }
 
 pub fn now_secs() -> u64 {
