@@ -221,3 +221,47 @@ Format: timestamp | commit | test command | failure | root cause | change | rete
   — concurrent runners on this host overwrite each other's per-file
   junit (run2b files 1-3 lost to finale's smoke). Prefix by PID or
   per-run dir before the next multi-lane day.
+
+2026-09-28 00:15 UTC | rust 5a65e3e+390f3d2 / prta 52deacf+8c568a7 | residue + go-baseline2 + G1-G3
+- RESIDUE SWEEP (rust-run2d, pinned binary, quiet host): 6/6 files
+  PASS incl. the lost cli files and both one-offs (nds_deauth_blocks_again,
+  cli_health). 12 inconclusive → all pass. junit paths now PID-suffixed
+  with a .latest symlink (prta 52deacf).
+- G1 CLOSED (rust 5a65e3e): GET /identity + POST /identity/reveal-seed,
+  Go PR #193 parity. NIP-06 (BIP39 seed + BIP32 m/44'/1237'/0'/0/0),
+  bech32 npub, HKDF-SHA256 domain hashes for CGNAT IPv4 / per-iface MACs /
+  six-word BIP39 passwords. Golden vectors generated from Go's
+  identity.DeriveFromMnemonic — byte-identical for two standard mnemonics
+  (caught a real bug: RFC 5869 expand counter byte was missing; first
+  draft derived wrong IPv4 for every key). VM-verified: pr193 8/8 via
+  PRTA. Isolated musl cost +114,688 B (+1.1%, parent-commit worktree
+  build measured).
+- G2 CLOSED (rust 390f3d2): not a missing feature — Go has no
+  `wallet send` either; Go's cobra prints wallet HELP to stdout (exit 0)
+  for unknown/missing subcommand, so PRTA skips. Rust client errored to
+  stderr with empty stdout → {'raw': ''} → fail. Now mirrors Go's help
+  output; VM-verified: mint_payout takes the identical skip branch.
+- G3 CLOSED (prta 8c568a7): neither backend implements NUT-24 /pay;
+  go-baseline "passes" for the nut18 file were curl-missing skips. The
+  one failing test lacked its siblings' _nut24_supported gate — gated
+  now. VM-verified: 1 pass + 4 skips, matching Go's shape.
+- GO BASELINE2 (clean harness: curl installed, guarded configure_mint):
+  231 pass / 244 skip / 37 bad (baseline1: 215/243/54; 26 fixed, 9
+  newly-exposed). Go's failures now real: the documented wallet.db
+  mint-state class ("TollGate is initializing. No reachable mints" —
+  price_per_step trio, concurrent single-token 0/5, case-insensitive
+  mint), ln-invoice 429 rate-limit family x6, degraded-mode lifecycle
+  x7, ssl-443 x2, LuCI 307, bash_client x5 (env), https-asserts x2
+  (local http lab mint).
+- FINAL SIDE-BY-SIDE (rust run2..2d + rust-verify-g123 vs go-baseline2,
+  446 common): rust 170 pass / 265 skip / 15 bad vs go 231/244/37.
+  Rust PASSES 11 where Go fails (payment core: price trio, concurrent
+  single-token, ln-invoice family x4, case-insensitive mints, wallet
+  balance, block-all-mints-stays-up). Go passes 1 where rust fails
+  (backend_no_500_during_degraded). Rust's remaining bad = 8 shared/env
+  (LuCI, bash_client x5, keyset test bug, ssl x2) + 6 degraded-mode
+  lifecycle family — of which Go fails 5 too. NEXT MILESTONE TARGET:
+  degraded-mode enter/advertise/recover lifecycle parity (per-test
+  disentangle of product gap vs lab-mint-blocking harness behavior).
+- Note: rust skips are ~21 higher than go's solely because 25+ go_only
+  files now correctly skip under the rust family (conftest 33eb8a0).
