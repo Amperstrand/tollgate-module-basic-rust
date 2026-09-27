@@ -69,8 +69,8 @@ pub async fn handle_create_ln_invoice(
         );
     }
 
-    let mint_url = match state.config.accepted_mints.first() {
-        Some(m) => m.url.clone(),
+    let mint = match state.config.accepted_mints.first() {
+        Some(m) => m,
         None => {
             return json_response(
                 StatusCode::BAD_REQUEST,
@@ -78,6 +78,28 @@ pub async fn handle_create_ln_invoice(
             );
         }
     };
+    let mint_url = mint.url.clone();
+
+    // AGENTS.md: validations possible locally run before any value moves.
+    // An invoice below price_per_step/min_purchase_steps would settle to a
+    // zero-step session after the mint already moved the paid value
+    // (mirrors precheck_payment in pay.rs).
+    let price_per_step = mint.price_per_step.max(1);
+    let min_steps = mint.min_purchase_steps.max(1);
+    let steps = req.amount / price_per_step;
+    if steps < min_steps {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({
+                "error": format!(
+                    "amount below minimum purchase: {steps} step(s) at {price_per_step} sat/step, minimum is {min_steps} step(s)"
+                ),
+                "steps": steps,
+                "min_steps": min_steps,
+                "price_per_step": price_per_step,
+            }),
+        );
+    }
 
     // The MAC is resolved at creation time and stored with the quote: the
     // monitor that later grants the session (possibly after a restart)

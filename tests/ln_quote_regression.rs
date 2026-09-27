@@ -5,7 +5,6 @@
 use tollgate_module_basic_rust::lightning_quotes::{
     now_secs, LightningQuoteRecord, QuoteStore, QUOTES_FILE,
 };
-
 fn quote_record(quote: &str) -> LightningQuoteRecord {
     LightningQuoteRecord {
         quote: quote.to_string(),
@@ -64,4 +63,73 @@ async fn remove_persists_and_is_noop_for_absent_records() {
 
     // Absent record: no error, no file churn.
     store.remove("nope").await.unwrap();
+}
+
+/// PR #22 r4070018382 / PR #23 r4070120792 (P1): sub-minimum amounts must
+/// be rejected BEFORE a payable invoice is created — otherwise settlement
+/// mints the paid value and grants a zero-step (unusable) session.
+#[tokio::test]
+#[serial_test::serial]
+async fn sub_minimum_amount_rejected_before_invoice_creation() {
+    let cfg_dir = tempfile::tempdir().unwrap();
+    std::env::set_var("TOLLGATE_TEST_CONFIG_DIR", cfg_dir.path());
+
+    let mut config = tollgate_module_basic_rust::config::Config::default();
+    config.accepted_mints = vec![tollgate_module_basic_rust::config::MintConfig {
+        url: "https://mint.example".to_string(),
+        price_per_step: 2,
+        min_purchase_steps: 1,
+        ..tollgate_module_basic_rust::config::MintConfig::default_production(
+            "https://mint.example",
+        )
+    }];
+
+    let identity = std::sync::Arc::new(
+        tollgate_module_basic_rust::identity::MerchantIdentity::load_or_generate().unwrap(),
+    );
+    let state = tollgate_module_basic_rust::http::AppState {
+        config: std::sync::Arc::new(config),
+        identity,
+        wallet: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
+        sessions: std::sync::Arc::new(tokio::sync::Mutex::new(
+            tollgate_module_basic_rust::session::SessionManager::new(),
+        )),
+        portal: std::sync::Arc::new(tollgate_module_basic_rust::portal::NdsPortal::new()),
+        verifier: std::sync::Arc::new(
+            tollgate_module_basic_rust::wallet::verify::TokenVerifier::new(vec![]),
+        ),
+        rate_limiter: std::sync::Arc::new(
+            tollgate_module_basic_rust::rate_limiter::RateLimiter::new(1000),
+        ),
+        ln_quotes: std::sync::Arc::new(QuoteStore::load(cfg_dir.path())),
+    };
+
+    let addr: std::net::SocketAddr = "127.0.0.1:59999".parse().unwrap();
+    let response = tollgate_module_basic_rust::http::routes::ln_invoice::handle_create_ln_invoice(
+        axum::extract::State(state),
+        axum::http::HeaderMap::new(),
+        axum::extract::ConnectInfo(addr),
+        axum::Json(tollgate_module_basic_rust::http::routes::ln_invoice::CreateInvoiceRequest {
+            amount: 1,
+            unit: None,
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::BAD_REQUEST,
+        "1 sat against a 2 sat/step mint must be rejected"
+    );
+    let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("below minimum purchase"),
+        "rejection must name the minimum-purchase reason, got: {body}"
+    );
+
+    std::env::remove_var("TOLLGATE_TEST_CONFIG_DIR");
 }
