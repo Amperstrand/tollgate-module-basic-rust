@@ -240,7 +240,10 @@ async fn main() {
     let http_state = state.clone();
     let http_handle = tokio::spawn(async move {
         let app = http::create_router((*http_state).clone());
-        let listener = match tokio::net::TcpListener::bind("0.0.0.0:2121").await {
+        // Go binds ":2121" — dual-stack, so [::1]:2121 answers too (PRTA's
+        // backend_url probes the IPv6 loopback). Mirror that: [::] first
+        // (dual-stack on Linux), fall back to IPv4-only when IPv6 is off.
+        let listener = match tokio::net::TcpListener::bind("[::]:2121").await {
             Ok(l) => l,
             Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
                 tracing::error!(
@@ -253,11 +256,17 @@ async fn main() {
                 std::process::exit(1);
             }
             Err(e) => {
-                tracing::error!(error = %e, "failed to bind 0.0.0.0:2121");
-                std::process::exit(1);
+                tracing::warn!(error = %e, "IPv6 bind failed, falling back to 0.0.0.0");
+                match tokio::net::TcpListener::bind("0.0.0.0:2121").await {
+                    Ok(l) => l,
+                    Err(e) => {
+                        tracing::error!(error = %e, "failed to bind 0.0.0.0:2121");
+                        std::process::exit(1);
+                    }
+                }
             }
         };
-        tracing::info!("HTTP server listening on 0.0.0.0:2121");
+        tracing::info!("HTTP server listening on :2121 (dual-stack)");
         axum::serve(
             listener,
             app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
