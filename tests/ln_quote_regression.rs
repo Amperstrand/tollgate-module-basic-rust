@@ -269,3 +269,40 @@ async fn settlement_uses_pricing_terms_frozen_at_creation() {
     assert_eq!(session.allotment, 999, "stored allotment must win");
     assert_eq!(session.metric, "bytes", "stored metric must win");
 }
+
+/// PR #22 r4070018400 / PR #23 r4070120831: the monitor sweeps every 5s;
+/// a rewrite on every tick is ~17k flash writes/day on OpenWrt while
+/// idle. A sweep that removes nothing must not touch the file.
+#[tokio::test]
+async fn sweep_touches_nothing_when_no_record_is_removed() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = QuoteStore::load(dir.path());
+    store.upsert(quote_record("live")).await.unwrap();
+
+    let path = dir.path().join(QUOTES_FILE);
+    let before = std::fs::metadata(&path).unwrap();
+    let content_before = std::fs::read(&path).unwrap();
+
+    // Exceed the kernel's coarse timestamp granularity so a rewrite
+    // would be observable in mtime.
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    for _ in 0..3 {
+        store.sweep().await;
+    }
+
+    let after = std::fs::metadata(&path).unwrap();
+    assert_eq!(
+        before.modified().unwrap(),
+        after.modified().unwrap(),
+        "no-op sweep must not rewrite the quote file"
+    );
+    assert_eq!(content_before, std::fs::read(&path).unwrap());
+
+    // A sweep that DOES remove a terminal record still persists.
+    let mut expired_granted = quote_record("done");
+    expired_granted.expiry = now_secs() - 1;
+    expired_granted.session_granted = true;
+    store.upsert(expired_granted).await.unwrap();
+    store.sweep().await;
+    assert!(store.get("done").await.is_none());
+}

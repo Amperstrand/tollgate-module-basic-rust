@@ -9,7 +9,7 @@
 //! once: mint (once, tracked by `minted_sat`), session (durable before
 //! the gate attempt), gate, then `session_granted`.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -58,7 +58,9 @@ impl LightningQuoteRecord {
 
 pub struct QuoteStore {
     path: PathBuf,
-    quotes: RwLock<HashMap<String, LightningQuoteRecord>>,
+    // BTreeMap: deterministic snapshot content, so an unchanged store
+    // serializes to identical bytes (no gratuitous flash rewrites).
+    quotes: RwLock<BTreeMap<String, LightningQuoteRecord>>,
 }
 
 impl QuoteStore {
@@ -122,7 +124,13 @@ impl QuoteStore {
     pub async fn sweep(&self) {
         let now = now_secs();
         let mut quotes = self.quotes.write().await;
+        let before = quotes.len();
         quotes.retain(|_, q| !(q.expired(now) || q.stale(now)) || !q.session_granted);
+        if quotes.len() == before {
+            // Nothing removed: rewriting would wear OpenWrt flash ~17k
+            // times/day while idle (AGENTS.md flash-wear rule).
+            return;
+        }
         let snapshot: Vec<LightningQuoteRecord> = quotes.values().cloned().collect();
         if let Err(e) = persist(&self.path, &snapshot) {
             tracing::warn!(error = %e, "failed to persist lightning quotes sweep");
