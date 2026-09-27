@@ -364,7 +364,7 @@ mod tests {
     async fn store_survives_reload_and_tolerates_corrupt_file() {
         let dir = tempfile::tempdir().unwrap();
         let store = QuoteStore::load(dir.path());
-        store.upsert(record("q1", false)).await;
+        store.upsert(record("q1", false)).await.unwrap();
 
         let reloaded = QuoteStore::load(dir.path());
         assert_eq!(reloaded.get("q1").await.unwrap().quote, "q1");
@@ -377,7 +377,7 @@ mod tests {
     async fn settle_grants_session_and_gate_without_reminting() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(QuoteStore::load(dir.path()));
-        store.upsert(record("q1", true)).await;
+        store.upsert(record("q1", true)).await.unwrap();
 
         let mut wallet =
             crate::wallet::wallet::TollWallet::new([0u8; 64], vec![], dir.path().to_path_buf());
@@ -420,7 +420,7 @@ mod tests {
     async fn settle_with_failing_gate_retries_without_reminting() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(QuoteStore::load(dir.path()));
-        store.upsert(record("q2", true)).await;
+        store.upsert(record("q2", true)).await.unwrap();
 
         let wallet =
             crate::wallet::wallet::TollWallet::new([0u8; 64], vec![], dir.path().to_path_buf());
@@ -475,13 +475,13 @@ mod tests {
 
         let mut expired = record("old", false);
         expired.expiry = now_secs() - 1;
-        store.upsert(expired).await;
+        store.upsert(expired).await.unwrap();
 
         let mut granted = record("done", true);
         granted.session_granted = true;
-        store.upsert(granted).await;
+        store.upsert(granted).await.unwrap();
 
-        store.upsert(record("live", false)).await;
+        store.upsert(record("live", false)).await.unwrap();
 
         let pending: Vec<String> = store
             .ungranted()
