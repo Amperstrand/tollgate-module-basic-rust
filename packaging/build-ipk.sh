@@ -181,10 +181,14 @@ echo "2.0" > "$STAGE/debian-binary"
 IPK_NAME="tollgate-wrt_${VERSION}_${ARCH}.ipk"
 IPK_PATH="$OUTPUT_DIR/$IPK_NAME"
 
-ar rD "$IPK_PATH" \
-    "$STAGE/debian-binary" \
-    "$STAGE/control.tar.gz" \
-    "$STAGE/data.tar.gz" 2>&1
+# OpenWrt opkg-build ipk format: a gzipped tar wrapping debian-binary +
+# data.tar.gz + control.tar.gz. (opkg also reads the Debian ar format, but
+# opkg 24.10 in the field rejects ar-wrapped ipks built by busybox ar, and
+# OpenWrt-side tooling assumes the tar.gz layout.)
+rm -f "$IPK_PATH"
+( cd "$STAGE" && tar --format=gnu --owner=0 --group=0 --numeric-owner \
+    -cf - ./debian-binary ./data.tar.gz ./control.tar.gz \
+    | gzip -n > "$IPK_PATH" )
 
 echo ""
 echo "=== IPK BUILD COMPLETE ==="
