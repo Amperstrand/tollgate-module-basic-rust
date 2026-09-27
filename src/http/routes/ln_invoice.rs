@@ -69,8 +69,8 @@ pub async fn handle_create_ln_invoice(
         );
     }
 
-    let mint_url = match state.config.accepted_mints.first() {
-        Some(m) => m.url.clone(),
+    let mint = match state.config.accepted_mints.first() {
+        Some(m) => m,
         None => {
             return json_response(
                 StatusCode::BAD_REQUEST,
@@ -78,6 +78,31 @@ pub async fn handle_create_ln_invoice(
             );
         }
     };
+    // Store the CDK-canonical identity: a quote surviving a restart must
+    // match the wallet map and config even if the configured spelling
+    // changes to an equivalent alias (AGENTS.md mint-URL canonicalization).
+    let mint_url = crate::wallet::canonical_mint_url(&mint.url);
+
+    // AGENTS.md: validations possible locally run before any value moves.
+    // An invoice below price_per_step/min_purchase_steps would settle to a
+    // zero-step session after the mint already moved the paid value
+    // (mirrors precheck_payment in pay.rs).
+    let price_per_step = mint.price_per_step.max(1);
+    let min_steps = mint.min_purchase_steps.max(1);
+    let steps = req.amount / price_per_step;
+    if steps < min_steps {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({
+                "error": format!(
+                    "amount below minimum purchase: {steps} step(s) at {price_per_step} sat/step, minimum is {min_steps} step(s)"
+                ),
+                "steps": steps,
+                "min_steps": min_steps,
+                "price_per_step": price_per_step,
+            }),
+        );
+    }
 
     // The MAC is resolved at creation time and stored with the quote: the
     // monitor that later grants the session (possibly after a restart)
@@ -139,10 +164,33 @@ pub async fn handle_create_ln_invoice(
                 created_at: now,
                 expiry: info.expiry,
                 minted: false,
+                allotment: steps * state.config.step_size,
+                metric: state.config.metric.clone(),
                 allotment_added: false,
                 session_granted: false,
             };
-            state.ln_quotes.upsert(record).await;
+            // AGENTS.md: never return a payable invoice whose record is
+            // not durable — a restart would make it unsettleable.
+            if let Err(e) = state.ln_quotes.upsert(record).await {
+                tracing::error!(error = %e, "ln-invoice: quote record not durable; invoice withheld");
+                let _ = state.ln_quotes.remove(&info.id).await;
+                return json_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    LightningInvoiceResponse {
+                        status: 0,
+                        quote: String::new(),
+                        invoice: String::new(),
+                        mint_url: mint_url.clone(),
+                        amount: req.amount,
+                        expiry: 0,
+                        state: "error".to_string(),
+                        access_granted: false,
+                        allotment: 0,
+                        metric: String::new(),
+                        error: "quote persistence failed".to_string(),
+                    },
+                );
+            }
 
             json_response(
                 StatusCode::OK,
@@ -212,14 +260,22 @@ pub async fn handle_get_ln_invoice(
     };
 
     if stored.session_granted {
-        let price_per_step = state
-            .config
-            .accepted_mints
-            .iter()
-            .find(|m| m.url.trim_end_matches('/') == stored.mint_url.trim_end_matches('/'))
-            .map(|m| m.price_per_step.max(1))
-            .unwrap_or(1);
-        let allotment = (stored.amount_sat / price_per_step) * state.config.step_size;
+        // Terms frozen at creation; legacy records (allotment == 0) fall
+        // back to current config pricing.
+        let allotment = if stored.allotment > 0 {
+            stored.allotment
+        } else {
+            let price_per_step =
+                crate::lightning_quotes::find_mint_config(&state.config, &stored.mint_url)
+                    .map(|m| m.price_per_step.max(1))
+                    .unwrap_or(1);
+            (stored.amount_sat / price_per_step) * state.config.step_size
+        };
+        let metric = if stored.metric.is_empty() {
+            state.config.metric.clone()
+        } else {
+            stored.metric.clone()
+        };
         return json_response(
             StatusCode::OK,
             LightningInvoiceResponse {
@@ -232,7 +288,7 @@ pub async fn handle_get_ln_invoice(
                 state: "paid".to_string(),
                 access_granted: true,
                 allotment,
-                metric: state.config.metric.clone(),
+                metric,
                 error: String::new(),
             },
         );
@@ -241,13 +297,14 @@ pub async fn handle_get_ln_invoice(
     let (state_str, expiry) = {
         let wallet_guard = state.wallet.read().await;
         match wallet_guard.as_ref() {
-            Some(wallet) => match wallet.check_mint_quote(&stored.mint_url, &q.quote).await {
-                Ok(raw) => {
-                    let lower = raw.to_lowercase();
-                    let is_paid = lower.contains("paid") || lower.contains("issued");
-                    let s = if is_paid { "paid" } else { "unpaid" };
-                    (s.to_string(), stored.expiry)
-                }
+            Some(wallet) => match wallet
+                .check_mint_quote_state(&stored.mint_url, &q.quote)
+                .await
+            {
+                Ok(raw) => (
+                    crate::lightning_quotes::quote_state_display(raw).to_string(),
+                    stored.expiry,
+                ),
                 Err(_) => ("unpaid".to_string(), stored.expiry),
             },
             None => ("unpaid".to_string(), stored.expiry),

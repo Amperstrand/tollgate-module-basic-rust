@@ -37,6 +37,6 @@ pub mod verify;
 #[allow(clippy::module_inception)]
 pub mod wallet;
 
-pub use wallet::TollWallet;
+pub use wallet::{canonical_mint_url, TollWallet};
 
 pub use crate::error::WalletError;
