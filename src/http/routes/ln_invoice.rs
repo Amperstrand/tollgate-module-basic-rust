@@ -265,12 +265,10 @@ pub async fn handle_get_ln_invoice(
         let allotment = if stored.allotment > 0 {
             stored.allotment
         } else {
-            let price_per_step = crate::lightning_quotes::find_mint_config(
-                &state.config,
-                &stored.mint_url,
-            )
-            .map(|m| m.price_per_step.max(1))
-            .unwrap_or(1);
+            let price_per_step =
+                crate::lightning_quotes::find_mint_config(&state.config, &stored.mint_url)
+                    .map(|m| m.price_per_step.max(1))
+                    .unwrap_or(1);
             (stored.amount_sat / price_per_step) * state.config.step_size
         };
         let metric = if stored.metric.is_empty() {
@@ -299,7 +297,10 @@ pub async fn handle_get_ln_invoice(
     let (state_str, expiry) = {
         let wallet_guard = state.wallet.read().await;
         match wallet_guard.as_ref() {
-            Some(wallet) => match wallet.check_mint_quote_state(&stored.mint_url, &q.quote).await {
+            Some(wallet) => match wallet
+                .check_mint_quote_state(&stored.mint_url, &q.quote)
+                .await
+            {
                 Ok(raw) => (
                     crate::lightning_quotes::quote_state_display(raw).to_string(),
                     stored.expiry,

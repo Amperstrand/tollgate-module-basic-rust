@@ -318,10 +318,25 @@ pub async fn settle_quote(
     };
 
     if !record.allotment_added {
+        // Crash idempotency across the two files (sessions.json and the
+        // quote store cannot be written atomically together): the grant
+        // key `ln:<quote>` rides IN the session record, so recovery can
+        // prove the allotment already reached disk after a crash between
+        // the session flush and the quote-marker write.
+        let grant_id = format!("ln:{}", record.quote);
         let mut sm = sessions.lock().await;
-        sm.add_allotment(&record.mac, &metric, allotment, 3600);
-        if let Err(e) = sm.save_to_disk(&crate::config::config_dir()) {
-            tracing::warn!(error = %e, "session save debounced; monitor flush will persist");
+        if !sm.has_grant(&record.mac, &grant_id) {
+            sm.add_allotment(&record.mac, &metric, allotment, 3600, Some(&grant_id));
+            // The session grant must be DURABLE before the quote marker
+            // advances (AGENTS.md): a debounced save returns Ok without
+            // writing, and a crash in that window used to leave
+            // allotment_added=true durable while the allotment was not —
+            // recovery then skipped re-adding it, losing the paid session.
+            if let Err(e) = sm.save_now(&crate::config::config_dir()) {
+                tracing::warn!(error = %e, "session save failed; retrying next tick");
+                drop(sm);
+                return SettleOutcome::GrantFailed;
+            }
         }
         drop(sm);
         record.allotment_added = true;
@@ -463,7 +478,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn settle_grants_session_and_gate_without_reminting() {
+        let cfg_dir = tempfile::tempdir().unwrap();
+        std::env::set_var("TOLLGATE_TEST_CONFIG_DIR", cfg_dir.path());
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(QuoteStore::load(dir.path()));
         store.upsert(record("q1", true)).await.unwrap();
@@ -506,7 +524,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn settle_with_failing_gate_retries_without_reminting() {
+        let cfg_dir = tempfile::tempdir().unwrap();
+        std::env::set_var("TOLLGATE_TEST_CONFIG_DIR", cfg_dir.path());
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(QuoteStore::load(dir.path()));
         store.upsert(record("q2", true)).await.unwrap();
@@ -592,7 +613,10 @@ mod tests {
         store.sweep().await;
         assert!(store.get("old").await.is_some());
         assert!(store.get("live").await.is_some());
-        assert!(store.get("done").await.is_none(), "granted+expired is dropped");
+        assert!(
+            store.get("done").await.is_none(),
+            "granted+expired is dropped"
+        );
     }
 
     #[test]

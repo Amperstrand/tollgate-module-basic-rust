@@ -1,7 +1,6 @@
 //! Regression tests pinning the Codex review findings from PRs #22/#23
 //! (merged 5df33eb / 6c68e21). Each test names the failure mode it guards.
 
-
 use tollgate_module_basic_rust::lightning_quotes::{
     now_secs, LightningQuoteRecord, QuoteStore, QUOTES_FILE,
 };
@@ -81,9 +80,7 @@ async fn sub_minimum_amount_rejected_before_invoice_creation() {
         url: "https://mint.example".to_string(),
         price_per_step: 2,
         min_purchase_steps: 1,
-        ..tollgate_module_basic_rust::config::MintConfig::default_production(
-            "https://mint.example",
-        )
+        ..tollgate_module_basic_rust::config::MintConfig::default_production("https://mint.example")
     }];
 
     let identity = std::sync::Arc::new(
@@ -111,10 +108,12 @@ async fn sub_minimum_amount_rejected_before_invoice_creation() {
         axum::extract::State(state),
         axum::http::HeaderMap::new(),
         axum::extract::ConnectInfo(addr),
-        axum::Json(tollgate_module_basic_rust::http::routes::ln_invoice::CreateInvoiceRequest {
-            amount: 1,
-            unit: None,
-        }),
+        axum::Json(
+            tollgate_module_basic_rust::http::routes::ln_invoice::CreateInvoiceRequest {
+                amount: 1,
+                unit: None,
+            },
+        ),
     )
     .await;
 
@@ -123,7 +122,9 @@ async fn sub_minimum_amount_rejected_before_invoice_creation() {
         axum::http::StatusCode::BAD_REQUEST,
         "1 sat against a 2 sat/step mint must be rejected"
     );
-    let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+    let body = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap();
     let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert!(
         body["error"]
@@ -149,10 +150,7 @@ async fn alias_spelled_mint_resolves_to_single_registered_wallet() {
         dir.path().to_path_buf(),
     );
 
-    wallet
-        .ensure_mint("https://mint.example")
-        .await
-        .unwrap();
+    wallet.ensure_mint("https://mint.example").await.unwrap();
     wallet
         .ensure_mint("HTTPS://Mint.Example/")
         .await
@@ -202,14 +200,23 @@ struct FakePortal {
 
 #[async_trait::async_trait]
 impl tollgate_module_basic_rust::portal::CaptivePortal for FakePortal {
-    async fn grant_access(&self, mac: &str) -> Result<(), tollgate_module_basic_rust::error::AppError> {
+    async fn grant_access(
+        &self,
+        mac: &str,
+    ) -> Result<(), tollgate_module_basic_rust::error::AppError> {
         self.granted.lock().unwrap().push(mac.to_string());
         Ok(())
     }
-    async fn revoke_access(&self, _mac: &str) -> Result<(), tollgate_module_basic_rust::error::AppError> {
+    async fn revoke_access(
+        &self,
+        _mac: &str,
+    ) -> Result<(), tollgate_module_basic_rust::error::AppError> {
         Ok(())
     }
-    async fn poll_usage(&self, _mac: &str) -> Result<(u64, u64), tollgate_module_basic_rust::error::AppError> {
+    async fn poll_usage(
+        &self,
+        _mac: &str,
+    ) -> Result<(u64, u64), tollgate_module_basic_rust::error::AppError> {
         Ok((0, 0))
     }
     async fn is_authenticated(&self, _mac: &str) -> bool {
@@ -222,9 +229,12 @@ impl tollgate_module_basic_rust::portal::CaptivePortal for FakePortal {
 /// changed) config — a config change + restart while a quote is payable
 /// used to grant a different product than the portal displayed.
 #[tokio::test]
+#[serial_test::serial]
 async fn settlement_uses_pricing_terms_frozen_at_creation() {
     use tollgate_module_basic_rust::lightning_quotes::{settle_quote, SettleOutcome};
 
+    let cfg_dir = tempfile::tempdir().unwrap();
+    std::env::set_var("TOLLGATE_TEST_CONFIG_DIR", cfg_dir.path());
     let dir = tempfile::tempdir().unwrap();
     let store = std::sync::Arc::new(QuoteStore::load(dir.path()));
 
@@ -248,7 +258,8 @@ async fn settlement_uses_pricing_terms_frozen_at_creation() {
         vec![],
         dir.path().to_path_buf(),
     );
-    let sessions = tokio::sync::Mutex::new(tollgate_module_basic_rust::session::SessionManager::new());
+    let sessions =
+        tokio::sync::Mutex::new(tollgate_module_basic_rust::session::SessionManager::new());
     let portal = FakePortal {
         granted: std::sync::Mutex::new(vec![]),
     };
@@ -305,4 +316,138 @@ async fn sweep_touches_nothing_when_no_record_is_removed() {
     store.upsert(expired_granted).await.unwrap();
     store.sweep().await;
     assert!(store.get("done").await.is_none());
+}
+
+/// PR #22 r4070018369 (P1): the quote marker must not advance until the
+/// session grant is durably recoverable. Pre-fix, a session save within
+/// the previous 5s made the debounced `save_to_disk` return Ok without
+/// writing — settle persisted `allotment_added = true` and a "power
+/// loss" lost the paid session while recovery skipped re-adding it.
+#[tokio::test]
+#[serial_test::serial]
+async fn session_grant_survives_power_loss_despite_open_debounce_window() {
+    use tollgate_module_basic_rust::lightning_quotes::{settle_quote, SettleOutcome};
+
+    let cfg_dir = tempfile::tempdir().unwrap();
+    std::env::set_var("TOLLGATE_TEST_CONFIG_DIR", cfg_dir.path());
+    let dir = tempfile::tempdir().unwrap();
+    let store = std::sync::Arc::new(QuoteStore::load(dir.path()));
+
+    // Open the debounce window: a session write happened <5s ago, so a
+    // debounced save is a no-op.
+    let sessions =
+        tokio::sync::Mutex::new(tollgate_module_basic_rust::session::SessionManager::new());
+    sessions.lock().await.save_to_disk(cfg_dir.path()).unwrap();
+
+    let mut rec = quote_record("durable-grant");
+    rec.minted = true;
+    store.upsert(rec).await.unwrap();
+
+    let config = tollgate_module_basic_rust::config::Config::default();
+    let wallet = tollgate_module_basic_rust::wallet::TollWallet::new(
+        [0u8; 64],
+        vec![],
+        dir.path().to_path_buf(),
+    );
+    let portal = FakePortal {
+        granted: std::sync::Mutex::new(vec![]),
+    };
+
+    let outcome = settle_quote(
+        store.clone(),
+        &wallet,
+        &sessions,
+        &portal,
+        &config,
+        store.get("durable-grant").await.unwrap(),
+    )
+    .await;
+    assert_eq!(
+        outcome,
+        SettleOutcome::Granted {
+            allotment: 10 * config.step_size
+        }
+    );
+
+    // "Power loss": nothing survives but the files on disk.
+    drop(sessions);
+    drop(store);
+    let reloaded =
+        tollgate_module_basic_rust::session::SessionManager::load_from_disk(cfg_dir.path());
+    let session = reloaded
+        .get_session("aa:bb:cc:dd:ee:ff")
+        .expect("paid session must be durable before the quote marker advances");
+    assert_eq!(session.allotment, 10 * config.step_size);
+}
+
+/// PR #23 r4070120800 (P1): a crash after sessions.json is written but
+/// before the quote-marker upsert must not double-apply the allotment on
+/// recovery. The `ln:<quote>` grant key inside the session record is the
+/// durable idempotency witness.
+#[tokio::test]
+#[serial_test::serial]
+async fn crash_between_session_flush_and_quote_marker_does_not_double_grant() {
+    use tollgate_module_basic_rust::lightning_quotes::{settle_quote, SettleOutcome};
+
+    let cfg_dir = tempfile::tempdir().unwrap();
+    std::env::set_var("TOLLGATE_TEST_CONFIG_DIR", cfg_dir.path());
+    let dir = tempfile::tempdir().unwrap();
+    let store = std::sync::Arc::new(QuoteStore::load(dir.path()));
+
+    // Quote still says allotment_added=false (the marker upsert "crashed").
+    let mut rec = quote_record("dq");
+    rec.minted = true;
+    rec.allotment = 999;
+    rec.metric = "bytes".to_string();
+    store.upsert(rec).await.unwrap();
+
+    // ...but the session flush landed, carrying the grant key. Seeded as
+    // raw JSON so the pre-fix loader (which drops the unknown field)
+    // exercises the same scenario.
+    let now = now_secs();
+    let seeded = serde_json::json!([{
+        "mac": "aa:bb:cc:dd:ee:ff",
+        "allotment": 999,
+        "used": 0,
+        "metric": "bytes",
+        "expiry": now + 3600,
+        "granted_at": now,
+        "last_grant_id": "ln:dq",
+    }]);
+    std::fs::write(
+        cfg_dir.path().join("sessions.json"),
+        serde_json::to_string_pretty(&seeded).unwrap(),
+    )
+    .unwrap();
+
+    let recovered = tokio::sync::Mutex::new(
+        tollgate_module_basic_rust::session::SessionManager::load_from_disk(cfg_dir.path()),
+    );
+    let config = tollgate_module_basic_rust::config::Config::default();
+    let wallet = tollgate_module_basic_rust::wallet::TollWallet::new(
+        [0u8; 64],
+        vec![],
+        dir.path().to_path_buf(),
+    );
+    let portal = FakePortal {
+        granted: std::sync::Mutex::new(vec![]),
+    };
+
+    let outcome = settle_quote(
+        store.clone(),
+        &wallet,
+        &recovered,
+        &portal,
+        &config,
+        store.get("dq").await.unwrap(),
+    )
+    .await;
+    assert_eq!(outcome, SettleOutcome::Granted { allotment: 999 });
+
+    let guard = recovered.lock().await;
+    let session = guard.get_session("aa:bb:cc:dd:ee:ff").unwrap();
+    assert_eq!(
+        session.allotment, 999,
+        "recovery must not re-apply an allotment that already reached sessions.json"
+    );
 }

@@ -35,6 +35,14 @@ pub struct CustomerSession {
     pub expiry: u64,
     /// Unix timestamp when the session was granted.
     pub granted_at: u64,
+    /// Durable idempotency key for the last quoted grant applied to this
+    /// session (e.g. `ln:<quote-id>`). Lets settlement prove an allotment
+    /// already reached `sessions.json` after a crash between the session
+    /// flush and the quote-marker write — the two files cannot be written
+    /// atomically together, so the key lives in the session record.
+    /// Absent on non-Lightning sessions (identical bytes to before).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_grant_id: Option<String>,
 }
 
 /// Session manager with disk persistence to `sessions.json`.
@@ -76,6 +84,7 @@ impl SessionManager {
             metric: metric.to_string(),
             expiry: now + duration_secs,
             granted_at: now,
+            last_grant_id: None,
         };
         self.sessions.insert(mac.to_string(), session.clone());
         session
@@ -84,13 +93,15 @@ impl SessionManager {
     /// Add allotment to an existing session, or create a new one if none
     /// exists. Returns `true` if an existing session was extended, `false`
     /// if a new session was created. Extending resets `used` to 0 and
-    /// refreshes `granted_at` / `expiry`.
+    /// refreshes `granted_at` / `expiry`. `grant_id`, when set, is the
+    /// durable idempotency key checked by `has_grant`.
     pub fn add_allotment(
         &mut self,
         mac: &str,
         metric: &str,
         amount: u64,
         duration_secs: u64,
+        grant_id: Option<&str>,
     ) -> bool {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -102,13 +113,31 @@ impl SessionManager {
                 session.granted_at = now;
                 session.used = 0;
                 session.expiry = now + duration_secs;
+                if let Some(id) = grant_id {
+                    session.last_grant_id = Some(id.to_string());
+                }
                 true
             }
             None => {
                 self.create_session(mac, amount, metric, duration_secs);
+                if let Some(id) = grant_id {
+                    if let Some(session) = self.sessions.get_mut(mac) {
+                        session.last_grant_id = Some(id.to_string());
+                    }
+                }
                 false
             }
         }
+    }
+
+    /// Whether the session for `mac` already carries this exact grant —
+    /// i.e. the allotment is durable in `sessions.json` and must not be
+    /// applied a second time.
+    pub fn has_grant(&self, mac: &str, grant_id: &str) -> bool {
+        self.sessions
+            .get(mac)
+            .and_then(|s| s.last_grant_id.as_deref())
+            .is_some_and(|id| id == grant_id)
     }
 
     /// Look up a session by MAC address.
@@ -180,6 +209,14 @@ impl SessionManager {
         self.do_save(dir)
     }
 
+    /// Force an immediate durable write, bypassing the debounce. Used by
+    /// payment-grant paths where the caller must not advance any marker
+    /// before the session is durably recoverable (a debounced
+    /// `save_to_disk` returns `Ok(())` without writing).
+    pub fn save_now(&self, dir: &Path) -> io::Result<()> {
+        self.do_save(dir)
+    }
+
     /// Force a disk write if there are unsaved changes. Called by the
     /// monitor on each tick to ensure throttled saves eventually persist.
     pub fn flush_if_dirty(&self, dir: &Path) -> io::Result<()> {
@@ -200,6 +237,8 @@ impl SessionManager {
     }
 
     fn do_save(&self, dir: &Path) -> io::Result<()> {
+        use std::io::Write;
+
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -209,8 +248,13 @@ impl SessionManager {
             self.sessions.values().filter(|s| s.expiry > now).collect();
         let json = serde_json::to_string_pretty(&data)?;
         let tmp = dir.join("sessions.json.tmp");
-        std::fs::write(&tmp, json)?;
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(json.as_bytes())?;
+        file.sync_all()?;
         std::fs::rename(&tmp, &path)?;
+        if let Some(parent) = path.parent() {
+            std::fs::File::open(parent)?.sync_all()?;
+        }
         *self.last_save_ms.lock().unwrap_or_else(|p| p.into_inner()) = epoch_ms();
         self.dirty.store(false, Ordering::Release);
         Ok(())

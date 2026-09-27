@@ -429,7 +429,10 @@ mod tests {
             canonical_mint_url("HTTPS://Mint.Example/"),
             "https://mint.example"
         );
-        assert_eq!(canonical_mint_url("https://mint.example/"), "https://mint.example");
+        assert_eq!(
+            canonical_mint_url("https://mint.example/"),
+            "https://mint.example"
+        );
         // Path case is preserved per CDK MintUrl semantics.
         assert_eq!(
             canonical_mint_url("https://mint.example/Path/TO/mint"),
@@ -452,7 +455,11 @@ mod tests {
             .ensure_mint("HTTPS://Mint.Example/")
             .await
             .expect("alias spelling must resolve to the registered wallet");
-        assert_eq!(wallet.wallets.len(), 1, "alias spelling must not fork the wallet map");
+        assert_eq!(
+            wallet.wallets.len(),
+            1,
+            "alias spelling must not fork the wallet map"
+        );
 
         // Lookups through alias spellings resolve past the map to the
         // store layer (a non-WalletNotFound error: UnknownQuote), proving
