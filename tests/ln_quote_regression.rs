@@ -173,3 +173,23 @@ async fn alias_spelled_mint_resolves_to_single_registered_wallet() {
         "alias spelling resolved past the wallet map, got {err:?}"
     );
 }
+
+/// PR #22 r4070018376 (P1): an invoice paid just before expiry — polled
+/// after it — must remain settleable. The pre-fix `ungranted()` filter
+/// excluded expired records forever, so the customer paid and never got
+/// a session.
+#[tokio::test]
+async fn expired_ungranted_quotes_stay_visible_to_settlement() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = QuoteStore::load(dir.path());
+
+    let mut expired = quote_record("paid-late");
+    expired.expiry = now_secs() - 1;
+    store.upsert(expired).await.unwrap();
+
+    let pending = store.ungranted().await;
+    assert!(
+        pending.iter().any(|q| q.quote == "paid-late"),
+        "expired-but-ungranted records must reach settlement"
+    );
+}

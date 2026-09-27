@@ -94,13 +94,15 @@ impl QuoteStore {
         self.quotes.read().await.get(quote).cloned()
     }
 
+    /// All not-yet-granted records, including expired/stale ones —
+    /// settlement reconciles the authoritative mint state before any
+    /// record is considered terminal.
     pub async fn ungranted(&self) -> Vec<LightningQuoteRecord> {
-        let now = now_secs();
         self.quotes
             .read()
             .await
             .values()
-            .filter(|q| !q.session_granted && !q.expired(now) && !q.stale(now))
+            .filter(|q| !q.session_granted)
             .cloned()
             .collect()
     }
@@ -166,6 +168,9 @@ pub(crate) fn find_mint_config<'a>(
 #[derive(Debug, Clone, PartialEq)]
 pub enum SettleOutcome {
     StillUnpaid,
+    /// Terminal: expired/stale AND the mint authoritatively reports
+    /// Unpaid. No value moved; the monitor removes the record.
+    ExpiredUnpaid,
     Granted {
         allotment: u64,
     },
@@ -220,6 +225,17 @@ pub async fn settle_quote(
             Err(e) => return SettleOutcome::Failed(e.to_string()),
         };
         if !quote_state_allows_settlement(status) {
+            // Expiry may terminate a record ONLY after the authoritative
+            // state is reconciled (AGENTS.md L64-L70): a payment landing
+            // just before expiry — or the mint being unreachable until
+            // after it — must still settle. Paid/Issued quotes fall
+            // through to minting below regardless of local expiry.
+            let now = now_secs();
+            if status == cdk::nuts::MintQuoteState::Unpaid
+                && (record.expired(now) || record.stale(now))
+            {
+                return SettleOutcome::ExpiredUnpaid;
+            }
             return SettleOutcome::StillUnpaid;
         }
         match wallet.mint_tokens(&record.mint_url, &record.quote).await {
@@ -316,6 +332,7 @@ pub async fn run_monitor(
             continue;
         };
         for record in records {
+            let quote_id = record.quote.clone();
             match settle_quote(
                 store.clone(),
                 wallet,
@@ -332,6 +349,15 @@ pub async fn run_monitor(
                     allotment,
                     "lightning quote settled: session granted"
                 ),
+                SettleOutcome::ExpiredUnpaid => {
+                    tracing::info!(
+                        quote = %quote_id,
+                        "lightning quote expired unpaid (mint-confirmed); removing record"
+                    );
+                    if let Err(e) = store.remove(&quote_id).await {
+                        tracing::warn!(error = %e, "failed to persist expired-quote removal");
+                    }
+                }
                 SettleOutcome::GrantFailed | SettleOutcome::StillUnpaid => {}
                 SettleOutcome::Failed(e) => {
                     tracing::warn!(error = %e, "lightning quote settle attempt failed; retrying next poll")
@@ -501,7 +527,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ungranted_filters_expired_and_granted() {
+    async fn ungranted_keeps_expired_records_for_settlement() {
         let dir = tempfile::tempdir().unwrap();
         let store = QuoteStore::load(dir.path());
 
@@ -511,17 +537,31 @@ mod tests {
 
         let mut granted = record("done", true);
         granted.session_granted = true;
+        granted.expiry = now_secs() - 1;
         store.upsert(granted).await.unwrap();
 
         store.upsert(record("live", false)).await.unwrap();
 
+        // Expired-but-ungranted records MUST reach settlement: a payment
+        // landing just before expiry (or a mint unreachable until after)
+        // must still grant (PR #22 r4070018376). Only granted records are
+        // excluded; terminality is decided on authoritative mint state.
         let pending: Vec<String> = store
             .ungranted()
             .await
             .into_iter()
             .map(|q| q.quote)
             .collect();
-        assert_eq!(pending, vec!["live".to_string()]);
+        assert!(pending.contains(&"live".to_string()));
+        assert!(pending.contains(&"old".to_string()));
+        assert!(!pending.contains(&"done".to_string()));
+
+        // Sweep never drops ungranted records, expired or not — a paid
+        // quote must not be garbage-collected out of its session.
+        store.sweep().await;
+        assert!(store.get("old").await.is_some());
+        assert!(store.get("live").await.is_some());
+        assert!(store.get("done").await.is_none(), "granted+expired is dropped");
     }
 
     #[test]
