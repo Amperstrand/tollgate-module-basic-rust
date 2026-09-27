@@ -142,7 +142,28 @@ pub async fn handle_create_ln_invoice(
                 allotment_added: false,
                 session_granted: false,
             };
-            state.ln_quotes.upsert(record).await;
+            // AGENTS.md: never return a payable invoice whose record is
+            // not durable — a restart would make it unsettleable.
+            if let Err(e) = state.ln_quotes.upsert(record).await {
+                tracing::error!(error = %e, "ln-invoice: quote record not durable; invoice withheld");
+                let _ = state.ln_quotes.remove(&info.id).await;
+                return json_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    LightningInvoiceResponse {
+                        status: 0,
+                        quote: String::new(),
+                        invoice: String::new(),
+                        mint_url: mint_url.clone(),
+                        amount: req.amount,
+                        expiry: 0,
+                        state: "error".to_string(),
+                        access_granted: false,
+                        allotment: 0,
+                        metric: String::new(),
+                        error: "quote persistence failed".to_string(),
+                    },
+                );
+            }
 
             json_response(
                 StatusCode::OK,

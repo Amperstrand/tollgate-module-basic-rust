@@ -66,11 +66,28 @@ impl QuoteStore {
         }
     }
 
-    pub async fn upsert(&self, record: LightningQuoteRecord) {
+    /// Insert or update a record and persist the snapshot.
+    ///
+    /// On persistence failure the in-memory transition is KEPT (it is
+    /// true — value may already have moved) and the error is returned so
+    /// callers can refuse to expose or advance on undurable state
+    /// (AGENTS.md: a payment response is never returned before the
+    /// record backing it is durable).
+    pub async fn upsert(&self, record: LightningQuoteRecord) -> std::io::Result<()> {
         let mut quotes = self.quotes.write().await;
         quotes.insert(record.quote.clone(), record);
         let snapshot: Vec<LightningQuoteRecord> = quotes.values().cloned().collect();
-        persist(&self.path, &snapshot);
+        persist(&self.path, &snapshot)
+    }
+
+    /// Remove a record and persist; absent records are a no-op (no write).
+    pub async fn remove(&self, quote: &str) -> std::io::Result<()> {
+        let mut quotes = self.quotes.write().await;
+        if quotes.remove(quote).is_none() {
+            return Ok(());
+        }
+        let snapshot: Vec<LightningQuoteRecord> = quotes.values().cloned().collect();
+        persist(&self.path, &snapshot)
     }
 
     pub async fn get(&self, quote: &str) -> Option<LightningQuoteRecord> {
@@ -89,27 +106,24 @@ impl QuoteStore {
     }
 
     /// Drop expired/stale settled records; called by the monitor's janitor
-    /// pass. Kept records are persisted back atomically.
+    /// pass. Ungranted records are never dropped here — settlement owns
+    /// their terminal transition.
     pub async fn sweep(&self) {
         let now = now_secs();
         let mut quotes = self.quotes.write().await;
         quotes.retain(|_, q| !(q.expired(now) || q.stale(now)) || !q.session_granted);
         let snapshot: Vec<LightningQuoteRecord> = quotes.values().cloned().collect();
-        persist(&self.path, &snapshot);
+        if let Err(e) = persist(&self.path, &snapshot) {
+            tracing::warn!(error = %e, "failed to persist lightning quotes sweep");
+        }
     }
 }
 
-fn persist(path: &Path, quotes: &[LightningQuoteRecord]) {
-    let Ok(json) = serde_json::to_string_pretty(quotes) else {
-        return;
-    };
+fn persist(path: &Path, quotes: &[LightningQuoteRecord]) -> std::io::Result<()> {
+    let json = serde_json::to_string_pretty(quotes)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     let tmp = path.with_extension("json.tmp");
-    if std::fs::write(&tmp, json)
-        .and_then(|_| std::fs::rename(&tmp, path))
-        .is_err()
-    {
-        tracing::warn!(path = %path.display(), "failed to persist lightning quotes");
-    }
+    std::fs::write(&tmp, json).and_then(|_| std::fs::rename(&tmp, path))
 }
 
 pub fn now_secs() -> u64 {
@@ -183,7 +197,9 @@ pub async fn settle_quote(
         match wallet.mint_tokens(&record.mint_url, &record.quote).await {
             Ok(_) => {
                 record.minted = true;
-                store.upsert(record.clone()).await;
+                if let Err(e) = store.upsert(record.clone()).await {
+                    return SettleOutcome::Failed(format!("quote persist failed: {e}"));
+                }
             }
             Err(e) => {
                 // A quote already ISSUED at the mint rejects a second mint;
@@ -191,7 +207,9 @@ pub async fn settle_quote(
                 let msg = e.to_string().to_lowercase();
                 if msg.contains("issued") || msg.contains("already") {
                     record.minted = true;
-                    store.upsert(record.clone()).await;
+                    if let Err(pe) = store.upsert(record.clone()).await {
+                        return SettleOutcome::Failed(format!("quote persist failed: {pe}"));
+                    }
                 } else {
                     return SettleOutcome::Failed(e.to_string());
                 }
@@ -215,7 +233,9 @@ pub async fn settle_quote(
         }
         drop(sm);
         record.allotment_added = true;
-        store.upsert(record.clone()).await;
+        if let Err(e) = store.upsert(record.clone()).await {
+            return SettleOutcome::Failed(format!("quote persist failed: {e}"));
+        }
     }
 
     if let Err(e) = portal.grant_access(&record.mac).await {
@@ -224,7 +244,9 @@ pub async fn settle_quote(
     }
 
     record.session_granted = true;
-    store.upsert(record).await;
+    if let Err(e) = store.upsert(record).await {
+        return SettleOutcome::Failed(format!("quote persist failed: {e}"));
+    }
     SettleOutcome::Granted { allotment }
 }
 
