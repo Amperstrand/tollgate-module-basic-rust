@@ -70,22 +70,29 @@ async fn remove_persists_and_is_noop_for_absent_records() {
 /// be rejected BEFORE a payable invoice is created — otherwise settlement
 /// mints the paid value and grants a zero-step (unusable) session.
 #[tokio::test]
-#[serial_test::serial]
 async fn sub_minimum_amount_rejected_before_invoice_creation() {
     let cfg_dir = tempfile::tempdir().unwrap();
-    std::env::set_var("TOLLGATE_TEST_CONFIG_DIR", cfg_dir.path());
 
-    let mut config = tollgate_module_basic_rust::config::Config::default();
-    config.accepted_mints = vec![tollgate_module_basic_rust::config::MintConfig {
-        url: "https://mint.example".to_string(),
-        price_per_step: 2,
-        min_purchase_steps: 1,
-        ..tollgate_module_basic_rust::config::MintConfig::default_production("https://mint.example")
-    }];
+    let config = tollgate_module_basic_rust::config::Config {
+        accepted_mints: vec![tollgate_module_basic_rust::config::MintConfig {
+            url: "https://mint.example".to_string(),
+            price_per_step: 2,
+            min_purchase_steps: 1,
+            ..tollgate_module_basic_rust::config::MintConfig::default_production(
+                "https://mint.example",
+            )
+        }],
+        ..tollgate_module_basic_rust::config::Config::default()
+    };
 
-    let identity = std::sync::Arc::new(
-        tollgate_module_basic_rust::identity::MerchantIdentity::load_or_generate().unwrap(),
-    );
+    let identity = std::sync::Arc::new({
+        let secp = secp256k1::Secp256k1::new();
+        let (secret_key, _) = secp.generate_keypair(&mut rand::thread_rng());
+        tollgate_module_basic_rust::identity::MerchantIdentity {
+            name: "merchant".to_string(),
+            secret_key,
+        }
+    });
     let state = tollgate_module_basic_rust::http::AppState {
         config: std::sync::Arc::new(config),
         identity,
@@ -133,8 +140,6 @@ async fn sub_minimum_amount_rejected_before_invoice_creation() {
             .contains("below minimum purchase"),
         "rejection must name the minimum-purchase reason, got: {body}"
     );
-
-    std::env::remove_var("TOLLGATE_TEST_CONFIG_DIR");
 }
 
 /// PR #22 r4070018389 / PR #23 r4070120810 (P1): alias-spelled mint URLs
@@ -229,12 +234,10 @@ impl tollgate_module_basic_rust::portal::CaptivePortal for FakePortal {
 /// changed) config — a config change + restart while a quote is payable
 /// used to grant a different product than the portal displayed.
 #[tokio::test]
-#[serial_test::serial]
 async fn settlement_uses_pricing_terms_frozen_at_creation() {
     use tollgate_module_basic_rust::lightning_quotes::{settle_quote, SettleOutcome};
 
     let cfg_dir = tempfile::tempdir().unwrap();
-    std::env::set_var("TOLLGATE_TEST_CONFIG_DIR", cfg_dir.path());
     let dir = tempfile::tempdir().unwrap();
     let store = std::sync::Arc::new(QuoteStore::load(dir.path()));
 
@@ -270,6 +273,7 @@ async fn settlement_uses_pricing_terms_frozen_at_creation() {
         &sessions,
         &portal,
         &config,
+        cfg_dir.path(),
         store.get("priced-then").await.unwrap(),
     )
     .await;
@@ -324,12 +328,10 @@ async fn sweep_touches_nothing_when_no_record_is_removed() {
 /// writing — settle persisted `allotment_added = true` and a "power
 /// loss" lost the paid session while recovery skipped re-adding it.
 #[tokio::test]
-#[serial_test::serial]
 async fn session_grant_survives_power_loss_despite_open_debounce_window() {
     use tollgate_module_basic_rust::lightning_quotes::{settle_quote, SettleOutcome};
 
     let cfg_dir = tempfile::tempdir().unwrap();
-    std::env::set_var("TOLLGATE_TEST_CONFIG_DIR", cfg_dir.path());
     let dir = tempfile::tempdir().unwrap();
     let store = std::sync::Arc::new(QuoteStore::load(dir.path()));
 
@@ -359,6 +361,7 @@ async fn session_grant_survives_power_loss_despite_open_debounce_window() {
         &sessions,
         &portal,
         &config,
+        cfg_dir.path(),
         store.get("durable-grant").await.unwrap(),
     )
     .await;
@@ -385,12 +388,10 @@ async fn session_grant_survives_power_loss_despite_open_debounce_window() {
 /// recovery. The `ln:<quote>` grant key inside the session record is the
 /// durable idempotency witness.
 #[tokio::test]
-#[serial_test::serial]
 async fn crash_between_session_flush_and_quote_marker_does_not_double_grant() {
     use tollgate_module_basic_rust::lightning_quotes::{settle_quote, SettleOutcome};
 
     let cfg_dir = tempfile::tempdir().unwrap();
-    std::env::set_var("TOLLGATE_TEST_CONFIG_DIR", cfg_dir.path());
     let dir = tempfile::tempdir().unwrap();
     let store = std::sync::Arc::new(QuoteStore::load(dir.path()));
 
@@ -439,6 +440,7 @@ async fn crash_between_session_flush_and_quote_marker_does_not_double_grant() {
         &recovered,
         &portal,
         &config,
+        cfg_dir.path(),
         store.get("dq").await.unwrap(),
     )
     .await;

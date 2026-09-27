@@ -222,13 +222,15 @@ pub fn quote_state_display(state: cdk::nuts::MintQuoteState) -> &'static str {
 /// Settle one quote: mint if paid-and-unminted, then grant session + gate.
 /// `minted`/`session_granted` transitions are persisted through the store
 /// as they happen, so a crash mid-settle resumes correctly: minting never
-/// repeats, granting retries.
+/// repeats, granting retries. `sessions_dir` is explicit (not the env
+/// override) so concurrent callers cannot race on the process-wide var.
 pub async fn settle_quote(
     store: Arc<QuoteStore>,
     wallet: &crate::wallet::wallet::TollWallet,
     sessions: &Mutex<crate::session::SessionManager>,
     portal: &dyn crate::portal::CaptivePortal,
     config: &crate::config::Config,
+    sessions_dir: &Path,
     record: LightningQuoteRecord,
 ) -> SettleOutcome {
     let mut record = record;
@@ -332,7 +334,7 @@ pub async fn settle_quote(
             // writing, and a crash in that window used to leave
             // allotment_added=true durable while the allotment was not —
             // recovery then skipped re-adding it, losing the paid session.
-            if let Err(e) = sm.save_now(&crate::config::config_dir()) {
+            if let Err(e) = sm.save_now(sessions_dir) {
                 tracing::warn!(error = %e, "session save failed; retrying next tick");
                 drop(sm);
                 return SettleOutcome::GrantFailed;
@@ -383,6 +385,7 @@ pub async fn run_monitor(
                 &state.sessions,
                 state.portal.as_ref(),
                 &state.config,
+                &crate::config::config_dir(),
                 record,
             )
             .await
@@ -478,10 +481,8 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial]
     async fn settle_grants_session_and_gate_without_reminting() {
         let cfg_dir = tempfile::tempdir().unwrap();
-        std::env::set_var("TOLLGATE_TEST_CONFIG_DIR", cfg_dir.path());
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(QuoteStore::load(dir.path()));
         store.upsert(record("q1", true)).await.unwrap();
@@ -505,6 +506,7 @@ mod tests {
             &sessions,
             &portal,
             &config,
+            cfg_dir.path(),
             store.get("q1").await.unwrap(),
         )
         .await;
@@ -524,10 +526,8 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial]
     async fn settle_with_failing_gate_retries_without_reminting() {
         let cfg_dir = tempfile::tempdir().unwrap();
-        std::env::set_var("TOLLGATE_TEST_CONFIG_DIR", cfg_dir.path());
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(QuoteStore::load(dir.path()));
         store.upsert(record("q2", true)).await.unwrap();
@@ -542,7 +542,16 @@ mod tests {
         let config = Config::default();
 
         let rec = store.get("q2").await.unwrap();
-        let outcome = settle_quote(store.clone(), &wallet, &sessions, &portal, &config, rec).await;
+        let outcome = settle_quote(
+            store.clone(),
+            &wallet,
+            &sessions,
+            &portal,
+            &config,
+            cfg_dir.path(),
+            rec,
+        )
+        .await;
         assert_eq!(outcome, SettleOutcome::GrantFailed);
 
         let rec = store.get("q2").await.unwrap();
@@ -567,6 +576,7 @@ mod tests {
             &sessions2,
             &portal2,
             &config,
+            cfg_dir.path(),
             store.get("q2").await.unwrap(),
         )
         .await;
