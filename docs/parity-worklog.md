@@ -178,3 +178,46 @@ Format: timestamp | commit | test command | failure | root cause | change | rete
   (tollgate-rs) — under rust-basic those guards never fire. Left as-is
   for now: rust-basic is a Go port, running the assertions is the
   parity signal; revisit per-test if a calibration skip proves needed.
+
+2026-09-27 19:45 UTC | rust b223437 ipk / prta 33eb8a0 | results/rust-run2 + run2b + run2c
+- M1 VM parity suite COMPLETE (three legs, contamination documented):
+  run2 = full 107 files; run2b = rerun of load-contaminated files;
+  run2c = final rerun after lab resurrection. Contamination sources
+  hit mid-campaign: (a) sibling lane's cargo loop pinned host load at
+  40 for ~2h → 1-vCPU OpenWrt VM starved (port-22 connect timeouts,
+  15s curl timeouts); (b) both poc QEMUs died ~16:30 (zero qemu procs,
+  no OOM trace — finale lane cycled the lab; PRTA 67c88f9 adds serial
+  history); (c) the lab cycle left an ALIEN pre-dispatch binary at
+  /usr/bin/tollgate-wrt (md5 8932ecab, binds 0.0.0.0, no CLI strings,
+  mtime 16:01) — run2b's later files + the "tollgate health prints
+  server log" symptom were THAT binary, not HEAD. Redeployed eb1c1263
+  (b223437) before run2c; verified dual-stack + CLI help + md5.
+- CONSOLIDATED rust verdict (2c > clean-2b > clean-2; starved→
+  inconclusive): 160 PASS / 252 SKIP / 23 BAD / 12 inconclusive.
+  Go baseline (Sep 26): 215/243/54. Rust-ok-where-go-fails: 15
+  (payment core: payment_regression trio, sentinel duplicate, security
+  spent/case-insensitive, swap invoices x4, nds allows-after-payment,
+  whoami, mint_url fuzzy x2).
+- GENUINE rust gaps isolated (clean evidence, run2c):
+  G1 /identity/reveal-seed + friends → 404 (route absent; Go PR #193
+     surface) — pr193 x4.
+  G2 `tollgate wallet send` CLI missing (supported: balance, info,
+     fund, drain) — mint_payout keyset-derivation test.
+  G3 NUT-24 payment via X-Cashu header → empty response — nut18.
+- Shared/env both-fail (not rust regressions): ssl 443-after-remove x2
+  (holds on go too), LuCI 8080 (no LuCI by design), bash_client x5
+  (git clone of sh1ftred/tollgate-bash-client fails from this host).
+- Framework fixes landed during triage (prta 33eb8a0): go_only/rust_only
+  marker gating now covers the backend family — 25+ go_only files
+  (degraded_portal, cli_*, try_all_mints, recovery_lifecycle…) had been
+  RUNNING under rust-basic because the gate compared backend_type ==
+  "rust" literally. They skip now; their earlier rust results were
+  either free parity signal (passes) or noise (failures).
+- One-offs to re-verify next cycle on a pinned binary:
+  nds_deauth_blocks_again (run2), degraded_mode::cli_health (only ever
+  observed on the alien binary — expected fixed by a3be466+dispatch,
+  cli files' clean rerun was lost to the /tmp junit overwrite).
+- Operational lesson recorded: /tmp/local-suite-junit is a SHARED path
+  — concurrent runners on this host overwrite each other's per-file
+  junit (run2b files 1-3 lost to finale's smoke). Prefix by PID or
+  per-run dir before the next multi-lane day.
