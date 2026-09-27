@@ -217,10 +217,32 @@ pub async fn settle_quote(
                 }
             }
             Err(e) => {
-                // A quote already ISSUED at the mint rejects a second mint;
-                // treat that specific case as minted rather than stuck.
-                let msg = e.to_string().to_lowercase();
-                if msg.contains("issued") || msg.contains("already") {
+                // AGENTS.md: an ambiguous mint result (30s timeout cancels
+                // the saga mid-flight; the mint may have already issued)
+                // must be reconciled, never inferred from error text.
+                // check_mint_quote_state re-queries the authoritative
+                // state AND resumes the quote's in-progress CDK saga
+                // (CDK links it via `used_by_operation`), recovering
+                // proofs the cancelled call already produced. Only a
+                // post-reconciliation Issued state may mark the quote
+                // minted.
+                let state = match wallet
+                    .check_mint_quote_state(&record.mint_url, &record.quote)
+                    .await
+                {
+                    Ok(s) => s,
+                    Err(re) => {
+                        return SettleOutcome::Failed(format!(
+                            "mint failed ({e}) and reconciliation failed ({re})"
+                        ))
+                    }
+                };
+                if state == cdk::nuts::MintQuoteState::Issued {
+                    tracing::warn!(
+                        quote = "…",
+                        error = %e,
+                        "mint errored but reconciliation confirms issued; marking minted"
+                    );
                     record.minted = true;
                     if let Err(pe) = store.upsert(record.clone()).await {
                         return SettleOutcome::Failed(format!("quote persist failed: {pe}"));
