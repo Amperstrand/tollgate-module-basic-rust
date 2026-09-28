@@ -265,3 +265,34 @@ Format: timestamp | commit | test command | failure | root cause | change | rete
   disentangle of product gap vs lab-mint-blocking harness behavior).
 - Note: rust skips are ~21 higher than go's solely because 25+ go_only
   files now correctly skip under the rust family (conftest 33eb8a0).
+
+2026-09-28 01:20 UTC | rate-limiter restart report (estate-relay finding) | issue #27
+- FINDING CONFIRMED with a sharper root cause: the 21023 rate limiter
+  (src/rate_limiter.rs) is clean — in-memory Mutex<HashMap<IpAddr,
+  Vec<Instant>>>, per-boot, no disk. Keyed per-IP ONLY (not
+  per-IP-per-mint; allow(ip) at pay.rs:151) — spec question flagged in
+  the issue.
+- The "state persists across restarts" is PROCESS survival, not state
+  persistence: a MANUALLY-started tollgate-wrt (setsid, /tmp fallback,
+  debug session) is immune to `service tollgate-wrt restart|stop` —
+  the init.d `stop()` override (ported verbatim from the GO package,
+  which is the origin of the bug) only logs; rc.common restart =
+  stop+start never sweeps non-procd processes. The manual instance
+  keeps :2121 forever while procd's fresh instance AddrInUse-loops
+  (respawn 3 5 0). Reproduced: 65 hammers → 429; TWO service restarts
+  → still 429 from the same manual process.
+- Clean procd path verified healthy: restart DOES recycle the instance
+  and the limiter resets (429 → restart → 200), but with a
+  term_timeout=5s SIGTERM race where the OLD process can still answer
+  with stale state — a restart-then-immediately-pay harness can see
+  either stale 429s or 000s.
+- PRTA-side relevance: router.py restart_backend's `setsid /tmp/tollgate`
+  fallback is a manual-start factory; every invocation leaves an
+  unmanageable process behind. (Our clean-VM runs today re-deployed via
+  opkg, so run2/2b/2c/2d results are unaffected.)
+- Filed: Amperstrand/tollgate-module-basic-rust#27 (includes repro,
+  shared-blame note for the Go packaging, fix suggestions: drop the
+  stop() override + sweep strays; startup guard when :2121 is held by a
+  non-child). Test pin deferred to the fix PR.
+- VM restored to a single procd-managed instance (verified fresh
+  listener + payment allowed) after the repro.
