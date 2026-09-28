@@ -257,6 +257,11 @@ touch /etc/tollgate/.migration_complete
 
 This prevents the auto-migration logic from re-running on next boot.
 
+The marker reader also honors the legacy auto-migration format
+(`imported=N`/`failed=0`/`date=...`, written before the `state=` field
+existed) as complete when `failed=0`; a legacy marker with `failed>0` is
+treated as incomplete and the (now convergent) re-run picks it up.
+
 ### Step 6: Back up the old wallet (optional but recommended)
 
 ```bash

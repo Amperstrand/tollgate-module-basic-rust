@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use tollgate_module_basic_rust::migration::{
     should_import_tokens, ExportOutcome, FirstBootMigration, JournalEntry, TokenOutcome, TokenSink,
-    JOURNAL_NAME, OLD_DB_NAME, TOKENS_FILE_NAME,
+    JOURNAL_NAME, MARKER_NAME, OLD_DB_NAME, TOKENS_FILE_NAME,
 };
 
 #[derive(Debug, Default)]
@@ -207,6 +207,53 @@ fn failed_export_blocks_import_even_when_tokens_file_exists() {
     assert!(should_import_tokens(true, true, ExportOutcome::NotRun));
     assert!(!should_import_tokens(false, true, ExportOutcome::Succeeded));
     assert!(!should_import_tokens(true, false, ExportOutcome::Succeeded));
+}
+
+/// Codex P2 finding 4 (migration.rs:206): legacy completion markers must be
+/// honored — the pre-#21 auto-migration wrote only imported=/failed=/date=,
+/// and the documented manual procedure ends with `touch` (empty marker).
+/// Requiring exactly `state=complete` treated those completed migrations as
+/// incomplete and restarted money-moving imports.
+#[test]
+fn legacy_marker_formats_are_honored() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path()).unwrap();
+    std::fs::write(dir.path().join(OLD_DB_NAME), b"fake bbolt db").unwrap();
+    let m = FirstBootMigration::new(dir.path());
+    assert!(m.should_run(), "no marker yet: migration runs");
+
+    // Empty marker — the documented manual-completion `touch` signal.
+    std::fs::write(dir.path().join(MARKER_NAME), b"").unwrap();
+    assert!(
+        !m.should_run(),
+        "empty (touch) marker is the operator's done signal"
+    );
+
+    // Legacy clean run: imported=/failed=0 — complete.
+    std::fs::write(
+        dir.path().join(MARKER_NAME),
+        b"imported=3\nfailed=0\ndate=1700000000\n",
+    )
+    .unwrap();
+    assert!(!m.should_run(), "legacy clean marker is complete");
+
+    // Legacy run with failures — genuinely incomplete: re-run (it now
+    // converges via the journal's Spent terminal state instead of
+    // re-failing spent tokens).
+    std::fs::write(
+        dir.path().join(MARKER_NAME),
+        b"imported=3\nfailed=1\ndate=1700000000\n",
+    )
+    .unwrap();
+    assert!(m.should_run(), "legacy failed marker re-runs");
+
+    // Current partial marker stays authoritative.
+    std::fs::write(dir.path().join(MARKER_NAME), b"state=partial\nfailed=0\n").unwrap();
+    assert!(m.should_run(), "explicit partial state is never complete");
+
+    // Whitespace-only marker behaves like the empty one.
+    std::fs::write(dir.path().join(MARKER_NAME), b"  \n").unwrap();
+    assert!(!m.should_run());
 }
 
 /// Codex P1 finding 2 (migration.rs:140): a receive Timeout is ambiguous —

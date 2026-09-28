@@ -378,10 +378,45 @@ fn fold_last_outcomes(entries: &[JournalEntry]) -> std::collections::HashMap<Str
     folded
 }
 
+/// Whether the completion marker says the migration is done. Accepts the
+/// formats that can predate the `state=` field (Codex P2 on PR #21:
+/// rejecting them restarted money-moving imports on a completed system):
+///
+/// - current: a `state=complete` line;
+/// - legacy auto-migration: `imported=N`/`failed=N`/`date=N` with no
+///   `state=` line — complete only when `failed=0` (a legacy marker with
+///   failures describes an incomplete migration; the re-run converges via
+///   the journal's `Spent` terminal state instead of re-failing spent
+///   tokens);
+/// - empty marker (the `touch` procedure MIGRATION.md documents as the
+///   final step of a manual migration): the operator's explicit "done"
+///   signal — honored as complete.
 fn marker_is_complete(path: &Path) -> bool {
-    std::fs::read_to_string(path)
-        .map(|body| body.lines().any(|l| l.trim() == "state=complete"))
-        .unwrap_or(false)
+    let Ok(body) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    if body.trim().is_empty() {
+        return true;
+    }
+    let mut saw_imported = false;
+    let mut legacy_failed: Option<u64> = None;
+    for line in body.lines() {
+        let l = line.trim();
+        if l == "state=complete" {
+            return true;
+        }
+        if l.starts_with("state=") || l.starts_with("pending=") {
+            // Any other explicit state (partial, …) is authoritative.
+            return false;
+        }
+        if l.starts_with("imported=") {
+            saw_imported = true;
+        }
+        if let Some(v) = l.strip_prefix("failed=") {
+            legacy_failed = v.parse().ok();
+        }
+    }
+    saw_imported && legacy_failed == Some(0)
 }
 
 fn read_tokens(path: &Path) -> Result<Vec<String>, MigrationError> {
