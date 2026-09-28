@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
@@ -94,6 +95,20 @@ func main() {
 	outDir := flag.String("out", ".", "output directory for tokens.jsonl, keyset_counters.json, migration-report.json")
 	flag.Parse()
 
+	// Positional form: `gonuts-export <wallet.db> <tokens.jsonl>` — the
+	// invocation the Rust first-boot migration uses (main.rs) and the one
+	// MIGRATION.md documents. The second argument is the tokens FILE path;
+	// the other artifacts land next to it. Accepted alongside the flag
+	// form so both callers keep working.
+	if flag.NArg() >= 2 {
+		boltPath = &flag.Args()[0]
+		tokensOut := flag.Args()[1]
+		dir := filepath.Dir(tokensOut)
+		outDir = &dir
+		tokensName := filepath.Base(tokensOut)
+		positionalTokensName = &tokensName
+	}
+
 	if *boltPath == "" {
 		fmt.Fprintln(os.Stderr, "error: --bolt is required")
 		flag.Usage()
@@ -105,6 +120,10 @@ func main() {
 		os.Exit(1)
 	}
 }
+
+// When invoked positionally, the tokens artifact filename from the caller
+// (defaults to tokens.jsonl under the flag form).
+var positionalTokensName *string
 
 func run(boltPath, outDir string) error {
 	return runWithCrashAfter(boltPath, outDir, 0)
@@ -156,7 +175,11 @@ func runWithCrashAfter(boltPath, outDir string, crashAfter int) error {
 	// its existence at the final path is the success stamp the Rust
 	// importer gates on — a crash or nonzero exit can never expose a
 	// truncated token file to the migration (Codex P1 on PR #21).
-	tokensPath := filepath.Join(outDir, "tokens.jsonl")
+	tokensName := "tokens.jsonl"
+	if positionalTokensName != nil {
+		tokensName = *positionalTokensName
+	}
+	tokensPath := filepath.Join(outDir, tokensName)
 	tokensTmp := tokensPath + ".tmp"
 	tokensFile, err := os.Create(tokensTmp)
 	if err != nil {
@@ -203,8 +226,12 @@ func runWithCrashAfter(boltPath, outDir string, crashAfter int) error {
 				return fmt.Errorf("marshalling token for keyset %s: %w", ks.Id, err)
 			}
 
-			// Write one token per line (JSONL)
-			if _, err := tokensFile.Write(append(tokenJSON, '\n')); err != nil {
+			// One canonical token string per line (cashuA + base64url of
+			// the V3 JSON): the only encoding CDK/cashu `Token::from_str`
+			// accepts, i.e. what the Rust importer and the `migrate` CLI
+			// parse. Raw JSON lines were unparseable end-to-end.
+			line := "cashuA" + base64.RawURLEncoding.EncodeToString(tokenJSON)
+			if _, err := tokensFile.WriteString(line + "\n"); err != nil {
 				tokensFile.Close()
 				os.Remove(tokensTmp)
 				return fmt.Errorf("writing token for keyset %s: %w", ks.Id, err)

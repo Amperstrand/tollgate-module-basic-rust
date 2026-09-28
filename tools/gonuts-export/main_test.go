@@ -97,6 +97,15 @@ func TestExportPublishesAllArtifactsWithoutTempRemains(t *testing.T) {
 	if got := lineCount(t, tokens); got != 2 {
 		t.Fatalf("tokens.jsonl: want 2 lines, got %d", got)
 	}
+	body, err := os.ReadFile(tokens)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, line := range strings.Split(strings.TrimSpace(string(body)), "\n") {
+		if !strings.HasPrefix(line, "cashuA") {
+			t.Fatalf("line %d is not a canonical cashuA token string: %q", i, line[:min(20, len(line))])
+		}
+	}
 	for _, name := range []string{"keyset_counters.json", "migration-report.json"} {
 		if _, err := os.Stat(filepath.Join(outDir, name)); err != nil {
 			t.Fatalf("missing artifact %s: %v", name, err)
@@ -116,6 +125,35 @@ func TestExportPublishesAllArtifactsWithoutTempRemains(t *testing.T) {
 // importer then swallowed (and could finalize the migration with tokens
 // silently unmigrated). The fix writes to tokens.jsonl.tmp and renames
 // only on success, so the previous complete artifact survives a crash.
+func TestPositionalInvocationMatchesRustCaller(t *testing.T) {
+	// main.rs invokes `gonuts-export <wallet.db> <tokens.jsonl>` positionally;
+	// MIGRATION.md documents the same form. This pins the contract.
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "wallet.db")
+	outDir := filepath.Join(dir, "cfg")
+	if err := os.MkdirAll(outDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	makeBoltDB(t, dbPath)
+
+	bolt := dbPath
+	tokensOut := filepath.Join(outDir, "tokens.jsonl")
+	name := filepath.Base(tokensOut)
+	outd := filepath.Dir(tokensOut)
+	positionalTokensName = &name
+	defer func() { positionalTokensName = nil }()
+
+	if err := runWithCrashAfter(bolt, outd, 0); err != nil {
+		t.Fatalf("positional-form run: %v", err)
+	}
+	if _, err := os.Stat(tokensOut); err != nil {
+		t.Fatalf("tokens artifact missing at caller-specified path: %v", err)
+	}
+	if got := lineCount(t, tokensOut); got != 2 {
+		t.Fatalf("tokens.jsonl: want 2 lines, got %d", got)
+	}
+}
+
 func TestCrashMidExportLeavesPreviousArtifactIntact(t *testing.T) {
 	if os.Getenv("GONUTS_EXPORT_CRASH_SUBPROC") == "1" {
 		dbPath := os.Getenv("GONUTS_EXPORT_CRASH_DB")
