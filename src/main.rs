@@ -68,9 +68,15 @@ async fn main() {
         }
     }
 
-    let seed = wallet::TollWallet::load_or_create_seed(&seed_path)
-        .await
-        .expect("failed to load/create wallet seed");
+    let seed = match wallet::TollWallet::load_or_create_seed(&seed_path).await {
+        Ok(seed) => seed,
+        Err(e) => {
+            // Remediation guidance is in the error log emitted by
+            // load_or_create_seed (seed/mnemonic mismatch or corruption).
+            tracing::error!(error = %e, "refusing to start with an unsafe wallet seed state");
+            std::process::exit(1);
+        }
+    };
 
     // Build wallet with accepted mints from config
     let mint_urls: Vec<String> = config_obj
