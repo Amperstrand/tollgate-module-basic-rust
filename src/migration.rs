@@ -45,6 +45,13 @@ impl TokenSink for TollWallet {
     async fn token_spent(&self, token: &str) -> Result<Option<u64>, crate::wallet::WalletError> {
         TollWallet::token_spent(self, token).await
     }
+
+    async fn mint_has_unresolved_receive(
+        &self,
+        token: &str,
+    ) -> Result<bool, crate::wallet::WalletError> {
+        TollWallet::mint_has_unresolved_receive(self, token).await
+    }
 }
 
 pub const JOURNAL_NAME: &str = "migration-journal.jsonl";
@@ -102,6 +109,15 @@ pub trait TokenSink {
     /// token is spent at the mint. Errors mean "cannot reconcile right now"
     /// (mint unreachable), NOT "unspent".
     async fn token_spent(&self, token: &str) -> Result<Option<u64>, crate::wallet::WalletError>;
+
+    /// Whether the token's mint wallet still holds an incomplete CDK
+    /// receive saga — a purely local query (works with the mint down).
+    /// While true, an earlier receive's outcome is undecided and the token
+    /// must be neither re-submitted nor terminalized this boot.
+    async fn mint_has_unresolved_receive(
+        &self,
+        token: &str,
+    ) -> Result<bool, crate::wallet::WalletError>;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -213,7 +229,43 @@ impl FirstBootMigration {
             // recover_incomplete_sagas has already run via ensure_mint at
             // boot) and tokens spent under a pre-journal migration, without
             // inferring anything from receive error text.
-            match sink.token_spent(&token).await {
+            let spent_check = sink.token_spent(&token).await;
+            let prior_pending = matches!(already.get(&token), Some(TokenOutcome::Pending));
+
+            // r4126804510: an all-spent NUT-07 answer proves only that the
+            // INPUTS were consumed — not that this wallet recovered the
+            // replacement outputs. CDK deletes a receive saga exactly when
+            // its outcome is persisted (outputs recovered via NUT-19 replay
+            // or NUT-09 /restore, compensated, or closed value-less with a
+            // logged warning), so "no incomplete receive saga" is CDK's own
+            // "operation decided" signal. While one remains, defer.
+            //
+            // r4126804498: a token whose earlier attempt may still be in
+            // flight (unresolved saga, or Pending with the mint
+            // unreachable) must not receive a fresh submit — that replays
+            // the same inputs without reconciling and burns a second
+            // derivation range (AGENTS.md forbids both).
+            let unresolved = match sink.mint_has_unresolved_receive(&token).await {
+                Ok(v) => v,
+                // Deterministic local answers: an unparseable token cannot
+                // have a saga. Only storage-level failures are "cannot
+                // determine" — those defer conservatively.
+                Err(crate::wallet::WalletError::TokenParse(_)) => false,
+                Err(e) => {
+                    tracing::warn!(error = %e, "migration: cannot inspect local saga state; treating token as unresolved");
+                    true
+                }
+            };
+            let untouchable = unresolved || (prior_pending && spent_check.is_err());
+            if untouchable {
+                tracing::warn!(
+                    "migration: token outcome undecided (unresolved receive saga or unreachable mint); deferring to next boot"
+                );
+                pending += 1;
+                continue;
+            }
+
+            match spent_check {
                 Ok(Some(amount_sat)) => {
                     tracing::warn!(
                         amount_sat,
@@ -642,6 +694,13 @@ mod tests {
             _token: &str,
         ) -> Result<Option<u64>, crate::wallet::WalletError> {
             Ok(None)
+        }
+
+        async fn mint_has_unresolved_receive(
+            &self,
+            _token: &str,
+        ) -> Result<bool, crate::wallet::WalletError> {
+            Ok(false)
         }
 
         async fn receive(&self, token: &str) -> Result<u64, crate::wallet::WalletError> {

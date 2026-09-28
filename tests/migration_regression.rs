@@ -19,6 +19,8 @@ struct FakeSink {
     receive: HashMap<String, Rx>,
     /// When set, every NUT-07 pre-check errors (mint unreachable).
     spent_err: bool,
+    /// Simulates an incomplete CDK receive saga for the mint (local state).
+    unresolved: bool,
     calls: std::sync::Mutex<Vec<String>>,
 }
 
@@ -54,6 +56,17 @@ impl TokenSink for FakeSink {
             return Err(WalletError::Timeout(std::time::Duration::from_secs(30)));
         }
         Ok(self.spent.get(token).copied().flatten())
+    }
+
+    async fn mint_has_unresolved_receive(
+        &self,
+        token: &str,
+    ) -> Result<bool, tollgate_module_basic_rust::wallet::WalletError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("unresolved:{token}"));
+        Ok(self.unresolved)
     }
 }
 
@@ -127,6 +140,13 @@ async fn pending_intent_is_durable_before_receive_touches_the_mint() {
             _token: &str,
         ) -> Result<Option<u64>, tollgate_module_basic_rust::wallet::WalletError> {
             Ok(None)
+        }
+
+        async fn mint_has_unresolved_receive(
+            &self,
+            _token: &str,
+        ) -> Result<bool, tollgate_module_basic_rust::wallet::WalletError> {
+            Ok(false)
         }
     }
 
@@ -254,6 +274,125 @@ fn legacy_marker_formats_are_honored() {
     // Whitespace-only marker behaves like the empty one.
     std::fs::write(dir.path().join(MARKER_NAME), b"  \n").unwrap();
     assert!(!m.should_run());
+}
+
+/// Codex P1 on PR #29 (r4126804498): a Pending token whose reconciliation
+/// is unavailable (mint down at the NUT-07 pre-check) must NOT be handed a
+/// fresh receive — that replays unresolved inputs and burns a second
+/// derivation range. It stays Pending; a token with no prior Pending state
+/// still proceeds (no saga can exist for it).
+#[tokio::test]
+async fn pending_token_with_mint_down_is_not_resubmitted() {
+    let dir = tempfile::tempdir().unwrap();
+    let m = setup(dir.path(), &["cashuA1"]);
+    write_journal(
+        dir.path(),
+        &[JournalEntry {
+            token: "cashuA1".to_string(),
+            outcome: TokenOutcome::Pending,
+        }],
+    );
+
+    let sink = FakeSink {
+        spent_err: true,
+        unresolved: false,
+        receive: [("cashuA1".to_string(), Rx::Ok(7))].into_iter().collect(),
+        ..Default::default()
+    };
+    let summary = m.import_tokens(&sink).await.unwrap();
+    assert_eq!(summary.pending, 1);
+    assert_eq!(summary.imported, 0);
+    let calls = sink.calls.lock().unwrap().clone();
+    assert!(
+        !calls.iter().any(|c| c.starts_with("receive:")),
+        "no fresh receive while the earlier outcome is undecided: {calls:?}"
+    );
+    assert_eq!(
+        fold_last(&read_journal(dir.path())).get("cashuA1"),
+        Some(&TokenOutcome::Pending)
+    );
+    assert_eq!(
+        m.finish(summary).unwrap(),
+        tollgate_module_basic_rust::migration::MigrationFinish::Partial
+    );
+
+    // Control: a token with no prior Pending state still proceeds when the
+    // pre-check is unavailable (no earlier saga can exist).
+    let dir2 = tempfile::tempdir().unwrap();
+    let m2 = setup(dir2.path(), &["cashuA1"]);
+    let sink2 = FakeSink {
+        spent_err: true,
+        receive: [("cashuA1".to_string(), Rx::Ok(7))].into_iter().collect(),
+        ..Default::default()
+    };
+    let summary2 = m2.import_tokens(&sink2).await.unwrap();
+    assert_eq!(
+        summary2.imported, 7,
+        "fresh token proceeds when mint is down (receive fails or succeeds on its own merits)"
+    );
+    assert!(sink2
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|c| c.starts_with("receive:")));
+}
+
+/// Codex P1 on PR #29 (r4126804510): an all-spent NUT-07 answer proves the
+/// inputs were consumed, not that this wallet recovered the outputs. While
+/// an incomplete CDK receive saga remains (recovery not settled), the token
+/// must not be terminalized `Spent` — it stays Pending until CDK settles
+/// the saga (outputs persisted), after which the terminal is safe.
+#[tokio::test]
+async fn spent_classification_requires_settled_saga() {
+    let dir = tempfile::tempdir().unwrap();
+    let m = setup(dir.path(), &["cashuA1"]);
+    write_journal(
+        dir.path(),
+        &[JournalEntry {
+            token: "cashuA1".to_string(),
+            outcome: TokenOutcome::Pending,
+        }],
+    );
+
+    // Mint says spent, but CDK recovery has not settled the saga.
+    let sink = FakeSink {
+        spent: [("cashuA1".to_string(), Some(7u64))].into_iter().collect(),
+        unresolved: true,
+        ..Default::default()
+    };
+    let summary = m.import_tokens(&sink).await.unwrap();
+    assert_eq!(
+        summary.spent, 0,
+        "must not terminalize while the saga is unresolved"
+    );
+    assert_eq!(summary.pending, 1);
+    let calls = sink.calls.lock().unwrap().clone();
+    assert!(!calls.iter().any(|c| c.starts_with("receive:")));
+    assert_eq!(
+        fold_last(&read_journal(dir.path())).get("cashuA1"),
+        Some(&TokenOutcome::Pending)
+    );
+
+    // Next boot: ensure_mint settled the saga (unresolved == false) —
+    // now the Spent terminal is provable.
+    let sink2 = FakeSink {
+        spent: [("cashuA1".to_string(), Some(7u64))].into_iter().collect(),
+        unresolved: false,
+        ..Default::default()
+    };
+    let summary2 = m.import_tokens(&sink2).await.unwrap();
+    assert_eq!(summary2.spent, 1);
+    assert_eq!(summary2.spent_sat, 7);
+    assert_eq!(summary2.pending, 0);
+    assert_eq!(
+        fold_last(&read_journal(dir.path())).get("cashuA1"),
+        Some(&TokenOutcome::Spent { amount_sat: 7 })
+    );
+    assert_eq!(
+        m.finish(summary2).unwrap(),
+        tollgate_module_basic_rust::migration::MigrationFinish::Complete
+    );
 }
 
 /// Codex P1 finding 2 (migration.rs:140): a receive Timeout is ambiguous —
