@@ -88,6 +88,9 @@ async fn main() {
                     imported_sat = summary.imported,
                     failed = summary.failed,
                     skipped_already_imported = summary.skipped_already_imported,
+                    pending = summary.pending,
+                    spent = summary.spent,
+                    spent_sat = summary.spent_sat,
                     "migration import pass complete"
                 );
                 match migration.finish(summary) {

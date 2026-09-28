@@ -17,6 +17,8 @@ struct FakeSink {
     spent: HashMap<String, Option<u64>>,
     /// token -> receive result.
     receive: HashMap<String, Rx>,
+    /// When set, every NUT-07 pre-check errors (mint unreachable).
+    spent_err: bool,
     calls: std::sync::Mutex<Vec<String>>,
 }
 
@@ -29,7 +31,10 @@ enum Rx {
 
 #[async_trait::async_trait]
 impl TokenSink for FakeSink {
-    async fn receive(&self, token: &str) -> Result<u64, tollgate_module_basic_rust::wallet::WalletError> {
+    async fn receive(
+        &self,
+        token: &str,
+    ) -> Result<u64, tollgate_module_basic_rust::wallet::WalletError> {
         use tollgate_module_basic_rust::wallet::WalletError;
         self.calls.lock().unwrap().push(format!("receive:{token}"));
         match self.receive.get(token).cloned().unwrap_or(Rx::Ok(1)) {
@@ -37,6 +42,18 @@ impl TokenSink for FakeSink {
             Rx::Timeout => Err(WalletError::Timeout(std::time::Duration::from_secs(30))),
             Rx::Definitive => Err(WalletError::TokenParse("definitive failure".into())),
         }
+    }
+
+    async fn token_spent(
+        &self,
+        token: &str,
+    ) -> Result<Option<u64>, tollgate_module_basic_rust::wallet::WalletError> {
+        use tollgate_module_basic_rust::wallet::WalletError;
+        self.calls.lock().unwrap().push(format!("spent:{token}"));
+        if self.spent_err {
+            return Err(WalletError::Timeout(std::time::Duration::from_secs(30)));
+        }
+        Ok(self.spent.get(token).copied().flatten())
     }
 }
 
@@ -104,6 +121,13 @@ async fn pending_intent_is_durable_before_receive_touches_the_mint() {
             self.saw_intent.lock().unwrap().push(saw);
             Ok(7)
         }
+
+        async fn token_spent(
+            &self,
+            _token: &str,
+        ) -> Result<Option<u64>, tollgate_module_basic_rust::wallet::WalletError> {
+            Ok(None)
+        }
     }
 
     let sink = ObservingSink {
@@ -164,5 +188,212 @@ async fn death_after_receive_leaves_pending_row_for_next_boot() {
     assert_eq!(
         fold_last(&read_journal(dir.path())).get("cashuA1"),
         Some(&TokenOutcome::Imported { amount_sat: 7 })
+    );
+}
+
+/// Codex P1 finding 2 (migration.rs:140): a receive Timeout is ambiguous —
+/// the mint may have accepted the swap — and must NOT be journaled as an
+/// ordinary Failed outcome (blind resubmission of a spent token every boot,
+/// migration permanently partial). The Pending intent row stays as the
+/// durable record and blocks finalization.
+#[tokio::test]
+async fn timeout_is_journaled_pending_not_failed() {
+    let dir = tempfile::tempdir().unwrap();
+    let m = setup(dir.path(), &["cashuA1"]);
+
+    let sink = FakeSink {
+        receive: [("cashuA1".to_string(), Rx::Timeout)].into_iter().collect(),
+        ..Default::default()
+    };
+    let summary = m.import_tokens(&sink).await.unwrap();
+    assert_eq!(summary.failed, 0, "timeout is ambiguous, not a failure");
+    assert_eq!(summary.pending, 1);
+    assert_eq!(summary.imported, 0);
+
+    assert_eq!(
+        fold_last(&read_journal(dir.path())).get("cashuA1"),
+        Some(&TokenOutcome::Pending),
+        "last journal entry for a timed-out receive must remain Pending"
+    );
+
+    let finish = m.finish(summary).unwrap();
+    assert_eq!(
+        finish,
+        tollgate_module_basic_rust::migration::MigrationFinish::Partial
+    );
+    assert!(m.old_db.exists(), "unsettled outcome retains wallet.db");
+}
+
+/// Next boot after a Timeout: ensure_mint has settled CDK's saga; the NUT-07
+/// pre-check reports the proofs spent (the receive actually landed) — the
+/// token is terminal `Spent`, never resubmitted, and completion proceeds.
+#[tokio::test]
+async fn pending_reconciles_to_spent_via_checkstate() {
+    let dir = tempfile::tempdir().unwrap();
+    let m = setup(dir.path(), &["cashuA1"]);
+    write_journal(
+        dir.path(),
+        &[JournalEntry {
+            token: "cashuA1".to_string(),
+            outcome: TokenOutcome::Pending,
+        }],
+    );
+
+    let sink = FakeSink {
+        spent: [("cashuA1".to_string(), Some(7u64))].into_iter().collect(),
+        receive: [("cashuA1".to_string(), Rx::Ok(999))].into_iter().collect(),
+        ..Default::default()
+    };
+    let summary = m.import_tokens(&sink).await.unwrap();
+    assert_eq!(summary.spent, 1);
+    assert_eq!(summary.spent_sat, 7);
+    assert_eq!(summary.imported, 0);
+    assert_eq!(summary.failed, 0);
+
+    let calls = sink.calls.lock().unwrap().clone();
+    assert!(
+        !calls.iter().any(|c| c.starts_with("receive:")),
+        "a Spent-classified token must never be resubmitted to the mint: {calls:?}"
+    );
+
+    let finish = m.finish(summary).unwrap();
+    assert_eq!(
+        finish,
+        tollgate_module_basic_rust::migration::MigrationFinish::Complete
+    );
+    assert!(
+        !m.old_db.exists(),
+        "terminal Spent does not block completion"
+    );
+    let marker = std::fs::read_to_string(&m.marker).unwrap();
+    assert!(marker.contains("state=complete"));
+    assert!(marker.contains("spent_sat=7"));
+}
+
+/// Next boot after a Timeout where the mint never accepted the swap
+/// (CDK compensated the saga): NUT-07 says unspent, the receive is
+/// re-attempted and succeeds.
+#[tokio::test]
+async fn pending_reconciles_forward_when_unspent() {
+    let dir = tempfile::tempdir().unwrap();
+    let m = setup(dir.path(), &["cashuA1"]);
+    write_journal(
+        dir.path(),
+        &[JournalEntry {
+            token: "cashuA1".to_string(),
+            outcome: TokenOutcome::Pending,
+        }],
+    );
+
+    let sink = FakeSink {
+        receive: [("cashuA1".to_string(), Rx::Ok(7))].into_iter().collect(),
+        ..Default::default()
+    };
+    let summary = m.import_tokens(&sink).await.unwrap();
+    assert_eq!(summary.imported, 7);
+    assert_eq!(summary.pending, 0);
+    assert_eq!(
+        fold_last(&read_journal(dir.path())).get("cashuA1"),
+        Some(&TokenOutcome::Imported { amount_sat: 7 })
+    );
+}
+
+/// NUT-07 unreachable (mint down): reconciliation is impossible this boot.
+/// The token must NOT be failed (the outcome is still unknown) — it stays
+/// pending and blocks finalization until a boot that can reconcile.
+#[tokio::test]
+async fn unreconcilable_token_stays_pending_not_failed() {
+    let dir = tempfile::tempdir().unwrap();
+    let m = setup(dir.path(), &["cashuA1"]);
+
+    let sink = FakeSink {
+        spent_err: true,
+        receive: [("cashuA1".to_string(), Rx::Timeout)].into_iter().collect(),
+        ..Default::default()
+    };
+    let summary = m.import_tokens(&sink).await.unwrap();
+    assert_eq!(summary.failed, 0, "cannot-reconcile is not a failure");
+    assert_eq!(summary.pending, 1);
+    assert_eq!(
+        fold_last(&read_journal(dir.path())).get("cashuA1"),
+        Some(&TokenOutcome::Pending)
+    );
+    assert_eq!(
+        m.finish(summary).unwrap(),
+        tollgate_module_basic_rust::migration::MigrationFinish::Partial
+    );
+}
+
+/// First contact with a token that was already spent (e.g. imported under
+/// the pre-journal migration, or spent by an earlier partial run that lost
+/// its journal): the pre-check classifies it terminal without a doomed
+/// receive attempt — the convergence path issue #12 asks for
+/// ("already-spent → skipped-spent").
+#[tokio::test]
+async fn already_spent_token_classified_without_receive() {
+    let dir = tempfile::tempdir().unwrap();
+    let m = setup(dir.path(), &["cashuA1"]);
+
+    let sink = FakeSink {
+        spent: [("cashuA1".to_string(), Some(9u64))].into_iter().collect(),
+        receive: [("cashuA1".to_string(), Rx::Ok(999))].into_iter().collect(),
+        ..Default::default()
+    };
+    let summary = m.import_tokens(&sink).await.unwrap();
+    assert_eq!(summary.spent, 1);
+    assert_eq!(summary.imported, 0);
+    assert_eq!(summary.failed, 0);
+
+    let calls = sink.calls.lock().unwrap().clone();
+    assert!(!calls.iter().any(|c| c.starts_with("receive:")));
+
+    assert_eq!(
+        fold_last(&read_journal(dir.path())).get("cashuA1"),
+        Some(&TokenOutcome::Spent { amount_sat: 9 })
+    );
+    assert_eq!(
+        m.finish(summary).unwrap(),
+        tollgate_module_basic_rust::migration::MigrationFinish::Complete
+    );
+}
+
+/// Definitive receive failures remain ordinary Failed (retriable on a later
+/// boot — "failure is not cached") and still block finalization.
+#[tokio::test]
+async fn definitive_failure_is_failed_and_retriable() {
+    let dir = tempfile::tempdir().unwrap();
+    let m = setup(dir.path(), &["cashuA1"]);
+
+    let sink = FakeSink {
+        receive: [("cashuA1".to_string(), Rx::Definitive)]
+            .into_iter()
+            .collect(),
+        ..Default::default()
+    };
+    let summary = m.import_tokens(&sink).await.unwrap();
+    assert_eq!(summary.failed, 1);
+    assert_eq!(summary.pending, 0);
+    assert_eq!(
+        fold_last(&read_journal(dir.path())).get("cashuA1"),
+        Some(&TokenOutcome::Failed {
+            reason: "token parse error: definitive failure".into()
+        })
+    );
+    assert_eq!(
+        m.finish(summary).unwrap(),
+        tollgate_module_basic_rust::migration::MigrationFinish::Partial
+    );
+
+    // Next boot with the cause fixed converges to Imported.
+    let sink2 = FakeSink {
+        receive: [("cashuA1".to_string(), Rx::Ok(4))].into_iter().collect(),
+        ..Default::default()
+    };
+    let summary2 = m.import_tokens(&sink2).await.unwrap();
+    assert_eq!(summary2.imported, 4);
+    assert_eq!(summary2.failed, 0);
+    assert_eq!(
+        fold_last(&read_journal(dir.path())).get("cashuA1"),
+        Some(&TokenOutcome::Imported { amount_sat: 4 })
     );
 }
