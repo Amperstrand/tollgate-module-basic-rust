@@ -6,15 +6,27 @@
 //! boot re-ran everything, counting already-imported tokens as failures.
 //!
 //! Contract:
-//! - every token attempted is journaled (`migration-journal.jsonl`) with
-//!   its outcome before the run finishes;
-//! - `wallet.db` is renamed only when **zero** imports failed — otherwise
-//!   it stays in place as the recovery source and the marker records
-//!   `partial`;
-//! - a re-run skips tokens the journal already shows as imported, so
-//!   crash-recovery converges instead of re-failing spent tokens;
+//! - a `Pending` intent entry is journaled (`migration-journal.jsonl`) and
+//!   **fsynced before `receive()` touches the mint** — the write-ahead-intent
+//!   discipline AGENTS.md mandates for money-moving CDK calls ("a TollGate
+//!   durable record created **before** the call, advanced after each step,
+//!   and reconciled at startup"). Death between receive and the outcome
+//!   append leaves the intent row, not nothing;
+//! - ambiguous receive outcomes (timeout) rest in `Pending` and are
+//!   reconciled on the next boot via NUT-07 checkstate — after CDK's
+//!   `ensure_mint`/`recover_incomplete_sagas` has settled the wallet-side
+//!   saga — never blindly resubmitted (AGENTS.md: "Ambiguous network
+//!   results must be reconciled, not blindly retried");
+//! - tokens proven spent at the mint are terminal (`Spent`): retrying can
+//!   never import them, so they do not block completion — the value either
+//!   already sits in this deterministic wallet or is unrecoverable;
+//! - `wallet.db` is renamed only when **zero** imports failed and **zero**
+//!   outcomes are still unsettled (`Pending`) — otherwise it stays in place
+//!   as the recovery source and the marker records `partial`;
+//! - a re-run skips tokens the journal already shows as imported or spent,
+//!   so crash-recovery converges instead of re-failing spent tokens;
 //! - the journal and marker are fsynced; a torn trailing line is skipped
-//!   by the reader.
+//!   by the reader (a torn intent line means receive never started).
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -23,6 +35,24 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::wallet::TollWallet;
+
+#[async_trait::async_trait]
+impl TokenSink for TollWallet {
+    async fn receive(&self, token: &str) -> Result<u64, crate::wallet::WalletError> {
+        TollWallet::receive(self, token).await
+    }
+
+    async fn token_spent(&self, token: &str) -> Result<Option<u64>, crate::wallet::WalletError> {
+        TollWallet::token_spent(self, token).await
+    }
+
+    async fn mint_has_unresolved_receive(
+        &self,
+        token: &str,
+    ) -> Result<bool, crate::wallet::WalletError> {
+        TollWallet::mint_has_unresolved_receive(self, token).await
+    }
+}
 
 pub const JOURNAL_NAME: &str = "migration-journal.jsonl";
 pub const MARKER_NAME: &str = ".migration_complete";
@@ -35,16 +65,59 @@ pub enum TokenOutcome {
     /// The token was received into the CDK wallet (this boot or a previous
     /// one — a re-run treats `Imported` as done).
     Imported { amount_sat: u64 },
-    /// Receive failed; the reason is preserved for the operator. The token
-    /// string is retained in the journal so it can be retried or hand-fed
-    /// to another wallet.
+    /// Receive failed definitively; the reason is preserved for the operator
+    /// and the token is retried on a later boot ("failure is not cached").
+    /// The token string is retained in the journal so it can be retried or
+    /// hand-fed to another wallet.
     Failed { reason: String },
+    /// Intent record: this process was about to (or did) hand the token to
+    /// `receive()`, but no settled outcome is durable. Written and fsynced
+    /// BEFORE the receive call, mirroring how CDK persists saga state before
+    /// its network calls. Covers death mid-receive and ambiguous (timed-out)
+    /// receives; reconciled on a later boot after CDK saga recovery.
+    Pending,
+    /// Every proof of the token is spent at the mint (NUT-07 checkstate):
+    /// an earlier receive of ours completed (the value already sits in the
+    /// deterministic wallet) or the token was spent elsewhere — in either
+    /// case retrying can never import it. Terminal; the amount is re-derived
+    /// from the token so the summary stays honest.
+    Spent { amount_sat: u64 },
 }
 
 impl TokenOutcome {
     fn is_imported(&self) -> bool {
         matches!(self, TokenOutcome::Imported { .. })
     }
+
+    fn is_spent(&self) -> bool {
+        matches!(self, TokenOutcome::Spent { .. })
+    }
+
+    fn is_pending(&self) -> bool {
+        matches!(self, TokenOutcome::Pending)
+    }
+}
+
+/// What the import loop may call on the wallet. A trait so crash-window
+/// tests can fake the mint side and observe journal ordering without a
+/// live CDK wallet.
+#[async_trait::async_trait]
+pub trait TokenSink {
+    async fn receive(&self, token: &str) -> Result<u64, crate::wallet::WalletError>;
+
+    /// NUT-07 reconciliation: `Ok(Some(amount_sat))` iff every proof of the
+    /// token is spent at the mint. Errors mean "cannot reconcile right now"
+    /// (mint unreachable), NOT "unspent".
+    async fn token_spent(&self, token: &str) -> Result<Option<u64>, crate::wallet::WalletError>;
+
+    /// Whether the token's mint wallet still holds an incomplete CDK
+    /// receive saga — a purely local query (works with the mint down).
+    /// While true, an earlier receive's outcome is undecided and the token
+    /// must be neither re-submitted nor terminalized this boot.
+    async fn mint_has_unresolved_receive(
+        &self,
+        token: &str,
+    ) -> Result<bool, crate::wallet::WalletError>;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,6 +131,16 @@ pub struct MigrationSummary {
     pub imported: u64,
     pub failed: u64,
     pub skipped_already_imported: u64,
+    /// Tokens whose outcome is still unsettled (`Pending`): death mid-loop,
+    /// or a receive whose result was ambiguous. Pending does not block
+    /// re-runs — these are reconciled on the next boot — but it DOES block
+    /// finalization (rename + complete marker).
+    pub pending: u64,
+    /// Tokens proven spent at the mint via NUT-07: terminal (value already
+    /// in the wallet from an earlier receive, or unrecoverable). Does NOT
+    /// block finalization — retrying can never import them.
+    pub spent: u64,
+    pub spent_sat: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -104,35 +187,139 @@ impl FirstBootMigration {
     }
 
     /// Import every token from `tokens_file`, journaling outcomes. Tokens
-    /// already journaled `Imported` are skipped (crash-recovery
-    /// convergence). The journal is fsynced before returning.
+    /// whose last journal entry is `Imported` are skipped (crash-recovery
+    /// convergence). Every attempt is preceded by a fsynced `Pending`
+    /// intent entry, so death after the mint moved value but before the
+    /// outcome append leaves a durable record instead of nothing.
     pub async fn import_tokens(
         &self,
-        wallet: &TollWallet,
+        sink: &dyn TokenSink,
     ) -> Result<MigrationSummary, MigrationError> {
         let mut imported = 0u64;
         let mut failed = 0u64;
         let mut skipped = 0u64;
+        let mut pending = 0u64;
+        let mut spent = 0u64;
+        let mut spent_sat = 0u64;
 
-        let already = self.previous_outcomes();
-        let done: std::collections::HashSet<String> = already
-            .iter()
-            .filter(|e| e.outcome.is_imported())
-            .map(|e| e.token.clone())
-            .collect();
-
+        let already = fold_last_outcomes(&read_journal(&self.journal));
         let tokens = read_tokens(&self.tokens_file)?;
         let mut journal_file = open_append(&self.journal)?;
 
         for token in tokens {
-            if done.contains(&token) {
-                skipped += 1;
+            match already.get(&token) {
+                Some(outcome) if outcome.is_imported() => {
+                    skipped += 1;
+                    continue;
+                }
+                Some(outcome) if outcome.is_spent() => {
+                    spent += 1;
+                    if let TokenOutcome::Spent { amount_sat } = outcome {
+                        spent_sat += amount_sat;
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+
+            // AGENTS.md ("Ambiguous network results must be reconciled, not
+            // blindly retried"): before (re)attempting a token that is not
+            // terminally done, ask the mint whether its proofs are already
+            // spent. This settles both death-mid-receive Pending rows (CDK's
+            // recover_incomplete_sagas has already run via ensure_mint at
+            // boot) and tokens spent under a pre-journal migration, without
+            // inferring anything from receive error text.
+            let spent_check = sink.token_spent(&token).await;
+            let prior_pending = matches!(already.get(&token), Some(TokenOutcome::Pending));
+
+            // r4126804510: an all-spent NUT-07 answer proves only that the
+            // INPUTS were consumed — not that this wallet recovered the
+            // replacement outputs. CDK deletes a receive saga exactly when
+            // its outcome is persisted (outputs recovered via NUT-19 replay
+            // or NUT-09 /restore, compensated, or closed value-less with a
+            // logged warning), so "no incomplete receive saga" is CDK's own
+            // "operation decided" signal. While one remains, defer.
+            //
+            // r4126804498: a token whose earlier attempt may still be in
+            // flight (unresolved saga, or Pending with the mint
+            // unreachable) must not receive a fresh submit — that replays
+            // the same inputs without reconciling and burns a second
+            // derivation range (AGENTS.md forbids both).
+            let unresolved = match sink.mint_has_unresolved_receive(&token).await {
+                Ok(v) => v,
+                // Deterministic local answers: an unparseable token cannot
+                // have a saga. Only storage-level failures are "cannot
+                // determine" — those defer conservatively.
+                Err(crate::wallet::WalletError::TokenParse(_)) => false,
+                Err(e) => {
+                    tracing::warn!(error = %e, "migration: cannot inspect local saga state; treating token as unresolved");
+                    true
+                }
+            };
+            let untouchable = unresolved || (prior_pending && spent_check.is_err());
+            if untouchable {
+                tracing::warn!(
+                    "migration: token outcome undecided (unresolved receive saga or unreachable mint); deferring to next boot"
+                );
+                pending += 1;
                 continue;
             }
-            let outcome = match wallet.receive(&token).await {
+
+            match spent_check {
+                Ok(Some(amount_sat)) => {
+                    tracing::warn!(
+                        amount_sat,
+                        "migration: token already spent at mint; marking terminal Spent (value sits in the wallet from an earlier receive, or is unrecoverable)"
+                    );
+                    spent += 1;
+                    spent_sat += amount_sat;
+                    append_entry(
+                        &mut journal_file,
+                        &JournalEntry {
+                            token: token.clone(),
+                            outcome: TokenOutcome::Spent { amount_sat },
+                        },
+                    )?;
+                    journal_file.sync_all()?;
+                    continue;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::debug!(error = %e, "migration: NUT-07 pre-check unavailable; proceeding to receive");
+                }
+            }
+
+            append_entry(
+                &mut journal_file,
+                &JournalEntry {
+                    token: token.clone(),
+                    outcome: TokenOutcome::Pending,
+                },
+            )?;
+            // AGENTS.md ("Fund safety..." hard rules / CDK boundaries): the
+            // intent must be durable BEFORE the money-moving call — without
+            // this fsync a crash after receive leaves no record that the
+            // token was ever attempted, and the next boot replays a now-
+            // spent token as a permanent failure.
+            journal_file.sync_all()?;
+
+            let outcome = match sink.receive(&token).await {
                 Ok(amount_sat) => {
                     imported += amount_sat;
                     TokenOutcome::Imported { amount_sat }
+                }
+                Err(crate::wallet::WalletError::Timeout(d)) => {
+                    // Ambiguous, not failed: the mint may have accepted the
+                    // swap and CDK's saga survives in SQLite for the next
+                    // boot's ensure_mint/recover_incomplete_sagas to settle.
+                    // The Pending intent row written above IS the durable
+                    // record; next boot's NUT-07 pre-check classifies it.
+                    tracing::warn!(
+                        timeout_secs = d.as_secs(),
+                        "migration: receive timed out (ambiguous); reconciling on next boot"
+                    );
+                    pending += 1;
+                    TokenOutcome::Pending
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "migration: token import failed (retained in journal)");
@@ -142,13 +329,15 @@ impl FirstBootMigration {
                     }
                 }
             };
-            append_entry(
-                &mut journal_file,
-                &JournalEntry {
-                    token: token.clone(),
-                    outcome,
-                },
-            )?;
+            if !outcome.is_pending() {
+                append_entry(
+                    &mut journal_file,
+                    &JournalEntry {
+                        token: token.clone(),
+                        outcome,
+                    },
+                )?;
+            }
         }
         journal_file.sync_all()?;
 
@@ -156,36 +345,42 @@ impl FirstBootMigration {
             imported,
             failed,
             skipped_already_imported: skipped,
+            pending,
+            spent,
+            spent_sat,
         })
     }
 
-    /// Finalize the migration: rename the old DB only on a fully clean
-    /// run, and write the marker (fsynced) recording the outcome.
+    /// Finalize the migration: rename the old DB only when no token failed
+    /// AND no outcome is still unsettled, and write the marker (fsynced)
+    /// recording the outcome.
     pub fn finish(&self, summary: MigrationSummary) -> Result<MigrationFinish, MigrationError> {
-        let finish = if summary.failed == 0 {
+        let clean = summary.failed == 0 && summary.pending == 0;
+        let finish = if clean {
             let backup = self.old_db.with_file_name(OLD_DB_BACKUP_NAME);
             std::fs::rename(&self.old_db, &backup).map_err(MigrationError::Io)?;
             MigrationFinish::Complete
         } else {
             tracing::error!(
                 failed = summary.failed,
+                pending = summary.pending,
                 old_db = %self.old_db.display(),
-                "migration incomplete: {} token(s) failed to import; wallet.db RETAINED as recovery source",
-                summary.failed
+                "migration incomplete: {} token(s) failed, {} unsettled; wallet.db RETAINED as recovery source",
+                summary.failed,
+                summary.pending
             );
             MigrationFinish::Partial
         };
 
         let marker_body = format!(
-            "state={}\nimported_sat={}\nfailed={}\nskipped_already_imported={}\ndate={}\n",
-            if summary.failed == 0 {
-                "complete"
-            } else {
-                "partial"
-            },
+            "state={}\nimported_sat={}\nfailed={}\nskipped_already_imported={}\npending={}\nspent={}\nspent_sat={}\ndate={}\n",
+            if clean { "complete" } else { "partial" },
             summary.imported,
             summary.failed,
             summary.skipped_already_imported,
+            summary.pending,
+            summary.spent,
+            summary.spent_sat,
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -200,10 +395,80 @@ impl FirstBootMigration {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportOutcome {
+    /// Export ran this boot and exited 0.
+    Succeeded,
+    /// Export ran this boot and exited nonzero — the artifact on disk was
+    /// not refreshed by a clean run and must not be imported/finalized
+    /// this boot (retry the export next boot).
+    Failed,
+    /// Export did not run, or could not be spawned (tool missing) — in
+    /// which case nothing touched `tokens.jsonl` this boot, so a file put
+    /// there by the deliberate manual export flow (MIGRATION.md) stays
+    /// importable.
+    NotRun,
+}
+
+/// Codex P1 on PR #21 (main.rs:84): the import gate must key on the
+/// export's exit status, not bare `tokens.jsonl` existence — the exporter
+/// historically truncated the file before finishing, so an existence-only
+/// gate could import a partial artifact and finalize the migration with
+/// unexported tokens silently unmigrated.
+pub fn should_import_tokens(should_run: bool, tokens_exist: bool, export: ExportOutcome) -> bool {
+    should_run && tokens_exist && export != ExportOutcome::Failed
+}
+
+/// Fold a raw journal into per-token outcome; the LAST entry for a token
+/// wins (Pending → Failed → Imported is a normal retry sequence; a trailing
+/// Pending is an unsettled attempt to be reconciled).
+fn fold_last_outcomes(entries: &[JournalEntry]) -> std::collections::HashMap<String, TokenOutcome> {
+    let mut folded = std::collections::HashMap::new();
+    for entry in entries {
+        folded.insert(entry.token.clone(), entry.outcome.clone());
+    }
+    folded
+}
+
+/// Whether the completion marker says the migration is done. Accepts the
+/// formats that can predate the `state=` field (Codex P2 on PR #21:
+/// rejecting them restarted money-moving imports on a completed system):
+///
+/// - current: a `state=complete` line;
+/// - legacy auto-migration: `imported=N`/`failed=N`/`date=N` with no
+///   `state=` line — complete only when `failed=0` (a legacy marker with
+///   failures describes an incomplete migration; the re-run converges via
+///   the journal's `Spent` terminal state instead of re-failing spent
+///   tokens);
+/// - empty marker (the `touch` procedure MIGRATION.md documents as the
+///   final step of a manual migration): the operator's explicit "done"
+///   signal — honored as complete.
 fn marker_is_complete(path: &Path) -> bool {
-    std::fs::read_to_string(path)
-        .map(|body| body.lines().any(|l| l.trim() == "state=complete"))
-        .unwrap_or(false)
+    let Ok(body) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    if body.trim().is_empty() {
+        return true;
+    }
+    let mut saw_imported = false;
+    let mut legacy_failed: Option<u64> = None;
+    for line in body.lines() {
+        let l = line.trim();
+        if l == "state=complete" {
+            return true;
+        }
+        if l.starts_with("state=") || l.starts_with("pending=") {
+            // Any other explicit state (partial, …) is authoritative.
+            return false;
+        }
+        if l.starts_with("imported=") {
+            saw_imported = true;
+        }
+        if let Some(v) = l.strip_prefix("failed=") {
+            legacy_failed = v.parse().ok();
+        }
+    }
+    saw_imported && legacy_failed == Some(0)
 }
 
 fn read_tokens(path: &Path) -> Result<Vec<String>, MigrationError> {
@@ -307,10 +572,11 @@ mod tests {
             "old wallet.db must be retained on partial"
         );
         let entries = read_journal(&m.journal);
-        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.len(), 4);
         assert!(entries
             .iter()
-            .all(|e| matches!(e.outcome, TokenOutcome::Failed { .. })));
+            .all(|e| matches!(e.outcome, TokenOutcome::Failed { .. })
+                || e.outcome == TokenOutcome::Pending));
         let marker = std::fs::read_to_string(&m.marker).unwrap();
         assert!(marker.contains("state=partial"));
         assert!(m.should_run(), "partial marker must allow a retry run");
@@ -350,12 +616,40 @@ mod tests {
                 imported: 9,
                 failed: 0,
                 skipped_already_imported: 0,
+                pending: 0,
+                spent: 0,
+                spent_sat: 0,
             })
             .unwrap();
         assert_eq!(finish, MigrationFinish::Complete);
         assert!(!m.old_db.exists(), "old db renamed away on clean finish");
         assert!(m.old_db.with_file_name(OLD_DB_BACKUP_NAME).exists());
         assert!(!m.should_run(), "complete marker must block further runs");
+    }
+
+    #[test]
+    fn unsettled_pending_blocks_rename_and_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = setup(dir.path(), &["cashuAtoken1"], &[]);
+
+        let finish = m
+            .finish(MigrationSummary {
+                imported: 5,
+                failed: 0,
+                skipped_already_imported: 0,
+                pending: 1,
+                spent: 0,
+                spent_sat: 0,
+            })
+            .unwrap();
+        assert_eq!(finish, MigrationFinish::Partial);
+        assert!(
+            m.old_db.exists(),
+            "unsettled outcome must retain wallet.db (value may have moved)"
+        );
+        let marker = std::fs::read_to_string(&m.marker).unwrap();
+        assert!(marker.contains("state=partial"));
+        assert!(marker.contains("pending=1"));
     }
 
     #[test]
@@ -382,5 +676,80 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let m = FirstBootMigration::new(dir.path());
         assert!(!m.should_run());
+    }
+
+    /// Fakes the mint side and records, at the moment `receive` runs,
+    /// whether the journal already contains a durable Pending intent for
+    /// the token — the write-ahead-intent contract under test.
+    #[derive(Debug, Default)]
+    struct ObservingSink {
+        journal_path: std::sync::Mutex<Option<PathBuf>>,
+        saw_intent_before_receive: std::sync::Mutex<Vec<bool>>,
+    }
+
+    #[async_trait::async_trait]
+    impl TokenSink for ObservingSink {
+        async fn token_spent(
+            &self,
+            _token: &str,
+        ) -> Result<Option<u64>, crate::wallet::WalletError> {
+            Ok(None)
+        }
+
+        async fn mint_has_unresolved_receive(
+            &self,
+            _token: &str,
+        ) -> Result<bool, crate::wallet::WalletError> {
+            Ok(false)
+        }
+
+        async fn receive(&self, token: &str) -> Result<u64, crate::wallet::WalletError> {
+            let journal = self.journal_path.lock().unwrap().clone();
+            let saw_intent = match journal
+                .map(std::fs::read_to_string)
+                .map(|body| body.unwrap_or_default())
+            {
+                Some(body) => body.lines().any(|line| {
+                    serde_json::from_str::<JournalEntry>(line)
+                        .map(|e| e.token == token && e.outcome == TokenOutcome::Pending)
+                        .unwrap_or(false)
+                }),
+                None => false,
+            };
+            self.saw_intent_before_receive
+                .lock()
+                .unwrap()
+                .push(saw_intent);
+            Ok(7)
+        }
+    }
+
+    #[tokio::test]
+    async fn receive_intent_is_durable_before_the_mint_is_touched() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = setup(dir.path(), &["cashuAtoken1"], &[]);
+
+        let sink = ObservingSink::default();
+        *sink.journal_path.lock().unwrap() = Some(m.journal.clone());
+
+        let summary = m.import_tokens(&sink).await.unwrap();
+        assert_eq!(summary.imported, 7);
+
+        let observations = sink.saw_intent_before_receive.lock().unwrap();
+        assert_eq!(
+            observations.len(),
+            1,
+            "each attempted token hits the mint exactly once per run"
+        );
+        assert!(
+            observations[0],
+            "Pending intent must be journaled (and fsynced) BEFORE receive() is called"
+        );
+
+        let folded = fold_last_outcomes(&read_journal(&m.journal));
+        assert_eq!(
+            folded.get("cashuAtoken1"),
+            Some(&TokenOutcome::Imported { amount_sat: 7 })
+        );
     }
 }

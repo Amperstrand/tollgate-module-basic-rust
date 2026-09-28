@@ -175,6 +175,109 @@ impl TollWallet {
         }
     }
 
+    /// NUT-07 check whether every proof of `token_str` is spent at the mint.
+    ///
+    /// `Ok(Some(amount_sat))` — all proofs `State::Spent`: this token can
+    /// never be received again (an earlier receive of ours completed, or it
+    /// was spent elsewhere). `Ok(None)` — at least one proof is still
+    /// spendable.
+    ///
+    /// Reconciliation surface for the migration (AGENTS.md: "Ambiguous
+    /// network results must be reconciled, not blindly retried"): after
+    /// `ensure_mint` has run CDK's `recover_incomplete_sagas`, this answers
+    /// definitively whether a timed-out receive actually landed — no
+    /// inference from error text.
+    pub async fn token_spent(&self, token_str: &str) -> Result<Option<u64>, WalletError> {
+        use cdk::nuts::nut07::State;
+        use cdk::nuts::{KeySetInfo, Token};
+        use cdk::wallet::types::KeysetLoadPolicy;
+
+        let token: Token = token_str
+            .parse()
+            .map_err(|e| WalletError::TokenParse(format!("{e}")))?;
+        let mint_url = token
+            .mint_url()
+            .map_err(|e| WalletError::TokenParse(format!("{e}")))?
+            .to_string();
+        let normalized = canonical_mint_url(&mint_url);
+        let amount_sat: u64 = token.value().map(|a| a.into()).unwrap_or(0);
+
+        let wallet = self
+            .wallets
+            .get(normalized.as_str())
+            .ok_or_else(|| WalletError::WalletNotFound(normalized.to_string()))?
+            .clone();
+
+        let result = timeout(OP_TIMEOUT, async {
+            let w = wallet.lock().await;
+            // Same keyset-resolution path receive() itself uses (via the
+            // metadata cache): proofs() maps each proof's short keyset id to
+            // the mint's long id before NUT-07.
+            let keysets = w.keysets(KeysetLoadPolicy::default()).await?;
+            let keyset_infos: Vec<KeySetInfo> = keysets
+                .iter()
+                .map(|ks| KeySetInfo {
+                    id: ks.id,
+                    unit: ks.unit.clone(),
+                    active: ks.active.unwrap_or(true),
+                    input_fee_ppk: ks.input_fee_ppk,
+                    final_expiry: ks.final_expiry,
+                })
+                .collect();
+            let proofs = token.proofs(&keyset_infos)?;
+            let states = w.check_proofs_spent(proofs).await?;
+            Ok::<_, cdk::Error>(states.iter().all(|s| s.state == State::Spent))
+        })
+        .await;
+
+        match result {
+            Ok(Ok(true)) => Ok(Some(amount_sat)),
+            Ok(Ok(false)) => Ok(None),
+            Ok(Err(e)) => Err(WalletError::Cdk(e)),
+            Err(_) => Err(WalletError::Timeout(OP_TIMEOUT)),
+        }
+    }
+
+    /// Whether the per-mint CDK wallet still holds an incomplete *receive*
+    /// saga — an earlier receive for this mint that `recover_incomplete_sagas`
+    /// has not settled. CDK deletes a saga exactly when its outcome is
+    /// persisted: outputs recovered via NUT-19 replay or NUT-09 `/restore`,
+    /// compensated, or — with a logged warning — closed value-less. While a
+    /// receive saga is incomplete, the operation's outcome is undecided.
+    ///
+    /// Local SQLite query (no network): the migration reconciliation gate
+    /// works even when the mint is unreachable (AGENTS.md: ambiguous results
+    /// are reconciled, not retried).
+    pub async fn mint_has_unresolved_receive(&self, token_str: &str) -> Result<bool, WalletError> {
+        use cdk::wallet::types::WalletSagaState;
+
+        let token: cashu::nuts::Token = token_str
+            .parse()
+            .map_err(|e| WalletError::TokenParse(format!("{e}")))?;
+        let mint_url = token
+            .mint_url()
+            .map_err(|e| WalletError::TokenParse(format!("{e}")))?
+            .to_string();
+        let normalized = canonical_mint_url(&mint_url);
+
+        let wallet = match self.wallets.get(normalized.as_str()) {
+            Some(w) => w.clone(),
+            // No wallet for this mint => no saga can exist for it; the
+            // receive path will surface the underlying classification.
+            None => return Ok(false),
+        };
+
+        let w = wallet.lock().await;
+        let sagas = w
+            .localstore
+            .get_incomplete_sagas()
+            .await
+            .map_err(|e| WalletError::Database(e.to_string()))?;
+        Ok(sagas
+            .into_iter()
+            .any(|s| matches!(s.state, WalletSagaState::Receive(_))))
+    }
+
     /// Send tokens (maps gonuts `Send`).
     /// Returns the serialized Cashu V4 token string.
     pub async fn send(
