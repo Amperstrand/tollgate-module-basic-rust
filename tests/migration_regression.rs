@@ -6,8 +6,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use tollgate_module_basic_rust::migration::{
-    FirstBootMigration, JournalEntry, TokenOutcome, TokenSink, JOURNAL_NAME, OLD_DB_NAME,
-    TOKENS_FILE_NAME,
+    should_import_tokens, ExportOutcome, FirstBootMigration, JournalEntry, TokenOutcome, TokenSink,
+    JOURNAL_NAME, OLD_DB_NAME, TOKENS_FILE_NAME,
 };
 
 #[derive(Debug, Default)]
@@ -189,6 +189,24 @@ async fn death_after_receive_leaves_pending_row_for_next_boot() {
         fold_last(&read_journal(dir.path())).get("cashuA1"),
         Some(&TokenOutcome::Imported { amount_sat: 7 })
     );
+}
+
+/// Codex P1 finding 3 (main.rs:84): after a failed (nonzero-exit) re-export,
+/// the import gate must NOT run on bare tokens.jsonl existence — the
+/// pre-atomicity exporter truncated the file before finishing, so a partial
+/// artifact could be imported and the migration finalized with unexported
+/// tokens silently unmigrated.
+#[test]
+fn failed_export_blocks_import_even_when_tokens_file_exists() {
+    assert!(should_import_tokens(true, true, ExportOutcome::Succeeded));
+    assert!(
+        !should_import_tokens(true, true, ExportOutcome::Failed),
+        "a nonzero-exit export must block import for this boot"
+    );
+    // Spawn failure (tool missing) leaves a manually exported file importable.
+    assert!(should_import_tokens(true, true, ExportOutcome::NotRun));
+    assert!(!should_import_tokens(false, true, ExportOutcome::Succeeded));
+    assert!(!should_import_tokens(true, false, ExportOutcome::Succeeded));
 }
 
 /// Codex P1 finding 2 (migration.rs:140): a receive Timeout is ambiguous —

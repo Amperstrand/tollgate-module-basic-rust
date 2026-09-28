@@ -107,6 +107,15 @@ func main() {
 }
 
 func run(boltPath, outDir string) error {
+	return runWithCrashAfter(boltPath, outDir, 0)
+}
+
+// runWithCrashAfter mirrors run() but terminates the process with exit
+// status 9 once crashAfter token lines have been written to the temp
+// artifact. It exists solely as a seam for the crash-window regression
+// test: it simulates kill -9 / power loss mid-export so the test can
+// assert that a previously exported tokens.jsonl is never left truncated.
+func runWithCrashAfter(boltPath, outDir string, crashAfter int) error {
 	// Open bbolt read-only
 	db, err := bolt.Open(boltPath, 0600, &bolt.Options{ReadOnly: true})
 	if err != nil {
@@ -142,17 +151,22 @@ func run(boltPath, outDir string) error {
 		return fmt.Errorf("creating output dir: %w", err)
 	}
 
-	// Emit tokens.jsonl — one V3 token per mint+keyset group
+	// All artifacts are built under temp names in the SAME directory (same
+	// filesystem, so each rename is atomic). tokens.jsonl is renamed LAST:
+	// its existence at the final path is the success stamp the Rust
+	// importer gates on — a crash or nonzero exit can never expose a
+	// truncated token file to the migration (Codex P1 on PR #21).
 	tokensPath := filepath.Join(outDir, "tokens.jsonl")
-	tokensFile, err := os.Create(tokensPath)
+	tokensTmp := tokensPath + ".tmp"
+	tokensFile, err := os.Create(tokensTmp)
 	if err != nil {
-		return fmt.Errorf("creating tokens.jsonl: %w", err)
+		return fmt.Errorf("creating tokens.jsonl.tmp: %w", err)
 	}
-	defer tokensFile.Close()
 
 	totalProofs := 0
 	totalAmount := uint64(0)
 	var healthEntries []KeysetHealth
+	linesWritten := 0
 
 	for mintURL, ksList := range keysets {
 		for _, ks := range ksList {
@@ -184,11 +198,22 @@ func run(boltPath, outDir string) error {
 
 			tokenJSON, err := json.Marshal(token)
 			if err != nil {
+				tokensFile.Close()
+				os.Remove(tokensTmp)
 				return fmt.Errorf("marshalling token for keyset %s: %w", ks.Id, err)
 			}
 
 			// Write one token per line (JSONL)
-			tokensFile.Write(append(tokenJSON, '\n'))
+			if _, err := tokensFile.Write(append(tokenJSON, '\n')); err != nil {
+				tokensFile.Close()
+				os.Remove(tokensTmp)
+				return fmt.Errorf("writing token for keyset %s: %w", ks.Id, err)
+			}
+			linesWritten++
+			if crashAfter > 0 && linesWritten >= crashAfter {
+				// Simulated power loss (test seam only; see runWithCrashAfter).
+				os.Exit(9)
+			}
 
 			// Calculate health
 			ksAmount := uint64(0)
@@ -210,6 +235,16 @@ func run(boltPath, outDir string) error {
 		}
 	}
 
+	if err := tokensFile.Sync(); err != nil {
+		tokensFile.Close()
+		os.Remove(tokensTmp)
+		return fmt.Errorf("fsyncing tokens.jsonl.tmp: %w", err)
+	}
+	if err := tokensFile.Close(); err != nil {
+		os.Remove(tokensTmp)
+		return fmt.Errorf("closing tokens.jsonl.tmp: %w", err)
+	}
+
 	// Emit keyset_counters.json
 	countersPath := filepath.Join(outDir, "keyset_counters.json")
 	var counters []KeysetCounterEntry
@@ -222,9 +257,11 @@ func run(boltPath, outDir string) error {
 	}
 	countersJSON, err := json.MarshalIndent(counters, "", "  ")
 	if err != nil {
+		os.Remove(tokensTmp)
 		return fmt.Errorf("marshalling counters: %w", err)
 	}
-	if err := os.WriteFile(countersPath, countersJSON, 0644); err != nil {
+	if err := atomicWriteFile(countersPath, countersJSON); err != nil {
+		os.Remove(tokensTmp)
 		return fmt.Errorf("writing keyset_counters.json: %w", err)
 	}
 
@@ -238,11 +275,24 @@ func run(boltPath, outDir string) error {
 	}
 	reportJSON, err := json.MarshalIndent(report, "", "  ")
 	if err != nil {
+		os.Remove(tokensTmp)
 		return fmt.Errorf("marshalling report: %w", err)
 	}
 	reportPath := filepath.Join(outDir, "migration-report.json")
-	if err := os.WriteFile(reportPath, reportJSON, 0644); err != nil {
+	if err := atomicWriteFile(reportPath, reportJSON); err != nil {
+		os.Remove(tokensTmp)
 		return fmt.Errorf("writing migration-report.json: %w", err)
+	}
+
+	// Commit point: only now does the complete token set become visible.
+	if err := os.Rename(tokensTmp, tokensPath); err != nil {
+		os.Remove(tokensTmp)
+		return fmt.Errorf("publishing tokens.jsonl: %w", err)
+	}
+	// Best-effort durability of the directory entries; the artifacts are
+	// already complete and visible, so a failure here is only a warning.
+	if err := syncDir(outDir); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: fsync of %s failed: %v\n", outDir, err)
 	}
 
 	fmt.Printf("Export complete: %d proofs, %d sats across %d keysets\n",
@@ -252,6 +302,41 @@ func run(boltPath, outDir string) error {
 	fmt.Printf("  migration-report.json → %s\n", reportPath)
 
 	return nil
+}
+
+// atomicWriteFile writes data via a temp file in the same directory and
+// renames it into place only after a successful fsync, so a crash leaves
+// either the complete previous content or the complete new content.
+func atomicWriteFile(path string, data []byte) error {
+	tmp := path + ".tmp"
+	f, err := os.Create(tmp)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }
 
 // loadKeysets reads the nested keysets bucket structure.

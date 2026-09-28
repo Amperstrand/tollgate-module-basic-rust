@@ -38,6 +38,7 @@ async fn main() {
 
     // First-boot gonuts → CDK migration (value-retaining, #12)
     let migration = migration::FirstBootMigration::new(&db_dir);
+    let mut export_outcome = migration::ExportOutcome::NotRun;
     if migration.should_run() {
         tracing::info!("detected gonuts bbolt wallet, attempting auto-migration");
         let export_tool = std::env::var("GONUTS_EXPORT_PATH")
@@ -49,14 +50,20 @@ async fn main() {
             .await;
         match exported {
             Ok(o) if o.status.success() => {
-                tracing::info!(tokens_file = %migration.tokens_file.display(), "gonuts-export completed")
+                tracing::info!(tokens_file = %migration.tokens_file.display(), "gonuts-export completed");
+                export_outcome = migration::ExportOutcome::Succeeded;
             }
-            Ok(o) => tracing::error!(
-                stderr = String::from_utf8_lossy(&o.stderr).to_string(),
-                "gonuts-export failed; migration will retry next boot (wallet.db retained)"
-            ),
+            Ok(o) => {
+                tracing::error!(
+                    stderr = String::from_utf8_lossy(&o.stderr).to_string(),
+                    "gonuts-export failed; tokens not imported this boot (wallet.db retained)"
+                );
+                export_outcome = migration::ExportOutcome::Failed;
+            }
             Err(e) => {
-                tracing::error!(error = %e, export_tool = %export_tool, "gonuts-export not found; manual: gonuts-export wallet.db tokens.jsonl — migration will retry next boot (wallet.db retained)")
+                // Spawn failure = nothing touched tokens.jsonl this boot, so a
+                // manually exported file (MIGRATION.md) stays importable.
+                tracing::error!(error = %e, export_tool = %export_tool, "gonuts-export not found; manual: gonuts-export wallet.db tokens.jsonl — migration will retry next boot (wallet.db retained)");
             }
         }
     }
@@ -81,7 +88,11 @@ async fn main() {
         }
     }
 
-    if migration.should_run() && migration.tokens_file.exists() {
+    if migration::should_import_tokens(
+        migration.should_run(),
+        migration.tokens_file.exists(),
+        export_outcome,
+    ) {
         match migration.import_tokens(&toll_wallet).await {
             Ok(summary) => {
                 tracing::info!(

@@ -343,6 +343,30 @@ impl FirstBootMigration {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportOutcome {
+    /// Export ran this boot and exited 0.
+    Succeeded,
+    /// Export ran this boot and exited nonzero — the artifact on disk was
+    /// not refreshed by a clean run and must not be imported/finalized
+    /// this boot (retry the export next boot).
+    Failed,
+    /// Export did not run, or could not be spawned (tool missing) — in
+    /// which case nothing touched `tokens.jsonl` this boot, so a file put
+    /// there by the deliberate manual export flow (MIGRATION.md) stays
+    /// importable.
+    NotRun,
+}
+
+/// Codex P1 on PR #21 (main.rs:84): the import gate must key on the
+/// export's exit status, not bare `tokens.jsonl` existence — the exporter
+/// historically truncated the file before finishing, so an existence-only
+/// gate could import a partial artifact and finalize the migration with
+/// unexported tokens silently unmigrated.
+pub fn should_import_tokens(should_run: bool, tokens_exist: bool, export: ExportOutcome) -> bool {
+    should_run && tokens_exist && export != ExportOutcome::Failed
+}
+
 /// Fold a raw journal into per-token outcome; the LAST entry for a token
 /// wins (Pending → Failed → Imported is a normal retry sequence; a trailing
 /// Pending is an unsettled attempt to be reconciled).

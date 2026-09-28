@@ -169,22 +169,37 @@ When the Rust binary starts for the first time and detects:
 ### What happens automatically
 
 1. `gonuts-export /etc/tollgate/wallet.db /etc/tollgate/tokens.jsonl` is
-   executed.
+   executed. The exporter writes all artifacts under `.tmp` names and
+   renames `tokens.jsonl` into place **only on success** — its existence
+   at the final path is the success stamp. A crash or nonzero exit never
+   leaves a truncated file; the previous complete artifact (if any) is
+   left untouched.
 2. If successful, `tokens.jsonl` is written containing one Cashu token
-   string per line (one per keyset batch).
-3. A log message instructs the operator to run the `migrate` CLI command
-   to import the tokens.
-4. If `gonuts-export` fails or is not found, a warning is logged and the
-   wallet starts empty. Manual migration is still possible.
+   string per line (one per keyset batch), and the tokens are imported
+   into the CDK wallet automatically (see "Failure handling" below).
+3. If `gonuts-export` exits nonzero, the tokens on disk are **not**
+   imported on this boot — the export is retried on the next boot. If the
+   tool cannot be spawned at all (not installed), a file placed by a
+   deliberate manual export is still imported.
+4. On any failure, a loud error is logged and `wallet.db` is retained as
+   the recovery source.
 
-### What does NOT happen automatically
+#### Failure handling during import
 
-- Tokens are **not** auto-imported into the CDK wallet on first boot.
-  Importing requires mint connectivity (CDK `receive()` contacts the mint),
-  and the binary defers this to the `migrate` CLI command so the operator
-  can control timing and verify the export first.
-- The old `wallet.db` is **not** renamed or deleted — it remains as a
-  backup until the operator confirms migration success.
+Every token attempt is journaled to `migration-journal.jsonl` with a
+durable `Pending` intent entry **before** the receive call, then advanced
+to a terminal outcome:
+
+| Journal outcome | Meaning | Next boot |
+|---|---|---|
+| `Imported` | Token received into the CDK wallet | skipped |
+| `Failed` | Receive failed definitively (reason retained) | retried |
+| `Pending` | Attempted but unsettled — process died mid-receive, or the receive timed out (ambiguous) | reconciled via NUT-07 checkstate: spent → terminal `Spent`, unspent → retried |
+| `Spent` | All proofs spent at the mint — the value already sits in this wallet (earlier receive completed) or is unrecoverable | terminal, does not block completion |
+
+`wallet.db` is renamed to `wallet.db.pre-migration` only when no token
+failed and none is unsettled; otherwise it stays in place and the
+`.migration_complete` marker records `state=partial`.
 
 ---
 
