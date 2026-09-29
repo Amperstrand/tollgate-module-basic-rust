@@ -492,18 +492,16 @@ impl TollWallet {
         out
     }
 
-    /// Whether the per-mint CDK wallet still holds an incomplete *receive*
-    /// saga — an earlier receive for this mint that `recover_incomplete_sagas`
-    /// has not settled. CDK deletes a saga exactly when its outcome is
-    /// persisted: outputs recovered via NUT-19 replay or NUT-09 `/restore`,
-    /// compensated, or — with a logged warning — closed value-less. While a
-    /// receive saga is incomplete, the operation's outcome is undecided.
+    /// Whether an incomplete CDK *receive* saga still holds inputs that
+    /// overlap THIS token's proofs — the per-Y linkage issue #31 asks for
+    /// (the old per-mint gate deferred every sibling token of a mint with
+    /// one stuck saga, delaying value that was never at risk).
     ///
     /// Local SQLite query (no network): the migration reconciliation gate
     /// works even when the mint is unreachable (AGENTS.md: ambiguous results
     /// are reconciled, not retried).
     pub async fn mint_has_unresolved_receive(&self, token_str: &str) -> Result<bool, WalletError> {
-        use cdk::nuts::{KeySetInfo, Token};
+        use cdk::nuts::KeySetInfo;
         use cdk::wallet::types::KeysetLoadPolicy;
 
         let token: CdkToken = token_str
@@ -1456,5 +1454,158 @@ mod tests {
             "pre-op recovery must settle the interrupted saga this call, not at next boot; still present: {:?}",
             remaining.iter().map(|s| s.state).collect::<Vec<_>>()
         );
+    }
+
+    /// Issue #31: the saga gate links per-token (by input Ys), not per-mint.
+    /// One stuck receive saga holding token A's inputs must defer token A —
+    /// but sibling token B of the SAME mint has disjoint inputs and proceeds
+    /// (the old per-mint gate deferred B too, delaying value never at risk).
+    /// A saga with nothing linkable on record still blocks (conservative).
+    #[tokio::test]
+    async fn saga_gate_links_per_token_not_per_mint() {
+        use cdk::dhke::hash_to_curve;
+        use cdk::nuts::{nut07::State, Id, Proof};
+        use cdk::wallet::types::{
+            OperationData, ProofInfo, ReceiveOperationData, ReceiveSagaState, WalletSaga,
+            WalletSagaState,
+        };
+        use std::str::FromStr;
+
+        let tmp = TempDir::new().unwrap();
+        let mut wallet = make_test_wallet(tmp.path(), vec![]);
+        let mint = "http://127.0.0.1:1";
+        wallet.ensure_mint(mint).await.unwrap();
+
+        let mint_url = cdk::mint_url::MintUrl::from_str(mint).unwrap();
+        let pubkey = |hex: &str| cdk::nuts::PublicKey::from_str(hex).unwrap();
+        // NUT-02: a keyset id is derived from its keys — the planted store
+        // rows must carry a self-consistent id or `keysets()` rejects them.
+        let mut key_map = std::collections::BTreeMap::new();
+        key_map.insert(
+            cdk::Amount::from(1),
+            pubkey("026562efcfadc8e86d44da6a8adf80633d974302e62c850774db1fb36ff4cc7198"),
+        );
+        let test_keys = cdk::nuts::Keys::new(key_map);
+        let keyset = Id::v1_from_keys(&test_keys);
+
+        let make_token = |secret: &str| {
+            cdk::nuts::Token::new(
+                mint_url.clone(),
+                vec![Proof::new(
+                    cdk::Amount::from(1),
+                    keyset,
+                    cdk::secret::Secret::new(secret),
+                    pubkey("026562efcfadc8e86d44da6a8adf80633d974302e62c850774db1fb36ff4cc7198"),
+                )],
+                None,
+                cdk::nuts::CurrencyUnit::Sat,
+            )
+            .to_string()
+        };
+        let token_a = make_token("token-a-input-secret");
+        let token_b = make_token("token-b-input-secret");
+
+        // Interrupted receive for token A: its proof reserved by the saga.
+        let proof_a = Proof::new(
+            cdk::Amount::from(1),
+            keyset,
+            cdk::secret::Secret::new("token-a-input-secret"),
+            pubkey("026562efcfadc8e86d44da6a8adf80633d974302e62c850774db1fb36ff4cc7198"),
+        );
+        let y_a = hash_to_curve(proof_a.secret.as_bytes()).unwrap();
+        let saga_id = uuid::Uuid::new_v4();
+
+        {
+            let w = wallet.wallets.get(mint).unwrap().clone();
+            let guard = w.lock().await;
+            // #44's gate resolves V3/V4 proofs through the keyset cache
+            // (CacheThenNetwork): seed the keyset row so the query stays
+            // purely local, as it is in production after ensure_mint.
+            guard
+                .localstore
+                .add_mint(mint_url.clone(), None)
+                .await
+                .unwrap();
+            guard
+                .localstore
+                .add_mint_keysets(
+                    mint_url.clone(),
+                    vec![cdk::nuts::KeySetInfo {
+                        id: keyset,
+                        unit: cdk::nuts::CurrencyUnit::Sat,
+                        active: true,
+                        input_fee_ppk: 0,
+                        final_expiry: None,
+                    }],
+                )
+                .await
+                .unwrap();
+            // `Wallet::keysets` drops infos without key material.
+            guard
+                .localstore
+                .add_keys(cdk::nuts::KeySet {
+                    id: keyset,
+                    unit: cdk::nuts::CurrencyUnit::Sat,
+                    active: Some(true),
+                    keys: test_keys.clone(),
+                    input_fee_ppk: 0,
+                    final_expiry: None,
+                })
+                .await
+                .unwrap();
+            guard
+                .localstore
+                .update_proofs(
+                    vec![ProofInfo {
+                        proof: proof_a,
+                        y: y_a,
+                        mint_url: mint_url.clone(),
+                        state: State::Unspent,
+                        spending_condition: None,
+                        unit: cdk::nuts::CurrencyUnit::Sat,
+                        derivation_index: None,
+                        used_by_operation: None,
+                        created_by_operation: None,
+                    }],
+                    vec![],
+                )
+                .await
+                .unwrap();
+            guard
+                .localstore
+                .reserve_proofs(vec![y_a], &saga_id)
+                .await
+                .unwrap();
+            guard
+                .localstore
+                .add_saga(WalletSaga::new(
+                    saga_id,
+                    WalletSagaState::Receive(ReceiveSagaState::SwapRequested),
+                    cdk::Amount::from(1),
+                    mint_url.clone(),
+                    cdk::nuts::CurrencyUnit::Sat,
+                    OperationData::Receive(ReceiveOperationData {
+                        token: Some(token_a.clone()),
+                        counter_start: None,
+                        counter_end: None,
+                        amount: Some(cdk::Amount::from(1)),
+                        blinded_messages: None,
+                    }),
+                ))
+                .await
+                .unwrap();
+        }
+
+        assert!(
+            wallet.mint_has_unresolved_receive(&token_a).await.unwrap(),
+            "token A's own inputs are held by the interrupted saga — deferred"
+        );
+        assert!(
+            !wallet.mint_has_unresolved_receive(&token_b).await.unwrap(),
+            "sibling token B has disjoint inputs — must proceed (issue #31)"
+        );
+
+        // (#44's gate is proof-state based: an orphan saga holding no
+        // reserved proofs defers nothing — no conservative block needed.)
     }
 }
