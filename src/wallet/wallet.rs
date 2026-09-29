@@ -85,6 +85,24 @@ pub fn canonical_mint_url(url: &str) -> String {
         .unwrap_or_else(|_| trimmed.to_string())
 }
 
+/// Per-proof (face value, secret) pairs from a token, V3/V4 agnostic and
+/// keyset-free — the inputs for NUT-07 spend classification.
+fn token_proof_amounts_secrets(token: &CdkToken) -> Vec<(cdk::Amount, cdk::secret::Secret)> {
+    use cdk::nuts::Token;
+    match token {
+        Token::TokenV3(t) => t
+            .token
+            .iter()
+            .flat_map(|entry| entry.proofs.iter().map(|p| (p.amount, p.secret.clone())))
+            .collect(),
+        Token::TokenV4(t) => t
+            .token
+            .iter()
+            .flat_map(|entry| entry.proofs.iter().map(|p| (p.amount, p.secret.clone())))
+            .collect(),
+    }
+}
+
 /// TollWallet wraps multiple CDK Wallet instances (one per mint URL) behind
 /// a tokio Mutex for thread-safe serialized access. CDK's saga pattern
 /// ensures operations are atomic — no swap-counter race.
@@ -416,21 +434,41 @@ impl TollWallet {
                         .map(|s| s.y)
                         .collect();
                     for (token_str, token) in entries {
-                        let ys: Vec<_> = token
-                            .token_secrets()
-                            .iter()
-                            .filter_map(|s| hash_to_curve(s.as_bytes()).ok())
-                            .collect();
                         let amount_sat: u64 = token.value().map(|a| a.into()).unwrap_or(0);
-                        if ys.is_empty() {
+                        // Per-proof (face value, secret) pairs, keyset-free:
+                        // Y is hash_to_curve(secret), so classification never
+                        // needs keyset resolution.
+                        let pairs = token_proof_amounts_secrets(&token);
+                        if pairs.is_empty() {
                             out.insert(
                                 token_str,
                                 Err(WalletError::TokenParse("token has no proofs".into())),
                             );
-                        } else if ys.iter().all(|y| spent_ys.contains(y)) {
+                            continue;
+                        }
+                        // PENDING mint-side proofs count as not-spent: the
+                        // mint is mid-operation and its word is not final.
+                        let spent_sat: u64 = pairs
+                            .iter()
+                            .filter(|(_, secret)| {
+                                hash_to_curve(secret.as_bytes())
+                                    .map(|y| spent_ys.contains(&y))
+                                    .unwrap_or(false)
+                            })
+                            .map(|(amount, _)| u64::from(*amount))
+                            .sum();
+                        if spent_sat == amount_sat {
                             out.insert(token_str, Ok(TokenSpendState::AllSpent { amount_sat }));
-                        } else {
+                        } else if spent_sat == 0 {
                             out.insert(token_str, Ok(TokenSpendState::Unspent));
+                        } else {
+                            out.insert(
+                                token_str,
+                                Ok(TokenSpendState::PartiallySpent {
+                                    spent_sat,
+                                    unspent_sat: amount_sat - spent_sat,
+                                }),
+                            );
                         }
                     }
                 }

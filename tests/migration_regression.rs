@@ -15,6 +15,8 @@ struct FakeSink {
     /// token -> mint-side NUT-07 answer: `Some(amount)` = all proofs spent,
     /// `None` = still spendable.
     spent: HashMap<String, Option<u64>>,
+    /// token -> (spent, unspent) for partially-spent tokens.
+    partial: HashMap<String, (u64, u64)>,
     /// token -> receive result.
     receive: HashMap<String, Rx>,
     /// When set, every NUT-07 pre-check errors (mint unreachable).
@@ -69,6 +71,14 @@ impl TokenSink for FakeSink {
                     (
                         t.clone(),
                         Err(WalletError::Timeout(std::time::Duration::from_secs(30))),
+                    )
+                } else if let Some((spent_sat, unspent_sat)) = self.partial.get(t).copied() {
+                    (
+                        t.clone(),
+                        Ok(TokenSpendState::PartiallySpent {
+                            spent_sat,
+                            unspent_sat,
+                        }),
                     )
                 } else {
                     match self.spent.get(t).copied().flatten() {
@@ -174,6 +184,77 @@ async fn nut07_pre_check_is_one_batch_per_run_with_candidates_only() {
         batches2.is_empty(),
         "with no candidates there is no pre-check call at all: {batches2:?}"
     );
+}
+
+/// Issue #35: a token whose proofs are PARTIALLY spent at the mint can
+/// never satisfy the atomic swap — the pre-check classifies it terminal
+/// `PartiallySpent` (with the unspent remainder surfaced for the operator)
+/// instead of the old blanket retriable-`Failed` that re-attempted a doomed
+/// receive on every boot. The remainder value is retained in the journal
+/// (and tokens.jsonl) for split-and-reimport recovery.
+#[tokio::test]
+async fn partially_spent_token_is_terminal_not_retriable_failed() {
+    let dir = tempfile::tempdir().unwrap();
+    let m = setup(dir.path(), &["cashuA1"]);
+    write_journal(
+        dir.path(),
+        &[JournalEntry {
+            token: "cashuA1".to_string(),
+            outcome: TokenOutcome::Failed {
+                reason: "mint rejected swap: inputs already spent".into(),
+            },
+        }],
+    );
+
+    let sink = FakeSink {
+        partial: [("cashuA1".to_string(), (4u64, 6u64))]
+            .into_iter()
+            .collect(),
+        receive: [("cashuA1".to_string(), Rx::Ok(999))].into_iter().collect(),
+        ..Default::default()
+    };
+    let summary = m.import_tokens(&sink).await.unwrap();
+    assert_eq!(summary.partially_spent, 1);
+    assert_eq!(summary.partially_spent_unspent_sat, 6);
+    assert_eq!(summary.failed, 0);
+    assert_eq!(summary.imported, 0);
+
+    let calls = sink.calls.lock().unwrap().clone();
+    assert!(
+        !calls.iter().any(|c| c.starts_with("receive:")),
+        "a partially-spent token must never be resubmitted: {calls:?}"
+    );
+
+    assert_eq!(
+        fold_last(&read_journal(dir.path())).get("cashuA1"),
+        Some(&TokenOutcome::PartiallySpent {
+            spent_sat: 4,
+            unspent_sat: 6
+        })
+    );
+
+    // Terminal for finalization too: recovery is an operator action, not a
+    // migration blocker.
+    let finish = m.finish(summary).unwrap();
+    assert_eq!(
+        finish,
+        tollgate_module_basic_rust::migration::MigrationFinish::Complete
+    );
+    let marker = std::fs::read_to_string(&m.marker).unwrap();
+    assert!(marker.contains("partially_spent=1"));
+    assert!(marker.contains("partially_spent_unspent_sat=6"));
+
+    // Re-runs stay converged: no re-check, no re-receive.
+    let sink2 = FakeSink::default();
+    let summary2 = m.import_tokens(&sink2).await.unwrap();
+    assert_eq!(summary2.partially_spent, 1);
+    assert!(sink2.batch_calls.lock().unwrap().is_empty());
+    assert!(!sink2
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|c| c.starts_with("receive:")));
 }
 
 /// Codex P1 finding 1 (migration.rs:132): a durable Pending intent must

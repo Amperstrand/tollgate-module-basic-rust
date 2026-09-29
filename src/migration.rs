@@ -90,6 +90,14 @@ pub enum TokenOutcome {
     /// case retrying can never import it. Terminal; the amount is re-derived
     /// from the token so the summary stays honest.
     Spent { amount_sat: u64 },
+    /// A strict subset of the token's proofs is spent at the mint (NUT-07
+    /// per-proof states, issue #35): the atomic receive can never succeed
+    /// (the mint rejects mixed inputs), so the token is terminal for the
+    /// import loop — but the unspent remainder is real, recoverable value.
+    /// The token string is retained in the journal (and `tokens.jsonl` on
+    /// disk), so the operator can split it and re-import the unspent
+    /// remainder; see MIGRATION.md "Partially spent tokens".
+    PartiallySpent { spent_sat: u64, unspent_sat: u64 },
 }
 
 impl TokenOutcome {
@@ -99,6 +107,10 @@ impl TokenOutcome {
 
     fn is_spent(&self) -> bool {
         matches!(self, TokenOutcome::Spent { .. })
+    }
+
+    fn is_partially_spent(&self) -> bool {
+        matches!(self, TokenOutcome::PartiallySpent { .. })
     }
 
     fn is_pending(&self) -> bool {
@@ -115,6 +127,11 @@ pub enum TokenSpendState {
     /// (the value already sits in this deterministic wallet) or the token
     /// was spent elsewhere — retrying can never import it.
     AllSpent { amount_sat: u64 },
+    /// Some proofs SPENT, some still spendable: the atomic receive can
+    /// never succeed (the mint rejects mixed inputs), but the unspent
+    /// remainder is real value — recoverable by splitting the token and
+    /// re-importing only the unspent proofs (issue #35).
+    PartiallySpent { spent_sat: u64, unspent_sat: u64 },
     /// No proof SPENT: the token is (still) receivable.
     Unspent,
 }
@@ -179,6 +196,12 @@ pub struct MigrationSummary {
     /// block finalization — retrying can never import them.
     pub spent: u64,
     pub spent_sat: u64,
+    /// Tokens with a spent SUBSET of proofs (issue #35): terminal for the
+    /// import loop, but with real recoverable value left.
+    pub partially_spent: u64,
+    /// Total unspent value still sitting in partially-spent tokens — the
+    /// operator-recoverable remainder (split + re-import, MIGRATION.md).
+    pub partially_spent_unspent_sat: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -239,6 +262,8 @@ impl FirstBootMigration {
         let mut pending = 0u64;
         let mut spent = 0u64;
         let mut spent_sat = 0u64;
+        let mut partially_spent = 0u64;
+        let mut partially_spent_unspent_sat = 0u64;
 
         let already = fold_last_outcomes(&read_journal(&self.journal));
         let tokens = read_tokens(&self.tokens_file)?;
@@ -253,7 +278,7 @@ impl FirstBootMigration {
             .filter(|t| {
                 !matches!(
                     already.get(*t),
-                    Some(o) if o.is_imported() || o.is_spent()
+                    Some(o) if o.is_imported() || o.is_spent() || o.is_partially_spent()
                 )
             })
             .cloned()
@@ -274,6 +299,13 @@ impl FirstBootMigration {
                     spent += 1;
                     if let TokenOutcome::Spent { amount_sat } = outcome {
                         spent_sat += amount_sat;
+                    }
+                    continue;
+                }
+                Some(outcome) if outcome.is_partially_spent() => {
+                    partially_spent += 1;
+                    if let TokenOutcome::PartiallySpent { unspent_sat, .. } = outcome {
+                        partially_spent_unspent_sat += unspent_sat;
                     }
                     continue;
                 }
@@ -338,6 +370,36 @@ impl FirstBootMigration {
                         &JournalEntry {
                             token: token.clone(),
                             outcome: TokenOutcome::Spent { amount_sat },
+                        },
+                    )?;
+                    journal_file.sync_all()?;
+                    continue;
+                }
+                Ok(TokenSpendState::PartiallySpent {
+                    spent_sat,
+                    unspent_sat,
+                }) => {
+                    // Issue #35: mixed inputs can never satisfy the atomic
+                    // swap — previously this fell through to receive, failed
+                    // on the mint's opaque rejection, and was retried every
+                    // boot forever. Terminal now; the unspent remainder is
+                    // real value the operator recovers by splitting (see
+                    // MIGRATION.md).
+                    tracing::warn!(
+                        spent_sat,
+                        unspent_sat,
+                        "migration: token partially spent at mint; marking terminal PartiallySpent — recover the unspent remainder by splitting the token (MIGRATION.md 'Partially spent tokens')"
+                    );
+                    partially_spent += 1;
+                    partially_spent_unspent_sat += unspent_sat;
+                    append_entry(
+                        &mut journal_file,
+                        &JournalEntry {
+                            token: token.clone(),
+                            outcome: TokenOutcome::PartiallySpent {
+                                spent_sat,
+                                unspent_sat,
+                            },
                         },
                     )?;
                     journal_file.sync_all()?;
@@ -408,6 +470,8 @@ impl FirstBootMigration {
             pending,
             spent,
             spent_sat,
+            partially_spent,
+            partially_spent_unspent_sat,
         })
     }
 
@@ -433,7 +497,7 @@ impl FirstBootMigration {
         };
 
         let marker_body = format!(
-            "state={}\nimported_sat={}\nfailed={}\nskipped_already_imported={}\npending={}\nspent={}\nspent_sat={}\ndate={}\n",
+            "state={}\nimported_sat={}\nfailed={}\nskipped_already_imported={}\npending={}\nspent={}\nspent_sat={}\npartially_spent={}\npartially_spent_unspent_sat={}\ndate={}\n",
             if clean { "complete" } else { "partial" },
             summary.imported,
             summary.failed,
@@ -441,6 +505,8 @@ impl FirstBootMigration {
             summary.pending,
             summary.spent,
             summary.spent_sat,
+            summary.partially_spent,
+            summary.partially_spent_unspent_sat,
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -490,6 +556,8 @@ pub struct MigrationState {
     pub pending: u64,
     pub spent: u64,
     pub spent_sat: u64,
+    pub partially_spent: u64,
+    pub partially_spent_unspent_sat: u64,
 }
 
 impl MigrationState {
@@ -509,6 +577,8 @@ pub fn summarize_state(db_dir: &Path) -> MigrationState {
         pending: 0,
         spent: 0,
         spent_sat: 0,
+        partially_spent: 0,
+        partially_spent_unspent_sat: 0,
     };
     if let Ok(body) = std::fs::read_to_string(&m.marker) {
         let marker_state = body
@@ -525,6 +595,10 @@ pub fn summarize_state(db_dir: &Path) -> MigrationState {
             TokenOutcome::Spent { amount_sat } => {
                 state.spent += 1;
                 state.spent_sat += amount_sat;
+            }
+            TokenOutcome::PartiallySpent { unspent_sat, .. } => {
+                state.partially_spent += 1;
+                state.partially_spent_unspent_sat += unspent_sat;
             }
         }
     }
@@ -731,6 +805,8 @@ mod tests {
                 pending: 0,
                 spent: 0,
                 spent_sat: 0,
+                partially_spent: 0,
+                partially_spent_unspent_sat: 0,
             })
             .unwrap();
         assert_eq!(finish, MigrationFinish::Complete);
@@ -752,6 +828,8 @@ mod tests {
                 pending: 1,
                 spent: 0,
                 spent_sat: 0,
+                partially_spent: 0,
+                partially_spent_unspent_sat: 0,
             })
             .unwrap();
         assert_eq!(finish, MigrationFinish::Partial);
