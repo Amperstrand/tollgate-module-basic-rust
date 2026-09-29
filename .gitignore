@@ -16,3 +16,7 @@ spec/
 # OpenCode session artifacts
 .omo/
 dist/
+
+# Built Go exporter binary — build from tools/gonuts-export (MIGRATION.md);
+# never commit host-arch artifacts.
+/tools/gonuts-export/gonuts-export

@@ -229,6 +229,23 @@ remainders at any time.
 If the automated export succeeded but tokens haven't been imported yet,
 or if you're migrating from a pre-exported `tokens.jsonl`:
 
+### Step 0: Build the exporter (if the binary is not installed)
+
+`gonuts-export` is built from source in this repo — the binary itself is
+not shipped in git (issue #36: a committed host-arch binary goes stale
+the moment anyone runs `go build`). For the router, cross-compile
+statically and copy it over:
+
+```bash
+cd tools/gonuts-export
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o gonuts-export .
+# then: scp gonuts-export root@router:/usr/bin/gonuts-export
+```
+
+(Adjust `GOARCH` to the router's architecture — `amd64`, `arm`, `arm64`,
+`mips`, `mipsle` with `GOARM`/GOMIPS as needed. `go test ./...` runs the
+exporter's unit tests host-side.)
+
 ### Step 1: Ensure the binary is running
 
 ```bash
