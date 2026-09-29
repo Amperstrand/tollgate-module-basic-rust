@@ -67,6 +67,7 @@ embedded-portal = ["dep:nftables"]
 [dev-dependencies]
 tempfile = "3"
 serial_test = "3"
+uuid = { version = "1", features = ["v4"] }
 
 # mipsel_24kc has no 64-bit atomics: if a cdk-common release reintroduces
 # AtomicU64, patch it via [patch.crates-io] (Amperstrand/cdk-common carries

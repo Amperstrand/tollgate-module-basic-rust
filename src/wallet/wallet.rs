@@ -176,6 +176,35 @@ impl TollWallet {
         self.db_dir.join(format!("{sanitized}.sqlite"))
     }
 
+    /// Settle incomplete CDK sagas before a money-moving operation.
+    ///
+    /// CDK documents recovery as *required* before swap/send/receive/melt;
+    /// cashu-service runs it before every send. Called under the wallet
+    /// lock, inside the operation's timeout: with a settled wallet it is a
+    /// local SQLite query (no network, no per-poll cost — quote-status
+    /// polling never enters here); when a saga IS incomplete — e.g. one
+    /// left behind by a mid-session `timeout()` cancellation — the
+    /// operation must not move value over unreconciled state, so the
+    /// recovery error aborts the money move with a distinct, observable
+    /// cause (issue #33).
+    async fn recover_before_op(w: &Wallet, op: &str) -> Result<(), WalletError> {
+        let report = w
+            .recover_incomplete_sagas()
+            .await
+            .map_err(|e| WalletError::SagaRecovery(format!("{op}: {e}")))?;
+        if !report.is_empty() {
+            tracing::info!(
+                op,
+                recovered = report.recovered,
+                compensated = report.compensated,
+                skipped = report.skipped,
+                failed = report.failed,
+                "settled incomplete sagas before money-moving op"
+            );
+        }
+        Ok(())
+    }
+
     /// Receive a Cashu token (maps gonuts `Receive`).
     ///
     /// CDK's receive is atomic — no counter race. Wrapped in 30s timeout.
@@ -197,7 +226,10 @@ impl TollWallet {
 
         let result = timeout(OP_TIMEOUT, async {
             let w = wallet.lock().await;
-            w.receive(token_str, ReceiveOptions::default()).await
+            Self::recover_before_op(&w, "receive").await?;
+            w.receive(token_str, ReceiveOptions::default())
+                .await
+                .map_err(WalletError::from)
         })
         .await;
 
@@ -206,7 +238,7 @@ impl TollWallet {
                 let sat: u64 = amount.into();
                 Ok(sat)
             }
-            Ok(Err(e)) => Err(WalletError::Cdk(e)),
+            Ok(Err(e)) => Err(e),
             Err(_) => {
                 self.spawn_saga_recovery(&normalized);
                 Err(WalletError::Timeout(OP_TIMEOUT))
@@ -401,15 +433,19 @@ impl TollWallet {
 
         let result = timeout(OP_TIMEOUT, async {
             let w = wallet.lock().await;
-            let prepared = w.prepare_send(Amount::from(amount_sat), opts).await?;
-            let token = prepared.confirm(None).await?;
-            Ok::<_, cdk::Error>(token.to_string())
+            Self::recover_before_op(&w, "send").await?;
+            let prepared = w
+                .prepare_send(Amount::from(amount_sat), opts)
+                .await
+                .map_err(WalletError::from)?;
+            let token = prepared.confirm(None).await.map_err(WalletError::from)?;
+            Ok::<_, WalletError>(token.to_string())
         })
         .await;
 
         match result {
             Ok(Ok(token_str)) => Ok(token_str),
-            Ok(Err(e)) => Err(WalletError::Cdk(e)),
+            Ok(Err(e)) => Err(e),
             Err(_) => {
                 self.spawn_saga_recovery(&normalized);
                 Err(WalletError::Timeout(OP_TIMEOUT))
@@ -519,15 +555,19 @@ impl TollWallet {
 
         let result = timeout(OP_TIMEOUT, async {
             let w = wallet.lock().await;
-            let proofs = w.mint(quote_id, SplitTarget::default(), None).await?;
+            Self::recover_before_op(&w, "mint").await?;
+            let proofs = w
+                .mint(quote_id, SplitTarget::default(), None)
+                .await
+                .map_err(WalletError::from)?;
             let total: u64 = proofs.iter().map(|p| -> u64 { p.amount.into() }).sum();
-            Ok::<_, cdk::Error>(total)
+            Ok::<_, WalletError>(total)
         })
         .await;
 
         match result {
             Ok(Ok(total)) => Ok(total),
-            Ok(Err(e)) => Err(WalletError::Cdk(e)),
+            Ok(Err(e)) => Err(e),
             Err(_) => {
                 self.spawn_saga_recovery(&normalized);
                 Err(WalletError::Timeout(OP_TIMEOUT))
@@ -548,15 +588,20 @@ impl TollWallet {
         let invoice_owned = invoice.to_string();
         let result = timeout(OP_TIMEOUT, async {
             let w = wallet.lock().await;
+            Self::recover_before_op(&w, "melt").await?;
             // Step 1: create melt quote
             let quote = w
                 .melt_quote(PaymentMethod::BOLT11, invoice_owned, None, None)
-                .await?;
+                .await
+                .map_err(WalletError::from)?;
             // Step 2: prepare melt with the quote ID
-            let prepared = w.prepare_melt(&quote.id, HashMap::new()).await?;
+            let prepared = w
+                .prepare_melt(&quote.id, HashMap::new())
+                .await
+                .map_err(WalletError::from)?;
             // Step 3: confirm
-            let finalized = prepared.confirm().await?;
-            Ok::<_, cdk::Error>((quote, finalized))
+            let finalized = prepared.confirm().await.map_err(WalletError::from)?;
+            Ok::<_, WalletError>((quote, finalized))
         })
         .await;
 
@@ -566,7 +611,7 @@ impl TollWallet {
                 amount: quote.amount.into(),
                 fee: quote.fee_reserve.into(),
             }),
-            Ok(Err(e)) => Err(WalletError::Cdk(e)),
+            Ok(Err(e)) => Err(e),
             Err(_) => {
                 self.spawn_saga_recovery(&normalized);
                 Err(WalletError::Timeout(OP_TIMEOUT))
@@ -1131,5 +1176,122 @@ mod tests {
         let result = tokio::time::timeout(Duration::from_secs(35), wallet.receive(token)).await;
 
         assert!(result.is_ok(), "receive should not hang forever");
+    }
+
+    /// Issue #33: an interrupted saga left behind by a mid-session timeout
+    /// must be settled BEFORE the next money move on that wallet — not left
+    /// unresolved until the next boot. Plants exactly what a killed process
+    /// leaves in SQLite (a reserved input proof + a `ProofsPending` receive
+    /// saga — the state a pre-swap crash leaves, compensable locally) and
+    /// asserts the saga is gone after the next receive, proving pre-op
+    /// recovery actually ran. The receive itself still fails (dead mint),
+    /// so no money moves in either version — the observable is the saga's
+    /// convergence, not the error kind.
+    #[tokio::test]
+    async fn receive_settles_interrupted_saga_before_moving_money() {
+        use cdk::dhke::hash_to_curve;
+        use cdk::nuts::{nut07::State, Id, Proof};
+        use cdk::wallet::types::{
+            OperationData, ProofInfo, ReceiveOperationData, ReceiveSagaState, WalletSaga,
+            WalletSagaState,
+        };
+        use std::str::FromStr;
+
+        let tmp = TempDir::new().unwrap();
+        let mut wallet = make_test_wallet(tmp.path(), vec![]);
+        // TCP port 1 on loopback: refused instantly, no external network.
+        let mint = "http://127.0.0.1:1";
+        wallet.ensure_mint(mint).await.unwrap();
+
+        let mint_url = cdk::mint_url::MintUrl::from_str(mint).unwrap();
+        let saga_id = uuid::Uuid::new_v4();
+        let proof = Proof::new(
+            cdk::Amount::from(1),
+            Id::from_bytes(&[0u8, 1, 2, 3, 4, 5, 6, 7]).unwrap(),
+            cdk::secret::Secret::new("interrupted-saga-input-secret"),
+            cdk::nuts::PublicKey::from_str(
+                "026562efcfadc8e86d44da6a8adf80633d974302e62c850774db1fb36ff4cc7198",
+            )
+            .unwrap(),
+        );
+        let y = hash_to_curve(proof.secret.as_bytes()).unwrap();
+
+        let store = {
+            let w = wallet.wallets.get(mint).unwrap().clone();
+            let guard = w.lock().await;
+            guard
+                .localstore
+                .update_proofs(
+                    vec![ProofInfo {
+                        proof: proof.clone(),
+                        y,
+                        mint_url: mint_url.clone(),
+                        state: State::Unspent,
+                        spending_condition: None,
+                        unit: cdk::nuts::CurrencyUnit::Sat,
+                        derivation_index: None,
+                        used_by_operation: None,
+                        created_by_operation: None,
+                    }],
+                    vec![],
+                )
+                .await
+                .unwrap();
+            guard
+                .localstore
+                .reserve_proofs(vec![y], &saga_id)
+                .await
+                .unwrap();
+            guard
+                .localstore
+                .add_saga(WalletSaga::new(
+                    saga_id,
+                    WalletSagaState::Receive(ReceiveSagaState::ProofsPending),
+                    cdk::Amount::from(1),
+                    mint_url.clone(),
+                    cdk::nuts::CurrencyUnit::Sat,
+                    OperationData::Receive(ReceiveOperationData {
+                        token: None,
+                        counter_start: None,
+                        counter_end: None,
+                        amount: Some(cdk::Amount::from(1)),
+                        blinded_messages: None,
+                    }),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                guard.localstore.get_incomplete_sagas().await.unwrap().len(),
+                1,
+                "plant sanity: one incomplete saga before the op"
+            );
+            guard.localstore.clone()
+        };
+
+        let fresh = Proof::new(
+            cdk::Amount::from(2),
+            Id::from_bytes(&[0u8, 1, 2, 3, 4, 5, 6, 7]).unwrap(),
+            cdk::secret::Secret::new("fresh-token-secret"),
+            cdk::nuts::PublicKey::from_str(
+                "026562efcfadc8e86d44da6a8adf80633d974302e62c850774db1fb36ff4cc7198",
+            )
+            .unwrap(),
+        );
+        let token_str =
+            cdk::nuts::Token::new(mint_url, vec![fresh], None, cdk::nuts::CurrencyUnit::Sat)
+                .to_string();
+
+        let err = wallet.receive(&token_str).await.expect_err("dead mint");
+        assert!(
+            matches!(err, WalletError::Cdk(_)),
+            "receive itself fails at the dead mint, got {err:?}"
+        );
+
+        let remaining = store.get_incomplete_sagas().await.unwrap();
+        assert!(
+            remaining.is_empty(),
+            "pre-op recovery must settle the interrupted saga this call, not at next boot; still present: {:?}",
+            remaining.iter().map(|s| s.state).collect::<Vec<_>>()
+        );
     }
 }
