@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use tollgate_module_basic_rust::migration::{
     should_import_tokens, ExportOutcome, FirstBootMigration, JournalEntry, TokenOutcome, TokenSink,
-    JOURNAL_NAME, MARKER_NAME, OLD_DB_NAME, TOKENS_FILE_NAME,
+    TokenSpendState, JOURNAL_NAME, MARKER_NAME, OLD_DB_NAME, TOKENS_FILE_NAME,
 };
 
 #[derive(Debug, Default)]
@@ -22,6 +22,8 @@ struct FakeSink {
     /// Simulates an incomplete CDK receive saga for the mint (local state).
     unresolved: bool,
     calls: std::sync::Mutex<Vec<String>>,
+    /// (tokens-per-call) for every `check_tokens_spent` invocation.
+    batch_calls: std::sync::Mutex<Vec<usize>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -48,14 +50,36 @@ impl TokenSink for FakeSink {
 
     async fn token_spent(
         &self,
-        token: &str,
+        _token: &str,
     ) -> Result<Option<u64>, tollgate_module_basic_rust::wallet::WalletError> {
+        Ok(None)
+    }
+
+    async fn check_tokens_spent(
+        &self,
+        tokens: &[String],
+    ) -> HashMap<String, Result<TokenSpendState, tollgate_module_basic_rust::wallet::WalletError>>
+    {
         use tollgate_module_basic_rust::wallet::WalletError;
-        self.calls.lock().unwrap().push(format!("spent:{token}"));
-        if self.spent_err {
-            return Err(WalletError::Timeout(std::time::Duration::from_secs(30)));
-        }
-        Ok(self.spent.get(token).copied().flatten())
+        self.batch_calls.lock().unwrap().push(tokens.len());
+        tokens
+            .iter()
+            .map(|t| {
+                if self.spent_err {
+                    (
+                        t.clone(),
+                        Err(WalletError::Timeout(std::time::Duration::from_secs(30))),
+                    )
+                } else {
+                    match self.spent.get(t).copied().flatten() {
+                        Some(amount_sat) => {
+                            (t.clone(), Ok(TokenSpendState::AllSpent { amount_sat }))
+                        }
+                        None => (t.clone(), Ok(TokenSpendState::Unspent)),
+                    }
+                }
+            })
+            .collect()
     }
 
     async fn mint_has_unresolved_receive(
@@ -106,6 +130,52 @@ fn fold_last(entries: &[JournalEntry]) -> HashMap<String, TokenOutcome> {
     folded
 }
 
+/// Issue #34: the NUT-07 pre-check is issued as ONE batched call per import
+/// run carrying only the non-terminal candidate tokens — not one call per
+/// token. A second run with some tokens terminal must shrink the batch to
+/// the remaining candidates instead of re-checking the finished ones.
+#[tokio::test]
+async fn nut07_pre_check_is_one_batch_per_run_with_candidates_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let m = setup(dir.path(), &["cashuA1", "cashuA2", "cashuA3"]);
+
+    let sink = FakeSink {
+        spent: [
+            ("cashuA1".to_string(), Some(3u64)),
+            ("cashuA2".to_string(), None),
+            ("cashuA3".to_string(), None),
+        ]
+        .into_iter()
+        .collect(),
+        receive: [
+            ("cashuA2".to_string(), Rx::Ok(2)),
+            ("cashuA3".to_string(), Rx::Ok(3)),
+        ]
+        .into_iter()
+        .collect(),
+        ..Default::default()
+    };
+    let summary = m.import_tokens(&sink).await.unwrap();
+    assert_eq!(summary.spent, 1);
+    assert_eq!(summary.imported, 5);
+
+    let batches = sink.batch_calls.lock().unwrap().clone();
+    assert_eq!(
+        batches,
+        vec![3],
+        "one batched pre-check per run, carrying all three candidates: {batches:?}"
+    );
+
+    let sink2 = FakeSink::default();
+    let summary2 = m.import_tokens(&sink2).await.unwrap();
+    assert_eq!(summary2.skipped_already_imported, 2);
+    let batches2 = sink2.batch_calls.lock().unwrap().clone();
+    assert!(
+        batches2.is_empty(),
+        "with no candidates there is no pre-check call at all: {batches2:?}"
+    );
+}
+
 /// Codex P1 finding 1 (migration.rs:132): a durable Pending intent must
 /// exist before `receive()` is called, so death between receive and the
 /// outcome append leaves a reconcilable record instead of nothing.
@@ -140,6 +210,17 @@ async fn pending_intent_is_durable_before_receive_touches_the_mint() {
             _token: &str,
         ) -> Result<Option<u64>, tollgate_module_basic_rust::wallet::WalletError> {
             Ok(None)
+        }
+
+        async fn check_tokens_spent(
+            &self,
+            tokens: &[String],
+        ) -> HashMap<String, Result<TokenSpendState, tollgate_module_basic_rust::wallet::WalletError>>
+        {
+            tokens
+                .iter()
+                .map(|t| (t.clone(), Ok(TokenSpendState::Unspent)))
+                .collect()
         }
 
         async fn mint_has_unresolved_receive(

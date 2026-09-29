@@ -329,6 +329,131 @@ impl TollWallet {
         }
     }
 
+    /// Batched NUT-07 spend classification for the migration pre-check
+    /// (issue #34): one checkstate call per mint carrying every candidate
+    /// token's Ys, instead of one call per token per boot.
+    ///
+    /// Classification needs only each proof's Y (hash_to_curve of the
+    /// secret — keyset-independent); keyset resolution is needed solely to
+    /// build V3 request proofs, so it runs once per mint alongside the
+    /// checkstate call. `Wallet::check_proofs_spent` is used (not a raw
+    /// connector call) to keep its side effect of marking mint-confirmed
+    /// Spent Ys in the local store.
+    pub async fn check_tokens_spent(
+        &self,
+        tokens: &[String],
+    ) -> HashMap<String, Result<crate::migration::TokenSpendState, WalletError>> {
+        use crate::migration::TokenSpendState;
+        use cdk::dhke::hash_to_curve;
+        use cdk::nuts::nut07::State;
+        use cdk::nuts::{KeySetInfo, Token};
+        use cdk::wallet::types::KeysetLoadPolicy;
+
+        let mut out: HashMap<String, Result<TokenSpendState, WalletError>> = HashMap::new();
+        let mut by_mint: HashMap<String, Vec<(String, Token)>> = HashMap::new();
+
+        for token_str in tokens {
+            match token_str.parse::<CdkToken>() {
+                Ok(token) => match token.mint_url() {
+                    Ok(url) => by_mint
+                        .entry(canonical_mint_url(&url.to_string()))
+                        .or_default()
+                        .push((token_str.clone(), token)),
+                    Err(e) => {
+                        out.insert(
+                            token_str.clone(),
+                            Err(WalletError::TokenParse(format!("{e}"))),
+                        );
+                    }
+                },
+                Err(e) => {
+                    out.insert(
+                        token_str.clone(),
+                        Err(WalletError::TokenParse(format!("{e}"))),
+                    );
+                }
+            }
+        }
+
+        for (mint, entries) in by_mint {
+            let Some(wallet) = self.wallets.get(&mint) else {
+                for (token_str, _) in &entries {
+                    out.insert(
+                        token_str.clone(),
+                        Err(WalletError::WalletNotFound(mint.clone())),
+                    );
+                }
+                continue;
+            };
+
+            let result = timeout(OP_TIMEOUT, async {
+                let w = wallet.lock().await;
+                let keysets = w.keysets(KeysetLoadPolicy::default()).await?;
+                let keyset_infos: Vec<KeySetInfo> = keysets
+                    .iter()
+                    .map(|ks| KeySetInfo {
+                        id: ks.id,
+                        unit: ks.unit.clone(),
+                        active: ks.active.unwrap_or(true),
+                        input_fee_ppk: ks.input_fee_ppk,
+                        final_expiry: ks.final_expiry,
+                    })
+                    .collect();
+                let mut proofs = Vec::new();
+                for (_, token) in &entries {
+                    proofs.extend(token.proofs(&keyset_infos)?);
+                }
+                let states = w.check_proofs_spent(proofs).await?;
+                Ok::<_, cdk::Error>(states)
+            })
+            .await;
+
+            match result {
+                Ok(Ok(states)) => {
+                    let spent_ys: std::collections::HashSet<cdk::nuts::PublicKey> = states
+                        .iter()
+                        .filter(|s| s.state == State::Spent)
+                        .map(|s| s.y)
+                        .collect();
+                    for (token_str, token) in entries {
+                        let ys: Vec<_> = token
+                            .token_secrets()
+                            .iter()
+                            .filter_map(|s| hash_to_curve(s.as_bytes()).ok())
+                            .collect();
+                        let amount_sat: u64 = token.value().map(|a| a.into()).unwrap_or(0);
+                        if ys.is_empty() {
+                            out.insert(
+                                token_str,
+                                Err(WalletError::TokenParse("token has no proofs".into())),
+                            );
+                        } else if ys.iter().all(|y| spent_ys.contains(y)) {
+                            out.insert(token_str, Ok(TokenSpendState::AllSpent { amount_sat }));
+                        } else {
+                            out.insert(token_str, Ok(TokenSpendState::Unspent));
+                        }
+                    }
+                }
+                Ok(Err(e)) => {
+                    // cdk::Error is not Clone: each per-token error is built
+                    // from the mint-level cause text (the migration loop only
+                    // branches on Ok/Err and TokenParse).
+                    let cause = format!("NUT-07 batch checkstate failed: {e}");
+                    for (token_str, _) in entries {
+                        out.insert(token_str, Err(WalletError::Database(cause.clone())));
+                    }
+                }
+                Err(_) => {
+                    for (token_str, _) in entries {
+                        out.insert(token_str, Err(WalletError::Timeout(OP_TIMEOUT)));
+                    }
+                }
+            }
+        }
+
+        out
+    }
+
     /// Whether the per-mint CDK wallet still holds an incomplete *receive*
     /// saga — an earlier receive for this mint that `recover_incomplete_sagas`
     /// has not settled. CDK deletes a saga exactly when its outcome is

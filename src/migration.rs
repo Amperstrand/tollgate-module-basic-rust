@@ -46,6 +46,14 @@ impl TokenSink for TollWallet {
         TollWallet::token_spent(self, token).await
     }
 
+    async fn check_tokens_spent(
+        &self,
+        tokens: &[String],
+    ) -> std::collections::HashMap<String, Result<TokenSpendState, crate::wallet::WalletError>>
+    {
+        TollWallet::check_tokens_spent(self, tokens).await
+    }
+
     async fn mint_has_unresolved_receive(
         &self,
         token: &str,
@@ -98,6 +106,19 @@ impl TokenOutcome {
     }
 }
 
+/// NUT-07 spend classification of one token, as answered by the migration
+/// pre-check. Derived from per-proof mint states so outcomes are terminal
+/// where the mint's answer is decisive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenSpendState {
+    /// Every proof SPENT at the mint: an earlier receive of ours completed
+    /// (the value already sits in this deterministic wallet) or the token
+    /// was spent elsewhere — retrying can never import it.
+    AllSpent { amount_sat: u64 },
+    /// No proof SPENT: the token is (still) receivable.
+    Unspent,
+}
+
 /// What the import loop may call on the wallet. A trait so crash-window
 /// tests can fake the mint side and observe journal ordering without a
 /// live CDK wallet.
@@ -105,10 +126,25 @@ impl TokenOutcome {
 pub trait TokenSink: Send + Sync {
     async fn receive(&self, token: &str) -> Result<u64, crate::wallet::WalletError>;
 
-    /// NUT-07 reconciliation: `Ok(Some(amount_sat))` iff every proof of the
-    /// token is spent at the mint. Errors mean "cannot reconcile right now"
-    /// (mint unreachable), NOT "unspent".
+    /// Single-token tri-state reconciliation surface (delegates to
+    /// `TollWallet::token_spent`): consumed by the payment journal's
+    /// startup reconciliation (#43). `Err` on PENDING/RESERVED proofs —
+    /// the outcome is ambiguous, not unspent.
     async fn token_spent(&self, token: &str) -> Result<Option<u64>, crate::wallet::WalletError>;
+
+    /// Batched NUT-07 pre-check (issue #34): ONE checkstate call per mint
+    /// carrying the Ys of every candidate token — NUT-07 requests are
+    /// spec-native arrays, so per-token calls were pure rate-limit waste.
+    ///
+    /// Contract: the returned map has an entry for EVERY input token.
+    /// Unparseable tokens map to `Err(TokenParse)`; a mint that cannot be
+    /// reached maps each of its tokens to the same transport error — the
+    /// same per-token semantics the per-token pre-check had, so the
+    /// loop's defer/proceed decisions are unchanged.
+    async fn check_tokens_spent(
+        &self,
+        tokens: &[String],
+    ) -> std::collections::HashMap<String, Result<TokenSpendState, crate::wallet::WalletError>>;
 
     /// Whether THIS token's input proofs are currently Reserved/Pending in
     /// the local wallet — i.e. an earlier attempt of this very token is
@@ -208,6 +244,26 @@ impl FirstBootMigration {
         let tokens = read_tokens(&self.tokens_file)?;
         let mut journal_file = open_append(&self.journal)?;
 
+        // Batched NUT-07 pre-pass (issue #34): one checkstate call per mint
+        // covering every token this run may (re)attempt. Tokens already
+        // terminal in the journal are excluded — they are neither re-checked
+        // nor re-received.
+        let candidates: Vec<String> = tokens
+            .iter()
+            .filter(|t| {
+                !matches!(
+                    already.get(*t),
+                    Some(o) if o.is_imported() || o.is_spent()
+                )
+            })
+            .cloned()
+            .collect();
+        let mut spent_map = if candidates.is_empty() {
+            std::collections::HashMap::new()
+        } else {
+            sink.check_tokens_spent(&candidates).await
+        };
+
         for token in tokens {
             match already.get(&token) {
                 Some(outcome) if outcome.is_imported() => {
@@ -231,7 +287,9 @@ impl FirstBootMigration {
             // recover_incomplete_sagas has already run via ensure_mint at
             // boot) and tokens spent under a pre-journal migration, without
             // inferring anything from receive error text.
-            let spent_check = sink.token_spent(&token).await;
+            let spent_check = spent_map
+                .remove(&token)
+                .expect("sink classifies every candidate token");
             let prior_pending = matches!(already.get(&token), Some(TokenOutcome::Pending));
 
             // r4126804510: an all-spent NUT-07 answer proves only that the
@@ -268,7 +326,7 @@ impl FirstBootMigration {
             }
 
             match spent_check {
-                Ok(Some(amount_sat)) => {
+                Ok(TokenSpendState::AllSpent { amount_sat }) => {
                     tracing::warn!(
                         amount_sat,
                         "migration: token already spent at mint; marking terminal Spent (value sits in the wallet from an earlier receive, or is unrecoverable)"
@@ -285,7 +343,7 @@ impl FirstBootMigration {
                     journal_file.sync_all()?;
                     continue;
                 }
-                Ok(None) => {}
+                Ok(TokenSpendState::Unspent) => {}
                 Err(e) => {
                     tracing::debug!(error = %e, "migration: NUT-07 pre-check unavailable; proceeding to receive");
                 }
@@ -748,6 +806,17 @@ mod tests {
             _token: &str,
         ) -> Result<Option<u64>, crate::wallet::WalletError> {
             Ok(None)
+        }
+
+        async fn check_tokens_spent(
+            &self,
+            tokens: &[String],
+        ) -> std::collections::HashMap<String, Result<TokenSpendState, crate::wallet::WalletError>>
+        {
+            tokens
+                .iter()
+                .map(|t| (t.clone(), Ok(TokenSpendState::Unspent)))
+                .collect()
         }
 
         async fn mint_has_unresolved_receive(
