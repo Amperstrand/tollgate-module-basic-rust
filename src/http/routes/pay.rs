@@ -59,6 +59,27 @@ pub(crate) enum PrecheckError {
     },
 }
 
+/// HTTP semantics for a failed receive (issue #33): a timeout is an
+/// UNKNOWN outcome, not a rejection — the mint may have accepted the swap
+/// (AGENTS.md: ambiguous results are reconciled, not retried). Answering
+/// 400 "rejected" would invite the customer to treat a possibly-consumed
+/// token as failed; 504 + `payment-outcome-unknown` says "do not resubmit,
+/// it is being reconciled".
+fn receive_failure_shape(e: &crate::wallet::WalletError) -> (StatusCode, &'static str, String) {
+    match e {
+        crate::wallet::WalletError::Timeout(_) => (
+            StatusCode::GATEWAY_TIMEOUT,
+            "payment-outcome-unknown",
+            "payment outcome unknown after timeout; do not resubmit this token — it is being reconciled automatically".to_string(),
+        ),
+        e => (
+            StatusCode::BAD_REQUEST,
+            "wallet-receive-failed",
+            format!("payment rejected: wallet receive failed: {e}"),
+        ),
+    }
+}
+
 /// Validate and price a payment from pre-receive facts only.
 ///
 /// The token's face value (verified amount) prices the minimum check;
@@ -266,18 +287,19 @@ pub async fn handle_pay(
             Err(e) => {
                 tracing::warn!(error = %e, "wallet receive failed");
                 drop(wallet_guard);
+                let (status, code, message) = receive_failure_shape(&e);
                 let event = nostr_event::create_event(
                     21023,
                     vec![
                         vec!["level".to_string(), "error".to_string()],
-                        vec!["code".to_string(), "wallet-receive-failed".to_string()],
+                        vec!["code".to_string(), code.to_string()],
                     ],
-                    &format!("payment rejected: wallet receive failed: {e}"),
+                    &message,
                     &state.identity.secret_key,
                 );
                 let json = serde_json::to_string(&event).unwrap_or_default();
                 return (
-                    StatusCode::BAD_REQUEST,
+                    status,
                     [
                         ("content-type", "application/json"),
                         ("access-control-allow-origin", "*"),
@@ -455,6 +477,23 @@ mod tests {
         assert_eq!(session.allotment, 5000);
         assert_eq!(session.metric, "bytes");
         assert!(mgr.is_active("test:mac"));
+    }
+
+    #[test]
+    fn receive_timeout_maps_to_outcome_unknown_not_rejected() {
+        let (status, code, _) = receive_failure_shape(&crate::wallet::WalletError::Timeout(
+            std::time::Duration::from_secs(30),
+        ));
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(code, "payment-outcome-unknown");
+    }
+
+    #[test]
+    fn definitive_receive_failure_maps_to_rejected() {
+        let (status, code, _) =
+            receive_failure_shape(&crate::wallet::WalletError::TokenParse("bad".into()));
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(code, "wallet-receive-failed");
     }
 
     /// Test that rejected tokens return 400 (simulated).

@@ -54,6 +54,9 @@ fn mnemonic_to_seed(phrase: &str) -> Result<[u8; 64], WalletError> {
 
 /// Default receive/send/melt timeout (matches Go's 30s).
 const OP_TIMEOUT: Duration = Duration::from_secs(30);
+/// Recovery may replay/restore several sagas over a slow mint — it runs
+/// detached, so it can afford a much larger budget than the ops it follows.
+const RECOVERY_TIMEOUT: Duration = Duration::from_secs(300);
 
 pub use crate::error::WalletError;
 
@@ -189,7 +192,10 @@ impl TollWallet {
                 Ok(sat)
             }
             Ok(Err(e)) => Err(WalletError::Cdk(e)),
-            Err(_) => Err(WalletError::Timeout(OP_TIMEOUT)),
+            Err(_) => {
+                self.spawn_saga_recovery(&normalized);
+                Err(WalletError::Timeout(OP_TIMEOUT))
+            }
         }
     }
 
@@ -327,7 +333,10 @@ impl TollWallet {
         match result {
             Ok(Ok(token_str)) => Ok(token_str),
             Ok(Err(e)) => Err(WalletError::Cdk(e)),
-            Err(_) => Err(WalletError::Timeout(OP_TIMEOUT)),
+            Err(_) => {
+                self.spawn_saga_recovery(&normalized);
+                Err(WalletError::Timeout(OP_TIMEOUT))
+            }
         }
     }
 
@@ -442,7 +451,10 @@ impl TollWallet {
         match result {
             Ok(Ok(total)) => Ok(total),
             Ok(Err(e)) => Err(WalletError::Cdk(e)),
-            Err(_) => Err(WalletError::Timeout(OP_TIMEOUT)),
+            Err(_) => {
+                self.spawn_saga_recovery(&normalized);
+                Err(WalletError::Timeout(OP_TIMEOUT))
+            }
         }
     }
 
@@ -478,7 +490,10 @@ impl TollWallet {
                 fee: quote.fee_reserve.into(),
             }),
             Ok(Err(e)) => Err(WalletError::Cdk(e)),
-            Err(_) => Err(WalletError::Timeout(OP_TIMEOUT)),
+            Err(_) => {
+                self.spawn_saga_recovery(&normalized);
+                Err(WalletError::Timeout(OP_TIMEOUT))
+            }
         }
     }
 
@@ -614,6 +629,47 @@ impl TollWallet {
 
     fn mnemonic_path_for(seed_path: &Path) -> PathBuf {
         seed_path.with_file_name("wallet_mnemonic.txt")
+    }
+
+    /// AGENTS.md ("if you add a timeout, add the reconciliation that
+    /// follows it"): every TollWallet op wraps CDK in `timeout(OP_TIMEOUT)`,
+    /// which cancels the saga mid-flight — the saga survives in SQLite and,
+    /// without this, nothing retries it until the next boot's `ensure_mint`.
+    /// This fires a detached `recover_incomplete_sagas` for the mint so the
+    /// cancelled saga settles in-session (receive: NUT-19 replay / NUT-09
+    /// restore / compensate; melt: quote-state check that detects an
+    /// already-paid Lightning payment). Never blocks the caller; recovery
+    /// failures are logged and left for the next trigger or boot.
+    fn spawn_saga_recovery(&self, normalized_mint: &str) {
+        let Some(wallet) = self.wallets.get(normalized_mint) else {
+            return;
+        };
+        let wallet = wallet.clone();
+        let mint = normalized_mint.to_string();
+        tokio::spawn(async move {
+            match timeout(RECOVERY_TIMEOUT, async {
+                wallet.lock().await.recover_incomplete_sagas().await
+            })
+            .await
+            {
+                Ok(Ok(report)) if report.recovered > 0 || report.compensated > 0 => {
+                    tracing::info!(
+                        mint = %mint,
+                        recovered = report.recovered,
+                        compensated = report.compensated,
+                        failed = report.failed,
+                        "post-timeout saga recovery settled operations"
+                    );
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!(mint = %mint, error = %e, "post-timeout saga recovery errored; retrying on next trigger or boot");
+                }
+                Err(_) => {
+                    tracing::warn!(mint = %mint, "post-timeout saga recovery timed out; retrying on next trigger or boot");
+                }
+            }
+        });
     }
 
     /// NUT-13 restore for every registered mint (CDK `Wallet::restore`:

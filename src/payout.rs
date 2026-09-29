@@ -429,6 +429,23 @@ async fn melt_to_lightning(
             tracing::info!(mint_url, %lightning_address, amount_sats, "melt successful");
             Ok(())
         }
+        Err(crate::wallet::WalletError::Timeout(d)) => {
+            // The most dangerous payout ambiguity: the Lightning payment may
+            // have fired. The melt saga is being reconciled in-session
+            // (CDK's melt resume checks the quote state — a paid quote is
+            // recovered, an unpaid one compensated). Never treat this as a
+            // plain failure or blind-retry the same melt (AGENTS.md:
+            // ambiguous results are reconciled, not retried).
+            tracing::error!(
+                mint_url,
+                %lightning_address,
+                timeout_secs = d.as_secs(),
+                "melt timed out — PAYMENT MAY HAVE BEEN PAID; reconciling the saga automatically, do not retry this payout manually"
+            );
+            Err(crate::error::PayoutError::Melt(
+                "melt timeout — outcome unknown, reconciling".into(),
+            ))
+        }
         Err(e) => {
             tracing::error!(mint_url, %lightning_address, error = %e, "melt failed");
             Err(crate::error::PayoutError::Melt(e.to_string()))
