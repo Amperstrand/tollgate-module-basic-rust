@@ -94,3 +94,67 @@ pub fn save_config(config: &Config) -> Result<(), ConfigError> {
 
     Ok(())
 }
+
+/// Go-parity `EnsureDefaultConfig` (config_manager_config.go:347, called from
+/// the ConfigManager constructor): guarantee a usable config.json exists on
+/// disk, not just in memory. A clean install must leave the file behind for
+/// operators and external tooling; a missing, empty, or unparseable file is
+/// (re)created from defaults, with the unusable original preserved under
+/// `config_backups/` the way Go's `backupAndLog` does.
+pub fn ensure_default_config() -> Result<Config, ConfigError> {
+    let path = config_path();
+    let default_config = Config::new_default();
+
+    let data = match std::fs::read(&path) {
+        Ok(data) => data,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            save_config(&default_config)?;
+            return Ok(default_config);
+        }
+        Err(e) => return Err(ConfigError::Io(e)),
+    };
+
+    if data.is_empty() {
+        backup_unusable_config(&path, &default_config.config_version)?;
+        save_config(&default_config)?;
+        return Ok(default_config);
+    }
+
+    match serde_json::from_slice::<Config>(&data) {
+        Ok(mut config) => {
+            let mut changed = false;
+            if config.validate_profit_share().is_err() {
+                tracing::warn!("invalid profit_share, resetting to defaults");
+                config.profit_share = default_config.profit_share;
+                changed = true;
+            }
+            if config.ensure_defaults() {
+                changed = true;
+            }
+            if changed {
+                save_config(&config)?;
+            }
+            Ok(config)
+        }
+        Err(parse_err) => {
+            tracing::warn!(error = %parse_err, "invalid config JSON, backing up and recreating");
+            backup_unusable_config(&path, &default_config.config_version)?;
+            save_config(&default_config)?;
+            Ok(default_config)
+        }
+    }
+}
+
+fn backup_unusable_config(path: &std::path::Path, version: &str) -> Result<(), ConfigError> {
+    let backup_dir = config_dir().join("config_backups");
+    std::fs::create_dir_all(&backup_dir)?;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let backup = backup_dir.join(format!("config.{version}.{ts}.json"));
+    if std::fs::rename(path, &backup).is_err() {
+        std::fs::copy(path, &backup)?;
+    }
+    Ok(())
+}

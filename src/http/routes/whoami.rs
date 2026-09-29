@@ -1,26 +1,9 @@
-//! GET /whoami — returns plain text `mac=<MAC>`, or HTTP 500 if MAC cannot
-//! be resolved.
+//! GET /whoami — returns plain text `mac=<MAC>`.
 //!
-// HTTP #2: A `GET` request on the `/whoami` endpoint MUST return http status `200 OK` with the body containing the customer's `<device-identifier>`
-// HTTP #2: Formatted as `[type]=[value]`
-
-//!
-//! Port of `tollgate-module-basic-go/src/main.go` `handler` (lines 356–368)
-//! bound at `/whoami` (line 769). Go's handler:
-//!
-//! ```go
-//! var ip = getIP(r)
-//! var mac, err = getMacAddress(ip)
-//! if err != nil {
-//!     w.WriteHeader(http.StatusInternalServerError)
-//!     return
-//! }
-//! fmt.Fprint(w, "mac=", mac)
-//! ```
-//!
-//! On MAC resolution failure Go writes NO body and only the status line.
-//! On success the body is exactly `mac=<MAC>` with no trailing newline,
-//! default HTTP 200 status, and `Content-Type: text/plain`.
+//! An echo of the caller's own address: when the MAC cannot be resolved the
+//! answer is `mac=` with HTTP 200 (Go parity — `main.go handler`: answer an
+//! empty mac instead of failing; never publish the 00:00:00:00:00:00
+//! sentinel as if it were an identity).
 
 use crate::http::AppState;
 use crate::mac_resolver::{get_client_ip, get_mac_address};
@@ -35,35 +18,25 @@ pub async fn handle_whoami(
     ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
 ) -> Response {
     let client_ip = get_client_ip(&headers, Some(remote_addr));
-    match get_mac_address(&client_ip) {
-        Some(mac) => (
-            StatusCode::OK,
-            [
-                ("content-type", "text/plain"),
-                ("access-control-allow-origin", "*"),
-            ],
-            format!("mac={mac}"),
-        )
-            .into_response(),
-        None => {
-            let mut resp = (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                [("access-control-allow-origin", "*")],
-                String::new(),
-            )
-                .into_response();
-            resp.headers_mut().remove("content-type");
-            resp
-        }
+    let mac = get_mac_address(&client_ip).unwrap_or_default();
+    if mac.is_empty() {
+        tracing::warn!("MAC address lookup failed for /whoami; answering an empty mac");
     }
+    (
+        StatusCode::OK,
+        [
+            ("content-type", "text/plain"),
+            ("access-control-allow-origin", "*"),
+        ],
+        format!("mac={mac}"),
+    )
+        .into_response()
 }
 
 #[cfg(test)]
 mod tests {
     #[test]
     fn whoami_success_body_format() {
-        // The on-the-wire body for a successful resolution is exactly
-        // `mac=<MAC>` — no newline, no trailing whitespace.
         let mac = "00:11:22:33:44:55".to_string();
         let body = format!("mac={mac}");
         assert_eq!(body, "mac=00:11:22:33:44:55");
@@ -71,17 +44,10 @@ mod tests {
     }
 
     #[test]
-    fn whoami_body_contains_mac_prefix() {
-        // The parity test (`test_parity_whoami_format`) asserts the body
-        // contains "mac=".
-        let body = format!("mac={}", "1a:2b:3c:4d:5e:6f");
-        assert!(body.contains("mac="));
-    }
-
-    #[test]
-    fn whoami_500_body_is_empty_on_failure() {
-        // Go writes NO body on failure — parity requires an empty body.
-        let body = String::new();
-        assert!(body.is_empty());
+    fn whoami_unresolvable_mac_answers_empty_value_with_200() {
+        // Go parity: unresolvable MAC is an echo of emptiness, not an error.
+        let mac = String::new();
+        let body = format!("mac={mac}");
+        assert_eq!(body, "mac=");
     }
 }

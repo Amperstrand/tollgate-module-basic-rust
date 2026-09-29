@@ -11,6 +11,7 @@ pub mod mac_resolver;
 pub mod metering;
 pub mod migration;
 pub mod mint_health;
+pub mod mint_url;
 pub mod monitor;
 pub mod nostr_event;
 pub mod payout;

@@ -565,6 +565,158 @@ pub struct PublicIdentity {
     pub lightning_address: Option<String>,
 }
 
+// ── JSON schema (mirrors Go config_manager/config_schema.go) ────────
+
+fn field(
+    name: &str,
+    json_key: &str,
+    ftype: &str,
+    description: &str,
+    default: serde_json::Value,
+    required: bool,
+    editable: bool,
+) -> serde_json::Value {
+    serde_json::json!({
+        "name": name,
+        "json_key": json_key,
+        "type": ftype,
+        "description": description,
+        "default": default,
+        "required": required,
+        "editable": editable,
+    })
+}
+
+fn with_children(mut v: serde_json::Value, children: Vec<serde_json::Value>) -> serde_json::Value {
+    v["children"] = serde_json::Value::Array(children);
+    v
+}
+
+fn str_children() -> Vec<serde_json::Value> {
+    vec![serde_json::json!({ "type": "string" })]
+}
+
+/// Field-schema description of `config.json`, mirroring Go's
+/// `GetConfigSchema()`. Defaults are this implementation's actual defaults
+/// (they diverge from the Go table where the two repos intentionally
+/// differ, e.g. byte step sizes).
+pub fn config_schema() -> serde_json::Value {
+    serde_json::Value::Array(vec![
+        field("ConfigVersion", "config_version", "string", "Configuration file version", "v0.0.8".into(), true, false),
+        field("LogLevel", "log_level", "string", "Logging verbosity", "info".into(), true, true),
+        field("Metric", "metric", "string", "Metering metric type", "bytes".into(), true, true),
+        field("StepSize", "step_size", "uint64", "Step size in bytes (if metric=bytes) or milliseconds (if metric=milliseconds)", 22020096u64.into(), true, true),
+        field("Margin", "margin", "float64", "Margin factor (0.0-1.0)", 0.1f64.into(), false, true),
+        field("ShowSetup", "show_setup", "bool", "Show setup wizard on first access", true.into(), true, true),
+        field("ResellerMode", "reseller_mode", "bool", "Enable reseller mode for upstream gateway discovery", false.into(), true, true),
+        field("AuthDelaySeconds", "auth_delay_seconds", "int", "Delay in seconds before authorizing MAC after payment (0 = immediate)", 0.into(), false, true),
+        field("RedirectURL", "redirect_url", "string", "URL to redirect clients to after payment (empty = no redirect)", "".into(), false, true),
+        with_children(
+            field("AcceptedMints", "accepted_mints", "array", "List of accepted Cashu mints", serde_json::Value::Null, true, true),
+            vec![
+                field("URL", "url", "string", "Mint URL", serde_json::Value::Null, true, true),
+                field("MinBalance", "min_balance", "uint64", "Minimum balance before auto-replenish (sats)", 64u64.into(), true, true),
+                field("BalanceTolerancePercent", "balance_tolerance_percent", "uint64", "Tolerance percentage for balance checks", 10u64.into(), true, true),
+                field("PayoutIntervalSeconds", "payout_interval_seconds", "uint64", "Seconds between payout rounds", 60u64.into(), true, true),
+                field("MinPayoutAmount", "min_payout_amount", "uint64", "Minimum payout amount in sats", 128u64.into(), true, true),
+                field("PricePerStep", "price_per_step", "uint64", "Price per step in sats", 1u64.into(), true, true),
+                field("PriceUnit", "price_unit", "string", "Price unit", "sats".into(), true, true),
+                field("MinPurchaseSteps", "purchase_min_steps", "uint64", "Minimum number of steps per purchase", 0u64.into(), true, true),
+            ],
+        ),
+        with_children(
+            field("ProfitShare", "profit_share", "array", "Profit sharing configuration", serde_json::Value::Null, true, true),
+            vec![
+                field("Factor", "factor", "float64", "Share ratio (0.0\u{2013}1.0). All factors MUST sum to 1.0. Use 0.79 not 79\u{2014}this is a ratio, not a percentage.", serde_json::Value::Null, true, true),
+                field("Identity", "identity", "string", "Identity name from identities.json", serde_json::Value::Null, true, true),
+            ],
+        ),
+        with_children(
+            field("UpstreamDetector", "upstream_detector", "object", "Upstream gateway detector configuration", serde_json::Value::Null, true, true),
+            vec![
+                field("ProbeTimeout", "probe_timeout", "duration", "Timeout for each probe", "10s".into(), true, true),
+                field("ProbeRetryCount", "probe_retry_count", "int", "Number of probe retries", 3.into(), true, true),
+                field("ProbeRetryDelay", "probe_retry_delay", "duration", "Delay between retries", "2s".into(), true, true),
+                field("RequireValidSignature", "require_valid_signature", "bool", "Require valid NIP-70 signature", true.into(), true, true),
+                with_children(field("IgnoreInterfaces", "ignore_interfaces", "array", "Interfaces to ignore", serde_json::json!(["lo", "docker0", "br-lan", "hostap0"]), false, true), str_children()),
+                with_children(field("OnlyInterfaces", "only_interfaces", "array", "Only probe these interfaces (empty = all)", serde_json::json!([]), false, true), str_children()),
+                field("DiscoveryTimeout", "discovery_timeout", "duration", "Deduplication window", "5m0s".into(), true, true),
+            ],
+        ),
+        with_children(
+            field("UpstreamSessionManager", "upstream_session_manager", "object", "Upstream session manager configuration", serde_json::Value::Null, true, true),
+            vec![
+                field("MaxPricePerMillisecond", "max_price_per_millisecond", "float64", "Max sats per millisecond", 0.002777777778f64.into(), true, true),
+                field("MaxPricePerByte", "max_price_per_byte", "float64", "Max sats per byte", 0.00003725782414f64.into(), true, true),
+                with_children(
+                    field("Trust", "trust", "object", "Trust policy", serde_json::Value::Null, true, true),
+                    vec![
+                        field("DefaultPolicy", "default_policy", "string", "Default trust policy", "trust_all".into(), true, true),
+                        with_children(field("Allowlist", "allowlist", "array", "Trusted pubkeys", serde_json::json!([]), false, true), str_children()),
+                        with_children(field("Blocklist", "blocklist", "array", "Blocked pubkeys", serde_json::json!([]), false, true), str_children()),
+                    ],
+                ),
+                with_children(
+                    field("Sessions", "sessions", "object", "Session settings", serde_json::Value::Null, true, true),
+                    vec![
+                        field("PreferredSessionIncrementsMilliseconds", "preferred_session_increments_milliseconds", "uint64", "Preferred time session increment (ms)", 60000u64.into(), true, true),
+                        field("PreferredSessionIncrementsBytes", "preferred_session_increments_bytes", "uint64", "Preferred data session increment (bytes)", 131100000u64.into(), true, true),
+                        field("MillisecondRenewalOffset", "millisecond_renewal_offset", "uint64", "Renew this many ms before expiry", 10000u64.into(), true, true),
+                        field("BytesRenewalOffset", "bytes_renewal_offset", "uint64", "Renew this many bytes before limit", 131100000u64.into(), true, true),
+                    ],
+                ),
+                with_children(
+                    field("UsageTracking", "usage_tracking", "object", "Usage tracking settings", serde_json::Value::Null, true, true),
+                    vec![
+                        field("DataMonitoringInterval", "data_monitoring_interval", "duration", "How often to check data usage", "0.5s".into(), true, true),
+                    ],
+                ),
+            ],
+        ),
+        with_children(
+            field("UpstreamWifi", "upstream_wifi", "object", "Upstream WiFi scanning and selection configuration", serde_json::Value::Null, true, true),
+            vec![
+                field("ScanIntervalSeconds", "scan_interval_seconds", "int", "Seconds between full WiFi scans", 300.into(), true, true),
+                field("FastCheckSeconds", "fast_check_seconds", "int", "Seconds between fast signal checks", 30.into(), true, true),
+                field("LostThreshold", "lost_threshold", "int", "Consecutive fast-check failures before marking as lost", 2.into(), true, true),
+                field("HysteresisDB", "hysteresis_db", "int", "Signal hysteresis in dB to prevent flapping", 12.into(), true, true),
+                field("SignalFloor", "signal_floor", "int", "Minimum signal strength in dBm to consider a network usable", (-85).into(), true, true),
+                field("BlacklistTTLMinutes", "blacklist_ttl_minutes", "int", "Minutes before a blacklisted network is retried", 60.into(), true, true),
+                field("EmergencyPenalty", "emergency_penalty", "int", "Penalty score added on emergency disconnect", 20.into(), true, true),
+                field("MaxConsecutiveFailures", "max_consecutive_failures", "int", "Consecutive failures before emergency scan", 3.into(), true, true),
+                field("SwitchCooldownMinutes", "switch_cooldown_minutes", "int", "Minimum minutes between network switches", 10.into(), true, true),
+                field("StartupGraceSeconds", "startup_grace_seconds", "int", "Grace period on startup before scoring", 90.into(), true, true),
+                field("PostSwitchWaitSeconds", "post_switch_wait_seconds", "int", "Seconds to wait after a switch before scoring", 5.into(), true, true),
+                field("DHCPTimeoutSeconds", "dhcp_timeout_seconds", "int", "Timeout for DHCP after connecting to a network", 180.into(), true, true),
+                field("ManualPauseSeconds", "manual_pause_seconds", "int", "Seconds to pause scanning after manual intervention", 120.into(), true, true),
+            ],
+        ),
+    ])
+}
+
+/// Field-schema description of `identities.json`, mirroring Go's
+/// `GetIdentitiesSchema()`.
+pub fn identities_schema() -> serde_json::Value {
+    serde_json::Value::Array(vec![
+        field("ConfigVersion", "config_version", "string", "Identities file version", "v0.0.1".into(), true, false),
+        with_children(
+            field("OwnedIdentities", "owned_identities", "array", "Identities with private keys (managed by the system)", serde_json::Value::Null, true, false),
+            vec![
+                field("Name", "name", "string", "Identity name", serde_json::Value::Null, true, false),
+                field("PrivateKey", "privatekey", "string", "Nostr private key (sensitive)", serde_json::Value::Null, true, false),
+            ],
+        ),
+        with_children(
+            field("PublicIdentities", "public_identities", "array", "Public identities for profit sharing and trust", serde_json::Value::Null, true, true),
+            vec![
+                field("Name", "name", "string", "Identity name", serde_json::Value::Null, true, true),
+                field("PubKey", "pubkey", "string", "Nostr public key \u{2014} not currently used for payouts (lightning_address is used instead)", serde_json::Value::Null, false, true),
+                field("LightningAddress", "lightning_address", "string", "Lightning address for payouts", serde_json::Value::Null, false, true),
+            ],
+        ),
+    ])
+}
+
 // ── InstallConfig (install.json) ─────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

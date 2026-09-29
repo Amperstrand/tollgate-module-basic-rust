@@ -11,13 +11,27 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[tokio::main]
 async fn main() {
+    // Multi-call dispatch: no argv args => run the server (this binary is
+    // installed as /usr/bin/tollgate-wrt); any args => behave as the
+    // `tollgate` operator CLI (a /usr/bin/tollgate symlink points here).
+    // Must run before tracing/server init so client mode never touches the
+    // socket, the wallet, or the log subscriber.
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.len() > 1 {
+        std::process::exit(cli::client::run(&argv).await);
+    }
+
     // Initialize tracing — must happen before anything else
     tracing_setup::init();
 
     tracing::info!("RunInitialProbe: tollgate-module-basic-rust v{VERSION} starting");
 
-    // Load config
-    let config_obj = config::load_config().unwrap_or(None).unwrap_or_default();
+    // Load config (Go parity: a missing/empty/broken config.json is created
+    // from defaults on first boot — EnsureDefaultConfig).
+    let config_obj = config::ensure_default_config().unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "config ensure failed, using built-in defaults");
+        config::Config::new_default()
+    });
     tracing::info!(
         metric = %config_obj.metric,
         mints = config_obj.accepted_mints.len(),
@@ -85,6 +99,7 @@ async fn main() {
         .map(|m| m.url.clone())
         .collect();
     let verifier = Arc::new(wallet::verify::TokenVerifier::new(mint_urls.clone()));
+    let mint_urls_for_retry = mint_urls.clone();
     let rate_limiter = Arc::new(tollgate_module_basic_rust::rate_limiter::RateLimiter::from_env());
     let mut toll_wallet = wallet::TollWallet::new(seed, mint_urls, db_dir.clone());
     for mint in &config_obj.accepted_mints {
@@ -168,45 +183,74 @@ async fn main() {
         monitor::Monitor::new(sessions, portal).start()
     };
 
-    let upstream_handle = {
+    // Re-register configured mints that failed at boot (mint/WAN down when
+    // the process started). ensure_mint is idempotent, so retrying the full
+    // configured set until every mint is live heals without a restart —
+    // the in-process counterpart of Go's hotplug one-shot service restart.
+    let mint_retry_wallet = state.wallet.clone();
+    let mint_retry_mints: Vec<String> = mint_urls_for_retry.clone();
+    let _mint_retry_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        interval.tick().await; // first tick fires immediately; skip it
+        loop {
+            interval.tick().await;
+            let mut all_live = true;
+            for mint in &mint_retry_mints {
+                let mut w = mint_retry_wallet.write().await;
+                if let Some(wallet) = w.as_mut() {
+                    match wallet.ensure_mint(mint).await {
+                        Ok(()) => {}
+                        Err(e) => {
+                            all_live = false;
+                            tracing::warn!(mint = %mint, error = %e, "mint registration retry failed");
+                        }
+                    }
+                }
+            }
+            if all_live {
+                tracing::info!("all configured mints registered");
+                return;
+            }
+        }
+    });
+
+    // Reseller gate: the upstream manager is the only task that moves
+    // wallet funds outbound (upstream purchases paid via wallet.send()).
+    // `reseller_mode` defaults to false — ordinary installations must
+    // never spawn the money-moving loop.
+    let upstream_handle = if state.config.reseller_mode {
+        tracing::info!("reseller_mode enabled — starting upstream WiFi manager");
         let upstream_config = wireless::UpstreamWifiConfig::default();
         let mut mgr = wireless::UpstreamManager::new(upstream_config);
         let wallet_arc = state.wallet.clone();
-        tokio::spawn(async move {
+        Some(tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(
                 wireless::UpstreamWifiConfig::default().scan_interval_seconds,
             ));
             interval.tick().await;
             loop {
                 interval.tick().await;
-                let token: Option<String> = {
+                let action = {
                     let w = wallet_arc.read().await;
-                    if let Some(wallet) = w.as_ref() {
-                        match wallet.get_balance().await {
-                            Ok(0) => None,
-                            Ok(balance) => {
-                                tracing::debug!(balance, "wallet has balance for upstream payment");
-                                None
-                            }
-                            Err(_) => None,
-                        }
-                    } else {
-                        None
-                    }
+                    mgr.tick(w.as_ref()).await
                 };
-                let action = mgr.tick(token.as_deref()).await;
                 if action != wireless::ManagerAction::NoAction {
                     tracing::info!(action = ?action, "upstream manager action");
                 }
             }
-        })
+        }))
+    } else {
+        None
     };
 
     // Start HTTP server + CLI socket
     let http_state = state.clone();
     let http_handle = tokio::spawn(async move {
         let app = http::create_router((*http_state).clone());
-        let listener = match tokio::net::TcpListener::bind("0.0.0.0:2121").await {
+        // Go binds ":2121" — dual-stack, so [::1]:2121 answers too (PRTA's
+        // backend_url probes the IPv6 loopback). Mirror that: [::] first
+        // (dual-stack on Linux), fall back to IPv4-only when IPv6 is off.
+        let listener = match tokio::net::TcpListener::bind("[::]:2121").await {
             Ok(l) => l,
             Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
                 tracing::error!(
@@ -219,11 +263,17 @@ async fn main() {
                 std::process::exit(1);
             }
             Err(e) => {
-                tracing::error!(error = %e, "failed to bind 0.0.0.0:2121");
-                std::process::exit(1);
+                tracing::warn!(error = %e, "IPv6 bind failed, falling back to 0.0.0.0");
+                match tokio::net::TcpListener::bind("0.0.0.0:2121").await {
+                    Ok(l) => l,
+                    Err(e) => {
+                        tracing::error!(error = %e, "failed to bind 0.0.0.0:2121");
+                        std::process::exit(1);
+                    }
+                }
             }
         };
-        tracing::info!("HTTP server listening on 0.0.0.0:2121");
+        tracing::info!("HTTP server listening on :2121 (dual-stack)");
         axum::serve(
             listener,
             app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
@@ -319,8 +369,11 @@ async fn main() {
 
     http_handle.abort();
     cli_handle.abort();
+    _mint_retry_handle.abort();
     monitor_handle.abort();
-    upstream_handle.abort();
+    if let Some(upstream_handle) = upstream_handle {
+        upstream_handle.abort();
+    }
     #[cfg(feature = "embedded-portal")]
     redirect_handle.abort();
     #[cfg(feature = "embedded-portal")]
