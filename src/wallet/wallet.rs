@@ -576,13 +576,38 @@ impl TollWallet {
         Self::write_file_private(path, seed).await
     }
 
+    /// Atomic + durable write of a wallet-identity file: temp file (0600,
+    /// same directory so the rename is same-filesystem), fsync, rename,
+    /// fsync the parent directory. A power loss at any point leaves either
+    /// the previous complete content or the new complete content — never a
+    /// truncated file the next boot would reject (Codex P1 on #37).
     async fn write_file_private(path: &Path, bytes: &[u8]) -> Result<(), WalletError> {
-        tokio::fs::write(path, bytes).await?;
+        use tokio::io::AsyncWriteExt;
+
+        let tmp = path.with_extension("tmp");
+        let mut f = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)
+            .await?;
+        f.write_all(bytes).await?;
+        f.sync_all().await?;
+        drop(f);
+
+        // Explicit chmod: OpenOptions.mode() only applies at creation, and
+        // a leftover tmp from an earlier crash could carry wider perms.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o600);
-            std::fs::set_permissions(path, perms)?;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+        }
+
+        tokio::fs::rename(&tmp, path).await?;
+        if let Some(parent) = path.parent() {
+            if let Ok(dir) = std::fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
         }
         Ok(())
     }
@@ -595,23 +620,23 @@ impl TollWallet {
     /// batched NUT-09 restore with NUT-07 pruning, batch 100 / gap 3).
     /// The operator-facing recovery path after seed/mnemonic loss — see
     /// MIGRATION.md.
-    pub async fn restore_all(&self) -> Result<Vec<(String, RestoredSummary)>, WalletError> {
+    pub async fn restore_all(
+        &self,
+    ) -> Result<Vec<(String, Result<RestoredSummary, String>)>, WalletError> {
+        // Per-mint isolation (Codex P2 on #37): one offline or
+        // restore-less mint must not block or swallow the recovery of the
+        // others — restore is often run precisely when things are broken.
         let mut out = Vec::new();
         for (mint_url, wallet) in &self.wallets {
-            let restored = wallet
-                .lock()
-                .await
-                .restore()
-                .await
-                .map_err(WalletError::Cdk)?;
-            out.push((
-                mint_url.clone(),
-                RestoredSummary {
+            let result = match wallet.lock().await.restore().await {
+                Ok(restored) => Ok(RestoredSummary {
                     spent_sat: u64::from(restored.spent),
                     unspent_sat: u64::from(restored.unspent),
                     pending_sat: u64::from(restored.pending),
-                },
-            ));
+                }),
+                Err(e) => Err(e.to_string()),
+            };
+            out.push((mint_url.clone(), result));
         }
         Ok(out)
     }

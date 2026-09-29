@@ -380,13 +380,17 @@ async fn handle_command(cmd: &str, state: &AppState) -> String {
                         drop(wallet_guard);
                         let mints: Vec<serde_json::Value> = results
                             .iter()
-                            .map(|(url, r)| {
-                                serde_json::json!({
+                            .map(|(url, r)| match r {
+                                Ok(r) => serde_json::json!({
                                     "url": url,
                                     "unspent_sat": r.unspent_sat,
                                     "spent_sat": r.spent_sat,
                                     "pending_sat": r.pending_sat,
-                                })
+                                }),
+                                Err(e) => serde_json::json!({
+                                    "url": url,
+                                    "error": e,
+                                }),
                             })
                             .collect();
                         serde_json::json!({
