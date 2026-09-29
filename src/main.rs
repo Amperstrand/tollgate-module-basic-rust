@@ -214,11 +214,16 @@ async fn main() {
         }
     });
 
-    let upstream_handle = {
+    // Reseller gate: the upstream manager is the only task that moves
+    // wallet funds outbound (upstream purchases paid via wallet.send()).
+    // `reseller_mode` defaults to false — ordinary installations must
+    // never spawn the money-moving loop.
+    let upstream_handle = if state.config.reseller_mode {
+        tracing::info!("reseller_mode enabled — starting upstream WiFi manager");
         let upstream_config = wireless::UpstreamWifiConfig::default();
         let mut mgr = wireless::UpstreamManager::new(upstream_config);
         let wallet_arc = state.wallet.clone();
-        tokio::spawn(async move {
+        Some(tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(
                 wireless::UpstreamWifiConfig::default().scan_interval_seconds,
             ));
@@ -233,7 +238,9 @@ async fn main() {
                     tracing::info!(action = ?action, "upstream manager action");
                 }
             }
-        })
+        }))
+    } else {
+        None
     };
 
     // Start HTTP server + CLI socket
@@ -364,7 +371,9 @@ async fn main() {
     cli_handle.abort();
     _mint_retry_handle.abort();
     monitor_handle.abort();
-    upstream_handle.abort();
+    if let Some(upstream_handle) = upstream_handle {
+        upstream_handle.abort();
+    }
     #[cfg(feature = "embedded-portal")]
     redirect_handle.abort();
     #[cfg(feature = "embedded-portal")]

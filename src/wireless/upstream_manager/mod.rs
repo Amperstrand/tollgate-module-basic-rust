@@ -151,8 +151,19 @@ impl UpstreamManager {
     ) -> Option<String> {
         let wallet = wallet?;
 
-        let gateway_ip = sta_gateway_ip(self.sta_interface.as_deref())
-            .unwrap_or_else(|| "192.168.1.1".to_string());
+        // No guessed gateway: pricing and paying whatever answers at an
+        // invented address is a wrong-party payment risk. If the STA
+        // route lookup fails, skip this purchase attempt entirely.
+        let gateway_ip = match sta_gateway_ip(self.sta_interface.as_deref()) {
+            Some(ip) => ip,
+            None => {
+                tracing::warn!(
+                    sta_interface = ?self.sta_interface,
+                    "cannot price upstream purchase: no default route on STA interface — skipping"
+                );
+                return None;
+            }
+        };
 
         let prober = GatewayProber::new();
         let info = match prober.probe(&gateway_ip).await {
