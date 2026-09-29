@@ -54,9 +54,13 @@ fn mnemonic_to_seed(phrase: &str) -> Result<[u8; 64], WalletError> {
 
 /// Default receive/send/melt timeout (matches Go's 30s).
 const OP_TIMEOUT: Duration = Duration::from_secs(30);
-/// Recovery may replay/restore several sagas over a slow mint — it runs
-/// detached, so it can afford a much larger budget than the ops it follows.
-const RECOVERY_TIMEOUT: Duration = Duration::from_secs(300);
+/// Recovery may replay/restore several sagas; CDK's own replay budget is
+/// ~60s, so 120s covers one full attempt (replay + checkstate + restore).
+/// While it runs it holds the mint's wallet mutex, so this is also the
+/// worst-case starvation window for same-mint ops after a timeout event —
+/// anything longer trades availability for nothing (the saga survives a
+/// failed attempt and is retried on the next trigger or boot).
+const RECOVERY_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub use crate::error::WalletError;
 
