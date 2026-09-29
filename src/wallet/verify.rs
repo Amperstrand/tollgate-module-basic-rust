@@ -74,15 +74,25 @@ impl TokenVerifier {
         Ok((amount_sat * 1_000, mint_base))
     }
 
-    /// NUT-07: check all Y-values are UNSPENT.
-    /// Retries on HTTP 429 with exponential backoff (2s, 4s, 8s).
+    /// NUT-07: check all Y-values are UNSPENT, using CDK's own wire types
+    /// (CheckStateRequest/Response) for the endpoint contract. Retries on
+    /// HTTP 429 with exponential backoff (2s, 4s, 8s).
     async fn check_proofs_unspent(
         &self,
         mint_base: &str,
         ys: &[String],
     ) -> Result<(), VerifyError> {
+        use cdk::nuts::nut07::{CheckStateRequest, CheckStateResponse, State};
+        use cdk::nuts::PublicKey;
+        use std::str::FromStr;
+
         let url = format!("{mint_base}/v1/checkstate");
-        let body = serde_json::json!({ "Ys": ys });
+        let ys: Vec<PublicKey> = ys
+            .iter()
+            .map(|y| PublicKey::from_str(y))
+            .collect::<Result<_, _>>()
+            .map_err(|e| VerifyError::InvalidToken(e.to_string()))?;
+        let body = CheckStateRequest { ys };
 
         let mut last_err: Option<VerifyError> = None;
         for attempt in 0..3u32 {
@@ -106,22 +116,20 @@ impl TokenVerifier {
                     continue;
                 }
                 Ok(r) => {
-                    let resp: serde_json::Value = r
+                    let resp: CheckStateResponse = r
                         .error_for_status()
                         .map_err(|e| VerifyError::CheckStateStatus(e.to_string()))?
                         .json()
                         .await
                         .map_err(|e| VerifyError::CheckStateParse(e.to_string()))?;
 
-                    let states = resp["states"]
-                        .as_array()
-                        .ok_or(VerifyError::MissingStates)?;
-
-                    for state in states {
-                        let s = state["state"].as_str().unwrap_or("");
-                        if s.to_uppercase() != "UNSPENT" {
-                            return Err(VerifyError::Spent(s.to_string()));
-                        }
+                    if resp.states.is_empty() {
+                        return Err(VerifyError::MissingStates);
+                    }
+                    // Any non-UNSPENT answer (SPENT, PENDING, ...) rejects
+                    // the token: it is not freely receivable at face value.
+                    if let Some(state) = resp.states.iter().find(|s| s.state != State::Unspent) {
+                        return Err(VerifyError::Spent(state.state.to_string()));
                     }
                     return Ok(());
                 }
