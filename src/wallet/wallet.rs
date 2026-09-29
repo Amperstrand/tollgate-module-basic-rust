@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use cdk::amount::SplitTarget;
-use cdk::nuts::{CurrencyUnit, MintQuoteState, PaymentMethod};
+use cdk::nuts::{CurrencyUnit, MintQuoteState, PaymentMethod, Token as CdkToken};
 use cdk::wallet::{ReceiveOptions, SendOptions, Wallet};
 use cdk::Amount;
 use cdk_sqlite::wallet::WalletSqliteDatabase;
@@ -180,7 +180,7 @@ impl TollWallet {
     ///
     /// CDK's receive is atomic — no counter race. Wrapped in 30s timeout.
     pub async fn receive(&self, token_str: &str) -> Result<u64, WalletError> {
-        let token: cashu::nuts::Token = token_str
+        let token: CdkToken = token_str
             .parse()
             .map_err(|e| WalletError::TokenParse(format!("{e}")))?;
         let mint_url = token
@@ -311,7 +311,7 @@ impl TollWallet {
         use cdk::nuts::{KeySetInfo, Token};
         use cdk::wallet::types::KeysetLoadPolicy;
 
-        let token: Token = token_str
+        let token: CdkToken = token_str
             .parse()
             .map_err(|e| WalletError::TokenParse(format!("{e}")))?;
         let mint_url = token

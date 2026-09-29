@@ -361,32 +361,6 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "cashu"
-version = "0.17.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "92e035322b7e279fc37a110e5fffdcf987fa5414caea1d0576cedb3b3611cbbb"
-dependencies = [
- "bitcoin",
- "cbor-diag",
- "ciborium",
- "lightning",
- "lightning-invoice",
- "once_cell",
- "serde",
- "serde_json",
- "serde_with",
- "strum",
- "strum_macros",
- "thiserror 2.0.19",
- "tracing",
- "unicode-normalization",
- "url",
- "uuid",
- "web-time",
- "zeroize",
-]
-
-[[package]]
-name = "cashu"
 version = "0.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68d1f489732446b458badb2aebe702238a34b88f7a3506dcfde704b34a3334de"
@@ -481,7 +455,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bitcoin",
- "cashu 0.18.1",
+ "cashu",
  "cdk-http-client",
  "futures",
  "getrandom 0.4.3",
@@ -512,7 +486,7 @@ checksum = "4a6903a2317259283f5bc5c59500edf0b8260b032e71e478320cddd9094dba78"
 dependencies = [
  "async-trait",
  "bitreq",
- "cashu 0.18.1",
+ "cashu",
  "futures",
  "futures-channel",
  "getrandom 0.4.3",
@@ -2807,7 +2781,6 @@ dependencies = [
  "async-trait",
  "axum",
  "bip39",
- "cashu 0.17.3",
  "cdk",
  "cdk-sqlite",
  "hex",
