@@ -9,6 +9,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 
+use crate::config;
 use crate::http::AppState;
 
 /// Socket path — honors TOLLGATE_TEST_CONFIG_DIR for tests.
@@ -294,9 +295,19 @@ async fn handle_command(cmd: &str, state: &AppState) -> String {
     match cmd {
         "version" => version_string(),
         "status" => {
+            let m = crate::migration::summarize_state(&config::config_dir());
             serde_json::json!({
                 "success": true,
-                "message": "running"
+                "message": "running",
+                "migration": {
+                    "marker": m.marker,
+                    "imported_sat": m.imported_sat,
+                    "failed": m.failed,
+                    "pending": m.pending,
+                    "spent": m.spent,
+                    "spent_sat": m.spent_sat,
+                    "settled": m.is_settled(),
+                }
             })
             .to_string()
                 + "\n"
@@ -352,6 +363,58 @@ async fn handle_command(cmd: &str, state: &AppState) -> String {
                 serde_json::json!({
                     "success": true,
                     "message": "0"
+                })
+                .to_string()
+                    + "\n"
+            }
+        }
+        // NUT-13 disaster recovery: re-derive proofs from the wallet seed
+        // via the mint's NUT-09 restore endpoint (CDK Wallet::restore —
+        // batch 100, gap 3, NUT-07 pruning). Runs against every registered
+        // mint; needs the mints configured and reachable.
+        "wallet restore" => {
+            let wallet_guard = state.wallet.read().await;
+            if let Some(ref wallet) = *wallet_guard {
+                match wallet.restore_all().await {
+                    Ok(results) => {
+                        drop(wallet_guard);
+                        let mints: Vec<serde_json::Value> = results
+                            .iter()
+                            .map(|(url, r)| match r {
+                                Ok(r) => serde_json::json!({
+                                    "url": url,
+                                    "unspent_sat": r.unspent_sat,
+                                    "spent_sat": r.spent_sat,
+                                    "pending_sat": r.pending_sat,
+                                }),
+                                Err(e) => serde_json::json!({
+                                    "url": url,
+                                    "error": e,
+                                }),
+                            })
+                            .collect();
+                        serde_json::json!({
+                            "success": true,
+                            "message": serde_json::to_string(&mints)
+                                .unwrap_or_default()
+                        })
+                        .to_string()
+                            + "\n"
+                    }
+                    Err(e) => {
+                        drop(wallet_guard);
+                        serde_json::json!({
+                            "success": false,
+                            "error": format!("wallet restore failed: {e}")
+                        })
+                        .to_string()
+                            + "\n"
+                    }
+                }
+            } else {
+                serde_json::json!({
+                    "success": false,
+                    "error": "no wallet configured"
                 })
                 .to_string()
                     + "\n"
@@ -538,6 +601,11 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(resp.trim()).unwrap();
         assert_eq!(json["success"], true);
         assert_eq!(json["message"], "running");
+        // Issue #32: migration health rides along on status.
+        assert!(json["migration"].is_object());
+        assert_eq!(json["migration"]["settled"], true);
+        assert_eq!(json["migration"]["failed"], 0);
+        assert_eq!(json["migration"]["pending"], 0);
     }
 
     #[tokio::test]
@@ -554,6 +622,18 @@ mod tests {
     async fn wallet_info_returns_json() {
         let state = make_test_state();
         let resp = handle_command("wallet info", &state).await;
+        let json: serde_json::Value = serde_json::from_str(resp.trim()).unwrap();
+        assert_eq!(json["success"], true);
+        assert!(json["message"].is_string());
+    }
+
+    #[tokio::test]
+    async fn wallet_restore_with_no_mints_reports_empty() {
+        // No registered mints => restore is a no-op success (the network
+        // path itself is CDK's Wallet::restore, exercised upstream and in
+        // the field against a live mint).
+        let state = make_test_state();
+        let resp = handle_command("wallet restore", &state).await;
         let json: serde_json::Value = serde_json::from_str(resp.trim()).unwrap();
         assert_eq!(json["success"], true);
         assert!(json["message"].is_string());

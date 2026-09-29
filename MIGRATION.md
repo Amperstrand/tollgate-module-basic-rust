@@ -456,3 +456,48 @@ mv /etc/tollgate/wallet.db.pre-migration /etc/tollgate/wallet.db
 ```
 
 The Go wallet is unaffected — all its files remain untouched.
+
+---
+
+## Wallet Backup & Disaster Recovery (NUT-13)
+
+### Back up the mnemonic
+
+On first boot the binary writes a 24-word BIP39 mnemonic to
+`/etc/tollgate/wallet_mnemonic.txt` (mode 0600) alongside the unchanged
+`wallet_seed.bin`. **Copy the words to paper offline and delete nothing** —
+the mnemonic is the only human-usable way to rebuild this wallet:
+
+```
+cat /etc/tollgate/wallet_mnemonic.txt
+```
+
+Wallets created before this feature have no mnemonic file; their backup is
+the raw `wallet_seed.bin` (a random 64-byte seed with no phrase
+representation — protect it like the mnemonic).
+
+The two files are cross-checked at every boot: if `wallet_seed.bin` does
+not match the phrase, or the seed file is corrupt, the binary refuses to
+start rather than silently forking the wallet identity. Resolve manually —
+keep whichever file matches the wallet that holds the funds.
+
+### Recover the wallet on new hardware
+
+1. Install the package and write the mnemonic to
+   `/etc/tollgate/wallet_mnemonic.txt` (mode 0600). Do **not** create
+   `wallet_seed.bin` — it is re-derived from the phrase automatically.
+2. Configure `accepted_mints` with every mint the wallet used.
+3. Start the service, then run the NUT-13 restore (batched NUT-09 restore
+   with NUT-07 pruning, per mint):
+
+```
+echo "wallet restore" | socat - UNIX-CONNECT:/var/run/tollgate.sock
+```
+
+The response lists `unspent_sat`, `spent_sat`, and `pending_sat` per mint.
+`wallet balance` now reflects the restored, unspent proofs.
+
+Notes: restore needs each mint online and requires the mint to support
+NUT-09 (cdk-mintd and reference mints do). Restoring is read-only and
+idempotent — it never spends; already-spent derivations are reported under
+`spent_sat`.

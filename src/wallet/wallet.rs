@@ -30,9 +30,27 @@ use cdk::nuts::{CurrencyUnit, MintQuoteState, PaymentMethod};
 use cdk::wallet::{ReceiveOptions, SendOptions, Wallet};
 use cdk::Amount;
 use cdk_sqlite::wallet::WalletSqliteDatabase;
+#[cfg(test)]
 use rand::Rng;
 use tokio::sync::Mutex;
 use tokio::time::{timeout, Duration};
+
+/// Operator-facing result of a NUT-13 restore per mint (sats).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RestoredSummary {
+    pub spent_sat: u64,
+    pub unspent_sat: u64,
+    pub pending_sat: u64,
+}
+
+/// BIP39 mnemonic phrase -> 64-byte wallet seed (passphrase-less, the
+/// ecosystem convention CDK's own tooling uses). Rejects invalid phrases.
+fn mnemonic_to_seed(phrase: &str) -> Result<[u8; 64], WalletError> {
+    let mnemonic: bip39::Mnemonic = phrase
+        .parse()
+        .map_err(|e| WalletError::Database(format!("invalid wallet mnemonic: {e}")))?;
+    Ok(mnemonic.to_seed(""))
+}
 
 /// Default receive/send/melt timeout (matches Go's 30s).
 const OP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -472,29 +490,155 @@ impl TollWallet {
     }
 
     /// Load or generate a wallet seed (64 bytes) from the given path.
+    /// Load the wallet seed, creating it on first boot.
+    ///
+    /// New wallets get a 24-word BIP39 mnemonic: `wallet_mnemonic.txt`
+    /// (0600, the operator's disaster-recovery backup — see MIGRATION.md)
+    /// plus the unchanged 64-byte `wallet_seed.bin` that CDK consumes.
+    /// The mnemonic is written FIRST so every crash point self-heals:
+    ///
+    /// - mnemonic only  → seed is (re)derived from it;
+    /// - seed only      → pre-mnemonic wallet, loads as before;
+    /// - both present   → they must derive consistently, otherwise startup
+    ///   fails loudly instead of silently forking the wallet (a mismatch
+    ///   means one file was replaced).
+    ///
+    /// A seed file of the wrong size is now a hard error (restore from the
+    /// mnemonic or a backup) rather than a silent regeneration — a fresh
+    /// seed over an existing wallet would orphan every deterministic
+    /// derivation (AGENTS.md: never silently recreate wallet state).
     pub async fn load_or_create_seed(path: &Path) -> Result<[u8; 64], WalletError> {
+        let mnemonic_path = Self::mnemonic_path_for(path);
+
+        let mnemonic_on_disk = match tokio::fs::read_to_string(&mnemonic_path).await {
+            Ok(phrase) => Some(phrase.trim().to_string()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(WalletError::Io(e)),
+        };
+
+        let derived: Option<[u8; 64]> = match &mnemonic_on_disk {
+            Some(phrase) => Some(mnemonic_to_seed(phrase)?),
+            None => None,
+        };
+
         if path.exists() {
             let data = tokio::fs::read(path).await?;
-            if data.len() == 64 {
-                let mut seed = [0u8; 64];
-                seed.copy_from_slice(&data);
-                return Ok(seed);
+            if data.len() != 64 {
+                tracing::error!(
+                    seed_file = %path.display(),
+                    mnemonic_file = %mnemonic_path.display(),
+                    "wallet seed file is corrupt (wrong size); refusing to regenerate a fresh seed over an existing wallet. Restore wallet_seed.bin from backup, or re-derive it from the mnemonic in {} and retry",
+                    mnemonic_path.display()
+                );
+                return Err(WalletError::Database(
+                    "wallet seed file has wrong size".into(),
+                ));
             }
-            tracing::warn!("seed file wrong size, regenerating");
+            let mut seed = [0u8; 64];
+            seed.copy_from_slice(&data);
+
+            if let Some(expected) = derived {
+                if expected != seed {
+                    tracing::error!(
+                        seed_file = %path.display(),
+                        mnemonic_file = %mnemonic_path.display(),
+                        "wallet_seed.bin does not match wallet_mnemonic.txt — one of them was replaced. Refusing to start with an ambiguous wallet identity; resolve manually (keep the file that matches the wallet that holds the funds)"
+                    );
+                    return Err(WalletError::Database("seed/mnemonic mismatch".into()));
+                }
+            }
+            return Ok(seed);
         }
 
-        let mut seed = [0u8; 64];
-        rand::thread_rng().fill(&mut seed);
-        tokio::fs::write(path, seed).await?;
+        match derived {
+            // Crash between the two writes: re-derive the seed.
+            Some(seed) => {
+                Self::write_seed_file(path, &seed).await?;
+                Ok(seed)
+            }
+            // First boot ever: generate the mnemonic first, then the seed.
+            None => {
+                let mnemonic = bip39::Mnemonic::generate(24)
+                    .map_err(|e| WalletError::Database(format!("mnemonic generation: {e}")))?;
+                let seed = mnemonic.to_seed("");
+                Self::write_file_private(&mnemonic_path, mnemonic.to_string().as_bytes()).await?;
+                tracing::info!(
+                    mnemonic_file = %mnemonic_path.display(),
+                    "generated 24-word wallet mnemonic — back it up to be able to restore this wallet (NUT-13)"
+                );
+                Self::write_seed_file(path, &seed).await?;
+                Ok(seed)
+            }
+        }
+    }
 
+    async fn write_seed_file(path: &Path, seed: &[u8; 64]) -> Result<(), WalletError> {
+        Self::write_file_private(path, seed).await
+    }
+
+    /// Atomic + durable write of a wallet-identity file: temp file (0600,
+    /// same directory so the rename is same-filesystem), fsync, rename,
+    /// fsync the parent directory. A power loss at any point leaves either
+    /// the previous complete content or the new complete content — never a
+    /// truncated file the next boot would reject (Codex P1 on #37).
+    async fn write_file_private(path: &Path, bytes: &[u8]) -> Result<(), WalletError> {
+        use tokio::io::AsyncWriteExt;
+
+        let tmp = path.with_extension("tmp");
+        let mut f = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)
+            .await?;
+        f.write_all(bytes).await?;
+        f.sync_all().await?;
+        drop(f);
+
+        // Explicit chmod: OpenOptions.mode() only applies at creation, and
+        // a leftover tmp from an earlier crash could carry wider perms.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o600);
-            std::fs::set_permissions(path, perms)?;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
         }
 
-        Ok(seed)
+        tokio::fs::rename(&tmp, path).await?;
+        if let Some(parent) = path.parent() {
+            if let Ok(dir) = std::fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
+        Ok(())
+    }
+
+    fn mnemonic_path_for(seed_path: &Path) -> PathBuf {
+        seed_path.with_file_name("wallet_mnemonic.txt")
+    }
+
+    /// NUT-13 restore for every registered mint (CDK `Wallet::restore`:
+    /// batched NUT-09 restore with NUT-07 pruning, batch 100 / gap 3).
+    /// The operator-facing recovery path after seed/mnemonic loss — see
+    /// MIGRATION.md.
+    pub async fn restore_all(
+        &self,
+    ) -> Result<Vec<(String, Result<RestoredSummary, String>)>, WalletError> {
+        // Per-mint isolation (Codex P2 on #37): one offline or
+        // restore-less mint must not block or swallow the recovery of the
+        // others — restore is often run precisely when things are broken.
+        let mut out = Vec::new();
+        for (mint_url, wallet) in &self.wallets {
+            let result = match wallet.lock().await.restore().await {
+                Ok(restored) => Ok(RestoredSummary {
+                    spent_sat: u64::from(restored.spent),
+                    unspent_sat: u64::from(restored.unspent),
+                    pending_sat: u64::from(restored.pending),
+                }),
+                Err(e) => Err(e.to_string()),
+            };
+            out.push((mint_url.clone(), result));
+        }
+        Ok(out)
     }
 }
 
@@ -637,6 +781,105 @@ mod tests {
             let meta = std::fs::metadata(&seed_path).unwrap();
             assert_eq!(meta.permissions().mode() & 0o777, 0o600);
         }
+    }
+
+    #[tokio::test]
+    async fn first_boot_writes_mnemonic_and_matching_seed() {
+        let tmp = TempDir::new().unwrap();
+        let seed_path = tmp.path().join("wallet_seed.bin");
+        let mnemonic_path = tmp.path().join("wallet_mnemonic.txt");
+
+        let seed = TollWallet::load_or_create_seed(&seed_path).await.unwrap();
+        let phrase = std::fs::read_to_string(&mnemonic_path).unwrap();
+        assert_eq!(phrase.split_whitespace().count(), 24);
+
+        // BIP39 determinism: the phrase on disk must re-derive the seed.
+        assert_eq!(mnemonic_to_seed(phrase.trim()).unwrap(), seed);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let meta = std::fs::metadata(&mnemonic_path).unwrap();
+            assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        }
+    }
+
+    #[tokio::test]
+    async fn mnemonic_only_boot_self_heals_seed() {
+        // Crash between the two writes: mnemonic persisted, seed not.
+        let tmp = TempDir::new().unwrap();
+        let seed_path = tmp.path().join("wallet_seed.bin");
+        let mnemonic_path = tmp.path().join("wallet_mnemonic.txt");
+
+        let mnemonic = bip39::Mnemonic::generate(24).unwrap();
+        std::fs::write(&mnemonic_path, mnemonic.to_string()).unwrap();
+
+        let seed = TollWallet::load_or_create_seed(&seed_path).await.unwrap();
+        assert_eq!(seed, mnemonic.to_seed(""));
+        assert!(seed_path.exists());
+    }
+
+    #[tokio::test]
+    async fn seed_only_boot_is_backward_compatible() {
+        // Pre-mnemonic wallet: raw seed, no mnemonic file.
+        let tmp = TempDir::new().unwrap();
+        let seed_path = tmp.path().join("wallet_seed.bin");
+        let original = [7u8; 64];
+        std::fs::write(&seed_path, original).unwrap();
+
+        let seed = TollWallet::load_or_create_seed(&seed_path).await.unwrap();
+        assert_eq!(seed, original);
+        assert!(!tmp.path().join("wallet_mnemonic.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn seed_mnemonic_mismatch_fails_loudly() {
+        let tmp = TempDir::new().unwrap();
+        let seed_path = tmp.path().join("wallet_seed.bin");
+        let mnemonic_path = tmp.path().join("wallet_mnemonic.txt");
+
+        std::fs::write(&seed_path, [9u8; 64]).unwrap();
+        let other = bip39::Mnemonic::generate(24).unwrap();
+        std::fs::write(&mnemonic_path, other.to_string()).unwrap();
+
+        let err = TollWallet::load_or_create_seed(&seed_path)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("mismatch"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn corrupt_seed_file_fails_instead_of_regenerating() {
+        // AGENTS.md / cashu-service pattern: never silently recreate wallet
+        // state — a fresh seed over an existing wallet orphans every
+        // deterministic derivation.
+        let tmp = TempDir::new().unwrap();
+        let seed_path = tmp.path().join("wallet_seed.bin");
+        std::fs::write(&seed_path, b"too short").unwrap();
+
+        let err = TollWallet::load_or_create_seed(&seed_path)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("wrong size"), "{err}");
+    }
+
+    #[test]
+    fn mnemonic_derivation_matches_bip39_vector() {
+        // BIP39 vector (independently computed, empty passphrase): the
+        // all-zeros-entropy 12-word phrase.
+        let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let seed = mnemonic_to_seed(phrase).unwrap();
+        let expected = hex_literal_expect(
+            "5eb00bbddcf069084889a8ab9155568165f5c453ccb85e70811aaed6f6da5fc19a5ac40b389cd370d086206dec8aa6c43daea6690f20ad3d8d48b2d2ce9e38e4",
+        );
+        assert_eq!(seed, expected);
+    }
+
+    fn hex_literal_expect(hex_str: &str) -> [u8; 64] {
+        let mut out = [0u8; 64];
+        let bytes = hex::decode(hex_str).unwrap();
+        out.copy_from_slice(&bytes);
+        out
     }
 
     #[tokio::test]

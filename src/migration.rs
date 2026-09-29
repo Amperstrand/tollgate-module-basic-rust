@@ -419,6 +419,58 @@ pub fn should_import_tokens(should_run: bool, tokens_exist: bool, export: Export
     should_run && tokens_exist && export != ExportOutcome::Failed
 }
 
+/// Operator-facing snapshot of migration health for the CLI `status`
+/// surface (issue #32): journal-derived counts plus the marker state, so a
+/// stuck migration is one command to diagnose instead of log archaeology.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MigrationState {
+    pub marker: Option<String>,
+    pub imported_sat: u64,
+    pub failed: u64,
+    pub pending: u64,
+    pub spent: u64,
+    pub spent_sat: u64,
+}
+
+impl MigrationState {
+    /// `true` when every attempted token reached a terminal outcome and
+    /// none failed — i.e. nothing is waiting on a later boot.
+    pub fn is_settled(&self) -> bool {
+        self.pending == 0 && self.failed == 0
+    }
+}
+
+pub fn summarize_state(db_dir: &Path) -> MigrationState {
+    let m = FirstBootMigration::new(db_dir);
+    let mut state = MigrationState {
+        marker: None,
+        imported_sat: 0,
+        failed: 0,
+        pending: 0,
+        spent: 0,
+        spent_sat: 0,
+    };
+    if let Ok(body) = std::fs::read_to_string(&m.marker) {
+        let marker_state = body
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("state="))
+            .map(str::to_string);
+        state.marker = Some(marker_state.unwrap_or_else(|| "legacy".into()));
+    }
+    for outcome in fold_last_outcomes(&read_journal(&m.journal)).into_values() {
+        match outcome {
+            TokenOutcome::Imported { amount_sat } => state.imported_sat += amount_sat,
+            TokenOutcome::Failed { .. } => state.failed += 1,
+            TokenOutcome::Pending => state.pending += 1,
+            TokenOutcome::Spent { amount_sat } => {
+                state.spent += 1;
+                state.spent_sat += amount_sat;
+            }
+        }
+    }
+    state
+}
+
 /// Fold a raw journal into per-token outcome; the LAST entry for a token
 /// wins (Pending → Failed → Imported is a normal retry sequence; a trailing
 /// Pending is an unsettled attempt to be reconciled).
