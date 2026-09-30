@@ -284,6 +284,22 @@ pub async fn handle_pay(
     // overwrite) instead of failing on the spent token.
     let cfg_dir = config::config_dir();
     let payment_id = payment_journal::token_id(&token);
+    // Idempotency check FIRST (Codex P1 on #43): appending a fresh intent
+    // before this lookup would shadow the earlier settled entry
+    // (last-write-wins) and make the replay branch unreachable.
+    if let Some(payment_journal::PaymentPhase::Received { amount_sat })
+    | Some(payment_journal::PaymentPhase::ReconcileSpent { amount_sat }) =
+        payment_journal::settled_outcome(&cfg_dir, &token)
+    {
+        tracing::info!(amount_sat, id = %payment_id, "idempotent replay: token already settled, re-granting session");
+        let steps = amount_sat / precheck.price_per_step;
+        let allotment = steps * state.config.step_size;
+        let mut sessions = state.sessions.lock().await;
+        sessions.create_session(&mac, allotment, &state.config.metric, 3600);
+        drop(sessions);
+        let _ = state.portal.grant_access(&mac).await;
+        return session_granted_event(&state, &mac, allotment);
+    }
     let intent = payment_journal::PaymentEntry {
         id: payment_id.clone(),
         ts: std::time::SystemTime::now()
@@ -321,33 +337,12 @@ pub async fn handle_pay(
         );
     }
 
-    if let Some(payment_journal::PaymentPhase::Received { amount_sat })
-    | Some(payment_journal::PaymentPhase::ReconcileSpent { amount_sat }) =
-        payment_journal::settled_outcome(&cfg_dir, &token)
-    {
-        tracing::info!(amount_sat, id = %payment_id, "idempotent replay: token already settled, re-granting session");
-        let steps = amount_sat / precheck.price_per_step;
-        let allotment = steps * state.config.step_size;
-        let mut sessions = state.sessions.lock().await;
-        sessions.create_session(&mac, allotment, &state.config.metric, 3600);
-        drop(sessions);
-        let _ = state.portal.grant_access(&mac).await;
-        return session_granted_event(&state, &mac, allotment);
-    }
-
     // Step 2: receive token into wallet
     let wallet_guard = state.wallet.read().await;
     let received_amount = if let Some(ref wallet) = *wallet_guard {
         match wallet.receive(&token).await {
             Ok(amount_sat) => {
                 tracing::info!(amount_sat, "token received into wallet");
-                let _ = payment_journal::append_entry(
-                    &cfg_dir,
-                    &payment_journal::PaymentEntry {
-                        phase: payment_journal::PaymentPhase::Received { amount_sat },
-                        ..intent.clone()
-                    },
-                );
                 amount_sat
             }
             Err(e) => {
@@ -442,6 +437,21 @@ pub async fn handle_pay(
             tracing::warn!(error = %e, "failed to save sessions to disk");
         });
     drop(sessions);
+
+    // Terminal journal append AFTER the session is durable (Codex P1 on
+    // #43): a `received` entry then MEANS "session durably granted". A
+    // crash before this append leaves intent-only, which startup
+    // reconciliation re-decides (spent → re-grant; same-MAC overwrite is
+    // idempotent) instead of stranding a settled-but-sessionless payment.
+    let _ = payment_journal::append_entry(
+        &cfg_dir,
+        &payment_journal::PaymentEntry {
+            phase: payment_journal::PaymentPhase::Received {
+                amount_sat: received_amount,
+            },
+            ..intent.clone()
+        },
+    );
 
     // Open the gate to grant network access via ndsctl.
     if let Err(e) = state.portal.grant_access(&mac).await {

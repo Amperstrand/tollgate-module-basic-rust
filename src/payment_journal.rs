@@ -142,9 +142,25 @@ pub struct ReconcileReport {
     pub undecided: u64,
 }
 
-/// Startup reconciliation: decide every payment whose last phase is
+/// Reconciliation pass: decide every payment whose last phase is
 /// `intent` (crash mid-flight) or `timeout-unknown`, by asking the mint
 /// (NUT-07) whether the token's proofs were spent.
+///
+/// Two accepted trade-offs, deliberate and bounded (Codex P1/P2 on #43):
+///
+/// 1. Spent-at-mint is not proof THIS wallet received the outputs — an
+///    intent-only payment whose token was later spent elsewhere grants a
+///    session nobody paid for. The damage is bounded (one session priced
+///    from the token's face value) and the alternative — requiring
+///    per-proof recovery evidence before granting — deterministically
+///    strands every paying customer whose router crashed mid-receive.
+///    Precise attribution is the per-Y saga linkage tracked in #31; until
+///    then we accept the bounded free-ride over certain harm.
+/// 2. The amount is the token's FACE value (what NUT-07 reports), not the
+///    net-after-input-fees the live path uses — on fee-charging mints the
+///    reconciled session can over-grant by the fee delta, consistent with
+///    the live path's posture of never shorting the customer after value
+///    moved.
 ///
 /// Spent → the customer paid: the returned grant list carries the entry
 /// and spent amount; the (async) caller creates each session and opens the
