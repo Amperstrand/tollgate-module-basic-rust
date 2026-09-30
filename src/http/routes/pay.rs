@@ -232,9 +232,29 @@ pub async fn handle_pay(
         if let Some(amount_sat) = settled_amount {
             let entry_price = payment_journal::entry_price_per_step(&cfg_dir, &token)
                 .unwrap_or_else(|| precheck_fallback_price(&state));
+            // Replay returns the ORIGINAL grant, not a fresh one (Codex
+            // P1 on #43): recreating would reset usage and expiry, letting
+            // a customer replenish access forever with one old token.
+            {
+                let sessions = state.sessions.lock().await;
+                if sessions.is_active(&mac) {
+                    if let Some(sess) = sessions.get_session(&mac) {
+                        let remaining = sess.allotment.saturating_sub(sess.used).max(1);
+                        tracing::info!(
+                            amount_sat,
+                            remaining,
+                            "idempotent replay: session already active, returning current grant"
+                        );
+                        drop(sessions);
+                        let _ = state.portal.grant_access(&mac).await;
+                        return session_granted_event(&state, &mac, remaining);
+                    }
+                }
+                drop(sessions);
+            }
             tracing::info!(
                 amount_sat,
-                "idempotent replay: token already settled, re-granting session"
+                "idempotent replay: token settled, session gone — re-granting"
             );
             let steps = amount_sat / entry_price.max(1);
             let allotment = steps * state.config.step_size;
@@ -332,6 +352,8 @@ pub async fn handle_pay(
         mac: mac.clone(),
         mint: token_mint_url.to_string(),
         price_per_step: precheck.price_per_step,
+        step_size: state.config.step_size,
+        metric: state.config.metric.clone(),
         phase: payment_journal::PaymentPhase::Intent,
     };
     if let Err(e) = payment_journal::append_entry(&cfg_dir, &intent) {
@@ -452,11 +474,42 @@ pub async fn handle_pay(
 
     let mut sessions = state.sessions.lock().await;
     let _session = sessions.create_session(&mac, allotment, &state.config.metric, duration_secs);
-    sessions
-        .save_to_disk(&crate::config::config_dir())
-        .unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "failed to save sessions to disk");
-        });
+    // save_now (NOT the debounced save_to_disk): a debounced Ok(()) writes
+    // nothing, and the terminal journal append below must not advance
+    // until the session is DURABLY recoverable (Codex P1 on #43; the
+    // session module's save_now docs mandate exactly this ordering).
+    if let Err(e) = sessions.save_now(&crate::config::config_dir()) {
+        tracing::error!(error = %e, "CRITICAL: session not durable after receive — answering outcome-unknown; reconciliation will re-grant");
+        drop(sessions);
+        let _ = payment_journal::append_entry(
+            &cfg_dir,
+            &payment_journal::PaymentEntry {
+                phase: payment_journal::PaymentPhase::TimeoutUnknown,
+                ..intent.clone()
+            },
+        );
+        let (status, code, message) = receive_failure_shape(&crate::wallet::WalletError::Timeout(
+            std::time::Duration::from_secs(0),
+        ));
+        let event = nostr_event::create_event(
+            21023,
+            vec![
+                vec!["level".to_string(), "error".to_string()],
+                vec!["code".to_string(), code.to_string()],
+            ],
+            &message,
+            &state.identity.secret_key,
+        );
+        let json = serde_json::to_string(&event).unwrap_or_default();
+        return (
+            status,
+            [
+                ("content-type", "application/json"),
+                ("access-control-allow-origin", "*"),
+            ],
+            json,
+        );
+    }
     drop(sessions);
 
     // Terminal journal append AFTER the session is durable (Codex P1 on

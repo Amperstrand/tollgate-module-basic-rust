@@ -19,6 +19,8 @@ fn entry(_dir: &std::path::Path, id: &str, phase: PaymentPhase) -> PaymentEntry 
         mac: "aa:bb:cc:dd:ee:01".into(),
         mint: "https://mint.example".into(),
         price_per_step: 2,
+        step_size: 5000,
+        metric: "milliseconds".into(),
         phase,
     }
 }
@@ -102,6 +104,25 @@ async fn reconcile_spent_grants_and_is_idempotent() {
         grants[0].0.mac, "aa:bb:cc:dd:ee:01",
         "grant carries the customer MAC"
     );
+    assert_eq!(
+        grants[0].0.step_size, 5000,
+        "grant carries the frozen pricing facts"
+    );
+
+    // The CALLER applies each grant durably, then appends the terminal
+    // phase (the main.rs contract): simulate that here.
+    for (g, amount) in &grants {
+        append_entry(
+            dir.path(),
+            &PaymentEntry {
+                phase: PaymentPhase::ReconcileSpent {
+                    amount_sat: *amount,
+                },
+                ..g.clone()
+            },
+        )
+        .unwrap();
+    }
     assert_eq!(
         settled_outcome(dir.path(), &e.token),
         Some(PaymentPhase::ReconcileSpent { amount_sat: 8 })

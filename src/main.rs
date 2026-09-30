@@ -20,14 +20,22 @@ async fn reconcile_payments_once(state: &Arc<http::AppState>) {
         payment_journal::reconcile(&cfg_dir, wallet).await
     };
     for (entry, amount_sat) in grants {
+        // Grant from the pricing facts frozen at intent time (Codex P2 on
+        // #43), not current config.
         let steps = amount_sat / entry.price_per_step.max(1);
-        let allotment = steps * state.config.step_size;
+        let allotment = steps * entry.step_size.max(1);
         {
             let mut sessions = state.sessions.lock().await;
-            sessions.create_session(&entry.mac, allotment, &state.config.metric, 3600);
-            sessions.save_to_disk(&config::config_dir()).unwrap_or_else(
-                |e| tracing::warn!(error = %e, "session save after reconcile failed"),
-            );
+            sessions.create_session(&entry.mac, allotment, &entry.metric, 3600);
+            // save_now: durable before the terminal journal append may
+            // advance — debounced save returns Ok without writing (Codex
+            // P1 on #43). On failure the entry stays undecided and is
+            // retried on the next pass.
+            if let Err(e) = sessions.save_now(&config::config_dir()) {
+                tracing::error!(mac = %entry.mac, error = %e, "CRITICAL: reconciled session not durable — leaving payment undecided for retry");
+                drop(sessions);
+                continue;
+            }
         }
         if let Err(e) = state.portal.grant_access(&entry.mac).await {
             tracing::warn!(mac = %entry.mac, error = %e, "gate open after payment reconcile failed");

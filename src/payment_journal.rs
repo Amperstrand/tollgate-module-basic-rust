@@ -77,7 +77,12 @@ pub struct PaymentEntry {
     pub token: String,
     pub mac: String,
     pub mint: String,
+    /// All pricing terms frozen at intent time so reconciliation grants
+    /// what was paid for even if the operator later changes config
+    /// (Codex P2 on #43).
     pub price_per_step: u64,
+    pub step_size: u64,
+    pub metric: String,
     pub phase: PaymentPhase,
 }
 
@@ -192,34 +197,49 @@ pub async fn reconcile(
         match sink.token_spent(&entry.token).await {
             Ok(Some(amount_sat)) => {
                 let steps = amount_sat / entry.price_per_step.max(1);
-                let phase = if steps == 0 {
+                if steps == 0 {
+                    // No side effect owed: safe to close inline.
                     report.zero_steps += 1;
-                    PaymentPhase::ReconcileZeroSteps { amount_sat }
+                    let _ = append_entry(
+                        dir,
+                        &PaymentEntry {
+                            phase: PaymentPhase::ReconcileZeroSteps { amount_sat },
+                            ..entry.clone()
+                        },
+                    );
                 } else {
+                    // Grant returned UNJOURNALLED: the caller appends
+                    // `reconcile-spent` only after the granted session is
+                    // DURABLY saved (save_now), so every crash point
+                    // converges via idempotent re-grant instead of
+                    // stranding a settled-but-sessionless payment
+                    // (Codex P1 on #43).
                     report.granted_sessions += 1;
                     grants.push((entry.clone(), amount_sat));
-                    PaymentPhase::ReconcileSpent { amount_sat }
-                };
-                let _ = append_entry(
-                    dir,
-                    &PaymentEntry {
-                        phase,
-                        ..entry.clone()
-                    },
-                );
+                }
             }
             Ok(None) => {
-                let _ = append_entry(
-                    dir,
-                    &PaymentEntry {
-                        phase: PaymentPhase::ReconcileUnspent,
-                        ..entry.clone()
-                    },
-                );
-                report.closed_unspent += 1;
+                // Close as unspent ONLY if no local receive saga is still
+                // unresolved: an incomplete saga can coexist with an
+                // UNSPENT NUT-07 answer while its swap is in flight
+                // (Codex P1 on #43) — that outcome is still ambiguous.
+                match sink.mint_has_unresolved_receive(&entry.token).await {
+                    Ok(false) => {
+                        let _ = append_entry(
+                            dir,
+                            &PaymentEntry {
+                                phase: PaymentPhase::ReconcileUnspent,
+                                ..entry.clone()
+                            },
+                        );
+                        report.closed_unspent += 1;
+                    }
+                    _ => report.undecided += 1,
+                }
             }
             Err(_) => {
-                // Mint unreachable or check unavailable: still unknown.
+                // Mint unreachable, check unavailable, or proofs PENDING
+                // at the mint: still unknown — retried next pass.
                 report.undecided += 1;
             }
         }
