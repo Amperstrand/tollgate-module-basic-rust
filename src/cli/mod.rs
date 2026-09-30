@@ -296,6 +296,7 @@ async fn handle_command(cmd: &str, state: &AppState) -> String {
         "version" => version_string(),
         "status" => {
             let m = crate::migration::summarize_state(&config::config_dir());
+            let p = crate::payment_journal::summarize(&config::config_dir());
             serde_json::json!({
                 "success": true,
                 "message": "running",
@@ -307,6 +308,11 @@ async fn handle_command(cmd: &str, state: &AppState) -> String {
                     "spent": m.spent,
                     "spent_sat": m.spent_sat,
                     "settled": m.is_settled(),
+                },
+                "payments": {
+                    "total": p.total,
+                    "needs_reconciliation": p.needs_reconciliation,
+                    "received_sat": p.received_sat,
                 }
             })
             .to_string()

@@ -35,6 +35,15 @@ use rand::Rng;
 use tokio::sync::Mutex;
 use tokio::time::{timeout, Duration};
 
+/// Tri-state NUT-07 outcome for a token (reconciliation callers).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenCheckState {
+    Spent(u64),
+    Unspent,
+    /// Proofs are in-flight at the mint — the outcome is still ambiguous.
+    Pending,
+}
+
 /// Operator-facing result of a NUT-13 restore per mint (sats).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RestoredSummary {
@@ -218,6 +227,21 @@ impl TollWallet {
     /// definitively whether a timed-out receive actually landed — no
     /// inference from error text.
     pub async fn token_spent(&self, token_str: &str) -> Result<Option<u64>, WalletError> {
+        match self.token_check_state(token_str).await? {
+            TokenCheckState::Spent(amount_sat) => Ok(Some(amount_sat)),
+            TokenCheckState::Unspent => Ok(None),
+            // PENDING (in-flight at the mint) or mixed states are AMBIGUOUS,
+            // not unspent — callers that would close an outcome on "None"
+            // (payment reconciliation) must not treat this as settled
+            // (Codex P1 on #43).
+            TokenCheckState::Pending => Err(WalletError::Database(
+                "token proofs pending at mint — outcome still ambiguous".into(),
+            )),
+        }
+    }
+
+    /// Tri-state NUT-07 outcome for reconciliation callers.
+    pub async fn token_check_state(&self, token_str: &str) -> Result<TokenCheckState, WalletError> {
         use cdk::nuts::nut07::State;
         use cdk::nuts::{KeySetInfo, Token};
         use cdk::wallet::types::KeysetLoadPolicy;
@@ -256,13 +280,18 @@ impl TollWallet {
                 .collect();
             let proofs = token.proofs(&keyset_infos)?;
             let states = w.check_proofs_spent(proofs).await?;
-            Ok::<_, cdk::Error>(states.iter().all(|s| s.state == State::Spent))
+            let all_spent = states.iter().all(|s| s.state == State::Spent);
+            let any_pending = states
+                .iter()
+                .any(|s| matches!(s.state, State::Pending | State::Reserved));
+            Ok::<_, cdk::Error>((all_spent, any_pending))
         })
         .await;
 
         match result {
-            Ok(Ok(true)) => Ok(Some(amount_sat)),
-            Ok(Ok(false)) => Ok(None),
+            Ok(Ok((true, _))) => Ok(TokenCheckState::Spent(amount_sat)),
+            Ok(Ok((false, true))) => Ok(TokenCheckState::Pending),
+            Ok(Ok((false, false))) => Ok(TokenCheckState::Unspent),
             Ok(Err(e)) => Err(WalletError::Cdk(e)),
             Err(_) => Err(WalletError::Timeout(OP_TIMEOUT)),
         }

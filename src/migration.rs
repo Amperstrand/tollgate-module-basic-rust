@@ -102,7 +102,7 @@ impl TokenOutcome {
 /// tests can fake the mint side and observe journal ordering without a
 /// live CDK wallet.
 #[async_trait::async_trait]
-pub trait TokenSink {
+pub trait TokenSink: Send + Sync {
     async fn receive(&self, token: &str) -> Result<u64, crate::wallet::WalletError>;
 
     /// NUT-07 reconciliation: `Ok(Some(amount_sat))` iff every proof of the

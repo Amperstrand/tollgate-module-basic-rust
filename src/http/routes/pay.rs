@@ -16,6 +16,7 @@ use crate::config;
 use crate::http::AppState;
 use crate::mac_resolver::{get_client_ip, get_mac_address};
 use crate::nostr_event;
+use crate::payment_journal;
 use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
@@ -60,51 +61,21 @@ pub(crate) enum PrecheckError {
     },
 }
 
-/// Durable record of a timed-out (outcome-unknown) payment attempt
-/// (Codex P1 on #39): the customer is told the token is being reconciled,
-/// so TollGate must leave its own record of the ambiguity — CDK settling
-/// the wallet saga does not recover the *session* the customer is owed
-/// (AGENTS.md: wallet-level atomicity is not application-level atomicity;
-/// business-level recovery is this repo's job). Stores the token HASH only
-/// — the token is bearer ecash. Best-effort: a failed record logs CRITICAL
-/// but still answers 504 (the outcome is unknown either way).
-fn record_payment_timeout(token: &str) {
-    use std::io::Write;
-    let dir = config::config_dir();
-    let path = dir.join("payment-timeouts.jsonl");
-    let hash = {
-        use sha2::{Digest, Sha256};
-        let mut h = Sha256::new();
-        h.update(token.as_bytes());
-        hex::encode(h.finalize())
-    };
-    let entry = serde_json::json!({
-        "ts": std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs(),
-        "token_sha256": hash,
-        "outcome": "unknown-504",
-    });
-    let result = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .and_then(|mut f| {
-            writeln!(f, "{entry}")?;
-            f.sync_all()
-        });
-    if let Err(e) = result {
-        tracing::error!(error = %e, path = %path.display(), "CRITICAL: could not persist payment-timeout record");
-    }
-}
-
 /// HTTP semantics for a failed receive (issue #33): a timeout is an
 /// UNKNOWN outcome, not a rejection — the mint may have accepted the swap
 /// (AGENTS.md: ambiguous results are reconciled, not retried). Answering
 /// 400 "rejected" would invite the customer to treat a possibly-consumed
 /// token as failed; 504 + `payment-outcome-unknown` says "do not resubmit,
 /// it is being reconciled".
+fn precheck_fallback_price(state: &crate::http::AppState) -> u64 {
+    state
+        .config
+        .accepted_mints
+        .first()
+        .map(|m| m.price_per_step)
+        .unwrap_or(1)
+}
+
 fn receive_failure_shape(e: &crate::wallet::WalletError) -> (StatusCode, &'static str, String) {
     match e {
         crate::wallet::WalletError::Timeout(_) => (
@@ -245,6 +216,55 @@ pub async fn handle_pay(
             );
         }
     };
+    // Idempotent replay FIRST — before token verification (Codex P1 on
+    // #43): a settled token is SPENT at the mint, so the verifier would
+    // reject the duplicate POST before this branch could re-grant. The
+    // journal entry carries its own pricing facts.
+    {
+        let cfg_dir = config::config_dir();
+        let settled_amount = match payment_journal::settled_outcome(&cfg_dir, &token) {
+            Some(payment_journal::PaymentPhase::Received { amount_sat })
+            | Some(payment_journal::PaymentPhase::ReconcileSpent { amount_sat }) => {
+                Some(amount_sat)
+            }
+            _ => None,
+        };
+        if let Some(amount_sat) = settled_amount {
+            let entry_price = payment_journal::entry_price_per_step(&cfg_dir, &token)
+                .unwrap_or_else(|| precheck_fallback_price(&state));
+            // Replay returns the ORIGINAL grant, not a fresh one (Codex
+            // P1 on #43): recreating would reset usage and expiry, letting
+            // a customer replenish access forever with one old token.
+            {
+                let sessions = state.sessions.lock().await;
+                if sessions.is_active(&mac) {
+                    if let Some(sess) = sessions.get_session(&mac) {
+                        let remaining = sess.allotment.saturating_sub(sess.used).max(1);
+                        tracing::info!(
+                            amount_sat,
+                            remaining,
+                            "idempotent replay: session already active, returning current grant"
+                        );
+                        drop(sessions);
+                        let _ = state.portal.grant_access(&mac).await;
+                        return session_granted_event(&state, &mac, remaining);
+                    }
+                }
+                drop(sessions);
+            }
+            tracing::info!(
+                amount_sat,
+                "idempotent replay: token settled, session gone — re-granting"
+            );
+            let steps = amount_sat / entry_price.max(1);
+            let allotment = steps * state.config.step_size;
+            let mut sessions = state.sessions.lock().await;
+            sessions.create_session(&mac, allotment, &state.config.metric, 3600);
+            drop(sessions);
+            let _ = state.portal.grant_access(&mac).await;
+            return session_granted_event(&state, &mac, allotment);
+        }
+    }
 
     // Step 1: verify token via NUT-07 checkstate
     let (verified_amount, token_mint_url) = match state.verifier.verify(&token).await {
@@ -316,6 +336,51 @@ pub async fn handle_pay(
         }
     };
 
+    // Step 1.9: durable payment intent BEFORE value moves (AGENTS.md
+    // money-moving-call rule; #40). Also the idempotency key: a replayed
+    // token that already bought a session re-grants it (same-MAC
+    // overwrite) instead of failing on the spent token.
+    let cfg_dir = config::config_dir();
+    let payment_id = payment_journal::token_id(&token);
+    let intent = payment_journal::PaymentEntry {
+        id: payment_id.clone(),
+        ts: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+        token: token.clone(),
+        mac: mac.clone(),
+        mint: token_mint_url.to_string(),
+        price_per_step: precheck.price_per_step,
+        step_size: state.config.step_size,
+        metric: state.config.metric.clone(),
+        phase: payment_journal::PaymentPhase::Intent,
+    };
+    if let Err(e) = payment_journal::append_entry(&cfg_dir, &intent) {
+        tracing::error!(error = %e, "CRITICAL: could not persist payment intent; refusing to move value with no recovery record");
+        let (status, code, message) = receive_failure_shape(&crate::wallet::WalletError::Database(
+            "payment journal unavailable".into(),
+        ));
+        let event = nostr_event::create_event(
+            21023,
+            vec![
+                vec!["level".to_string(), "error".to_string()],
+                vec!["code".to_string(), code.to_string()],
+            ],
+            &message,
+            &state.identity.secret_key,
+        );
+        let json = serde_json::to_string(&event).unwrap_or_default();
+        return (
+            status,
+            [
+                ("content-type", "application/json"),
+                ("access-control-allow-origin", "*"),
+            ],
+            json,
+        );
+    }
+
     // Step 2: receive token into wallet
     let wallet_guard = state.wallet.read().await;
     let received_amount = if let Some(ref wallet) = *wallet_guard {
@@ -326,9 +391,20 @@ pub async fn handle_pay(
             }
             Err(e) => {
                 tracing::warn!(error = %e, "wallet receive failed");
-                if matches!(e, crate::wallet::WalletError::Timeout(_)) {
-                    record_payment_timeout(&token);
-                }
+                // Every error AT the receive call is ambiguous (Codex P1 on
+                // #43): a lost response after the mint accepted surfaces as
+                // a Cdk transport error, not a Timeout — classifying those
+                // as terminal `rejected` would close payments whose value
+                // moved. Pre-receive rejections (precheck) never journal an
+                // intent at all.
+                let phase = payment_journal::PaymentPhase::TimeoutUnknown;
+                let _ = payment_journal::append_entry(
+                    &cfg_dir,
+                    &payment_journal::PaymentEntry {
+                        phase,
+                        ..intent.clone()
+                    },
+                );
                 drop(wallet_guard);
                 let (status, code, message) = receive_failure_shape(&e);
                 let event = nostr_event::create_event(
@@ -398,12 +474,58 @@ pub async fn handle_pay(
 
     let mut sessions = state.sessions.lock().await;
     let _session = sessions.create_session(&mac, allotment, &state.config.metric, duration_secs);
-    sessions
-        .save_to_disk(&crate::config::config_dir())
-        .unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "failed to save sessions to disk");
-        });
+    // save_now (NOT the debounced save_to_disk): a debounced Ok(()) writes
+    // nothing, and the terminal journal append below must not advance
+    // until the session is DURABLY recoverable (Codex P1 on #43; the
+    // session module's save_now docs mandate exactly this ordering).
+    if let Err(e) = sessions.save_now(&crate::config::config_dir()) {
+        tracing::error!(error = %e, "CRITICAL: session not durable after receive — answering outcome-unknown; reconciliation will re-grant");
+        drop(sessions);
+        let _ = payment_journal::append_entry(
+            &cfg_dir,
+            &payment_journal::PaymentEntry {
+                phase: payment_journal::PaymentPhase::TimeoutUnknown,
+                ..intent.clone()
+            },
+        );
+        let (status, code, message) = receive_failure_shape(&crate::wallet::WalletError::Timeout(
+            std::time::Duration::from_secs(0),
+        ));
+        let event = nostr_event::create_event(
+            21023,
+            vec![
+                vec!["level".to_string(), "error".to_string()],
+                vec!["code".to_string(), code.to_string()],
+            ],
+            &message,
+            &state.identity.secret_key,
+        );
+        let json = serde_json::to_string(&event).unwrap_or_default();
+        return (
+            status,
+            [
+                ("content-type", "application/json"),
+                ("access-control-allow-origin", "*"),
+            ],
+            json,
+        );
+    }
     drop(sessions);
+
+    // Terminal journal append AFTER the session is durable (Codex P1 on
+    // #43): a `received` entry then MEANS "session durably granted". A
+    // crash before this append leaves intent-only, which startup
+    // reconciliation re-decides (spent → re-grant; same-MAC overwrite is
+    // idempotent) instead of stranding a settled-but-sessionless payment.
+    let _ = payment_journal::append_entry(
+        &cfg_dir,
+        &payment_journal::PaymentEntry {
+            phase: payment_journal::PaymentPhase::Received {
+                amount_sat: received_amount,
+            },
+            ..intent.clone()
+        },
+    );
 
     // Open the gate to grant network access via ndsctl.
     if let Err(e) = state.portal.grant_access(&mac).await {
@@ -419,6 +541,14 @@ pub async fn handle_pay(
     );
 
     // Step 4: return kind 1022 session-granted event
+    session_granted_event(&state, &mac, allotment)
+}
+
+fn session_granted_event(
+    state: &crate::http::AppState,
+    mac: &str,
+    allotment: u64,
+) -> (StatusCode, [(&'static str, &'static str); 2], String) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -428,7 +558,7 @@ pub async fn handle_pay(
         vec![
             "device-identifier".to_string(),
             "mac".to_string(),
-            mac.clone(),
+            mac.to_string(),
         ],
         vec!["allotment".to_string(), allotment.to_string()],
         vec!["metric".to_string(), state.config.metric.clone()],
@@ -529,21 +659,6 @@ mod tests {
         ));
         assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
         assert_eq!(code, "payment-outcome-unknown");
-    }
-
-    #[test]
-    fn payment_timeout_record_hashes_token_and_persists() {
-        let dir = tempfile::tempdir().unwrap();
-        std::env::set_var("TOLLGATE_TEST_CONFIG_DIR", dir.path());
-        let token = "cashuAsecretbearervalue";
-        record_payment_timeout(token);
-        let body = std::fs::read_to_string(dir.path().join("payment-timeouts.jsonl")).unwrap();
-        assert!(
-            !body.contains(token),
-            "bearer token must never be persisted"
-        );
-        assert!(body.contains("token_sha256"));
-        assert!(body.contains("unknown-504"));
     }
 
     #[test]
