@@ -112,7 +112,16 @@ pub fn append_entry(dir: &Path, entry: &PaymentEntry) -> std::io::Result<()> {
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
     }
     f.write_all(line.as_bytes())?;
-    f.sync_all()
+    f.sync_all()?;
+    // First-creation durability: the file's directory entry must survive a
+    // power cut too, or the intent (and its token) can vanish with the
+    // file on reboot (Codex P2 on #43).
+    if let Some(parent) = path.parent() {
+        if let Ok(dirf) = std::fs::File::open(parent) {
+            let _ = dirf.sync_all();
+        }
+    }
+    Ok(())
 }
 
 pub fn read_journal(dir: &Path) -> Vec<PaymentEntry> {
@@ -241,6 +250,14 @@ pub fn summarize(dir: &Path) -> PaymentsSummary {
         }
     }
     s
+}
+
+/// The pricing fact recorded at intent time, for replay path use.
+pub fn entry_price_per_step(dir: &Path, token: &str) -> Option<u64> {
+    let id = token_id(token);
+    fold_last(&read_journal(dir))
+        .get(&id)
+        .map(|e| e.price_per_step)
 }
 
 /// Lookup for idempotent replay: the settled (value-received) outcome for

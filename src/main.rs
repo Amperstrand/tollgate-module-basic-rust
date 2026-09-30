@@ -206,6 +206,13 @@ async fn main() {
         ln_quotes: ln_quotes.clone(),
     });
 
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            lightning_quotes::run_monitor(state, ln_quotes, std::time::Duration::from_secs(5)).await
+        });
+    }
+
     // Payment-journal reconciliation (#40): decide every payment left
     // intent-only (crash mid-receive) or timeout-unknown, by asking the
     // mint (NUT-07). Spent => the customer paid => grant the session they

@@ -67,6 +67,15 @@ pub(crate) enum PrecheckError {
 /// 400 "rejected" would invite the customer to treat a possibly-consumed
 /// token as failed; 504 + `payment-outcome-unknown` says "do not resubmit,
 /// it is being reconciled".
+fn precheck_fallback_price(state: &crate::http::AppState) -> u64 {
+    state
+        .config
+        .accepted_mints
+        .first()
+        .map(|m| m.price_per_step)
+        .unwrap_or(1)
+}
+
 fn receive_failure_shape(e: &crate::wallet::WalletError) -> (StatusCode, &'static str, String) {
     match e {
         crate::wallet::WalletError::Timeout(_) => (
@@ -207,6 +216,35 @@ pub async fn handle_pay(
             );
         }
     };
+    // Idempotent replay FIRST — before token verification (Codex P1 on
+    // #43): a settled token is SPENT at the mint, so the verifier would
+    // reject the duplicate POST before this branch could re-grant. The
+    // journal entry carries its own pricing facts.
+    {
+        let cfg_dir = config::config_dir();
+        let settled_amount = match payment_journal::settled_outcome(&cfg_dir, &token) {
+            Some(payment_journal::PaymentPhase::Received { amount_sat })
+            | Some(payment_journal::PaymentPhase::ReconcileSpent { amount_sat }) => {
+                Some(amount_sat)
+            }
+            _ => None,
+        };
+        if let Some(amount_sat) = settled_amount {
+            let entry_price = payment_journal::entry_price_per_step(&cfg_dir, &token)
+                .unwrap_or_else(|| precheck_fallback_price(&state));
+            tracing::info!(
+                amount_sat,
+                "idempotent replay: token already settled, re-granting session"
+            );
+            let steps = amount_sat / entry_price.max(1);
+            let allotment = steps * state.config.step_size;
+            let mut sessions = state.sessions.lock().await;
+            sessions.create_session(&mac, allotment, &state.config.metric, 3600);
+            drop(sessions);
+            let _ = state.portal.grant_access(&mac).await;
+            return session_granted_event(&state, &mac, allotment);
+        }
+    }
 
     // Step 1: verify token via NUT-07 checkstate
     let (verified_amount, token_mint_url) = match state.verifier.verify(&token).await {
@@ -284,22 +322,6 @@ pub async fn handle_pay(
     // overwrite) instead of failing on the spent token.
     let cfg_dir = config::config_dir();
     let payment_id = payment_journal::token_id(&token);
-    // Idempotency check FIRST (Codex P1 on #43): appending a fresh intent
-    // before this lookup would shadow the earlier settled entry
-    // (last-write-wins) and make the replay branch unreachable.
-    if let Some(payment_journal::PaymentPhase::Received { amount_sat })
-    | Some(payment_journal::PaymentPhase::ReconcileSpent { amount_sat }) =
-        payment_journal::settled_outcome(&cfg_dir, &token)
-    {
-        tracing::info!(amount_sat, id = %payment_id, "idempotent replay: token already settled, re-granting session");
-        let steps = amount_sat / precheck.price_per_step;
-        let allotment = steps * state.config.step_size;
-        let mut sessions = state.sessions.lock().await;
-        sessions.create_session(&mac, allotment, &state.config.metric, 3600);
-        drop(sessions);
-        let _ = state.portal.grant_access(&mac).await;
-        return session_granted_event(&state, &mac, allotment);
-    }
     let intent = payment_journal::PaymentEntry {
         id: payment_id.clone(),
         ts: std::time::SystemTime::now()
@@ -347,14 +369,13 @@ pub async fn handle_pay(
             }
             Err(e) => {
                 tracing::warn!(error = %e, "wallet receive failed");
-                let phase = match &e {
-                    crate::wallet::WalletError::Timeout(_) => {
-                        payment_journal::PaymentPhase::TimeoutUnknown
-                    }
-                    other => payment_journal::PaymentPhase::Rejected {
-                        reason: other.to_string(),
-                    },
-                };
+                // Every error AT the receive call is ambiguous (Codex P1 on
+                // #43): a lost response after the mint accepted surfaces as
+                // a Cdk transport error, not a Timeout — classifying those
+                // as terminal `rejected` would close payments whose value
+                // moved. Pre-receive rejections (precheck) never journal an
+                // intent at all.
+                let phase = payment_journal::PaymentPhase::TimeoutUnknown;
                 let _ = payment_journal::append_entry(
                     &cfg_dir,
                     &payment_journal::PaymentEntry {
