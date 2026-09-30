@@ -54,6 +54,13 @@ fn mnemonic_to_seed(phrase: &str) -> Result<[u8; 64], WalletError> {
 
 /// Default receive/send/melt timeout (matches Go's 30s).
 const OP_TIMEOUT: Duration = Duration::from_secs(30);
+/// Recovery may replay/restore several sagas; CDK's own replay budget is
+/// ~60s, so 120s covers one full attempt (replay + checkstate + restore).
+/// While it runs it holds the mint's wallet mutex, so this is also the
+/// worst-case starvation window for same-mint ops after a timeout event —
+/// anything longer trades availability for nothing (the saga survives a
+/// failed attempt and is retried on the next trigger or boot).
+const RECOVERY_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub use crate::error::WalletError;
 
@@ -74,6 +81,7 @@ pub fn canonical_mint_url(url: &str) -> String {
 /// ensures operations are atomic — no swap-counter race.
 pub struct TollWallet {
     wallets: HashMap<String, Arc<Mutex<Wallet>>>,
+    recovery_in_flight: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     seed: [u8; 64],
     accepted_mints: Vec<String>,
     db_dir: PathBuf,
@@ -84,6 +92,7 @@ impl TollWallet {
     pub fn new(seed: [u8; 64], accepted_mints: Vec<String>, db_dir: PathBuf) -> Self {
         Self {
             wallets: HashMap::new(),
+            recovery_in_flight: Arc::default(),
             seed,
             accepted_mints,
             db_dir,
@@ -189,7 +198,10 @@ impl TollWallet {
                 Ok(sat)
             }
             Ok(Err(e)) => Err(WalletError::Cdk(e)),
-            Err(_) => Err(WalletError::Timeout(OP_TIMEOUT)),
+            Err(_) => {
+                self.spawn_saga_recovery(&normalized);
+                Err(WalletError::Timeout(OP_TIMEOUT))
+            }
         }
     }
 
@@ -327,7 +339,10 @@ impl TollWallet {
         match result {
             Ok(Ok(token_str)) => Ok(token_str),
             Ok(Err(e)) => Err(WalletError::Cdk(e)),
-            Err(_) => Err(WalletError::Timeout(OP_TIMEOUT)),
+            Err(_) => {
+                self.spawn_saga_recovery(&normalized);
+                Err(WalletError::Timeout(OP_TIMEOUT))
+            }
         }
     }
 
@@ -442,7 +457,10 @@ impl TollWallet {
         match result {
             Ok(Ok(total)) => Ok(total),
             Ok(Err(e)) => Err(WalletError::Cdk(e)),
-            Err(_) => Err(WalletError::Timeout(OP_TIMEOUT)),
+            Err(_) => {
+                self.spawn_saga_recovery(&normalized);
+                Err(WalletError::Timeout(OP_TIMEOUT))
+            }
         }
     }
 
@@ -478,7 +496,10 @@ impl TollWallet {
                 fee: quote.fee_reserve.into(),
             }),
             Ok(Err(e)) => Err(WalletError::Cdk(e)),
-            Err(_) => Err(WalletError::Timeout(OP_TIMEOUT)),
+            Err(_) => {
+                self.spawn_saga_recovery(&normalized);
+                Err(WalletError::Timeout(OP_TIMEOUT))
+            }
         }
     }
 
@@ -585,7 +606,16 @@ impl TollWallet {
         use tokio::io::AsyncWriteExt;
 
         let tmp = path.with_extension("tmp");
-        let mut f = tokio::fs::OpenOptions::new()
+        #[cfg(unix)]
+        let mut open = {
+            // tokio::fs::OpenOptions exposes mode() directly on unix.
+            let mut o = tokio::fs::OpenOptions::new();
+            o.mode(0o600);
+            o
+        };
+        #[cfg(not(unix))]
+        let mut open = tokio::fs::OpenOptions::new();
+        let mut f = open
             .write(true)
             .create(true)
             .truncate(true)
@@ -614,6 +644,72 @@ impl TollWallet {
 
     fn mnemonic_path_for(seed_path: &Path) -> PathBuf {
         seed_path.with_file_name("wallet_mnemonic.txt")
+    }
+
+    /// AGENTS.md ("if you add a timeout, add the reconciliation that
+    /// follows it"): every TollWallet op wraps CDK in `timeout(OP_TIMEOUT)`,
+    /// which cancels the saga mid-flight — the saga survives in SQLite and,
+    /// without this, nothing retries it until the next boot's `ensure_mint`.
+    /// This fires a detached `recover_incomplete_sagas` for the mint so the
+    /// cancelled saga settles in-session (receive: NUT-19 replay / NUT-09
+    /// restore / compensate; melt: quote-state check that detects an
+    /// already-paid Lightning payment). Never blocks the caller; recovery
+    /// failures are logged and left for the next trigger or boot.
+    fn spawn_saga_recovery(&self, normalized_mint: &str) {
+        let Some(wallet) = self.wallets.get(normalized_mint) else {
+            return;
+        };
+        // Coalesce per mint (Codex P2 on #39): while a recovery holds the
+        // wallet mutex, queued same-mint ops time out before starting
+        // their own sagas and would otherwise each spawn another recovery
+        // run. One in-flight recovery per mint is sufficient — the saga
+        // survives, and the next timeout or boot re-triggers.
+        {
+            let mut in_flight = self.recovery_in_flight.lock().unwrap();
+            if in_flight.contains(normalized_mint) {
+                tracing::debug!(mint = %normalized_mint, "saga recovery already in flight for mint");
+                return;
+            }
+            in_flight.insert(normalized_mint.to_string());
+        }
+        let wallet = wallet.clone();
+        let mint = normalized_mint.to_string();
+        let in_flight = self.recovery_in_flight.clone();
+        tokio::spawn(async move {
+            struct Guard(
+                std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+                String,
+            );
+            impl Drop for Guard {
+                fn drop(&mut self) {
+                    self.0.lock().unwrap().remove(&self.1);
+                }
+            }
+            let _guard = Guard(in_flight, mint.clone());
+
+            match timeout(RECOVERY_TIMEOUT, async {
+                wallet.lock().await.recover_incomplete_sagas().await
+            })
+            .await
+            {
+                Ok(Ok(report)) if report.recovered > 0 || report.compensated > 0 => {
+                    tracing::info!(
+                        mint = %mint,
+                        recovered = report.recovered,
+                        compensated = report.compensated,
+                        failed = report.failed,
+                        "post-timeout saga recovery settled operations"
+                    );
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!(mint = %mint, error = %e, "post-timeout saga recovery errored; retrying on next trigger or boot");
+                }
+                Err(_) => {
+                    tracing::warn!(mint = %mint, "post-timeout saga recovery timed out; retrying on next trigger or boot");
+                }
+            }
+        });
     }
 
     /// NUT-13 restore for every registered mint (CDK `Wallet::restore`:

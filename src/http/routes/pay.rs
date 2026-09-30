@@ -12,6 +12,7 @@
 // TIP #1: `allotment`: Amount of `<metric>` allotted to customer after payment.
 // TIP #1: `metric`: The purchased metric
 
+use crate::config;
 use crate::http::AppState;
 use crate::mac_resolver::{get_client_ip, get_mac_address};
 use crate::nostr_event;
@@ -57,6 +58,66 @@ pub(crate) enum PrecheckError {
         min_steps: u64,
         price_per_step: u64,
     },
+}
+
+/// Durable record of a timed-out (outcome-unknown) payment attempt
+/// (Codex P1 on #39): the customer is told the token is being reconciled,
+/// so TollGate must leave its own record of the ambiguity — CDK settling
+/// the wallet saga does not recover the *session* the customer is owed
+/// (AGENTS.md: wallet-level atomicity is not application-level atomicity;
+/// business-level recovery is this repo's job). Stores the token HASH only
+/// — the token is bearer ecash. Best-effort: a failed record logs CRITICAL
+/// but still answers 504 (the outcome is unknown either way).
+fn record_payment_timeout(token: &str) {
+    use std::io::Write;
+    let dir = config::config_dir();
+    let path = dir.join("payment-timeouts.jsonl");
+    let hash = {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(token.as_bytes());
+        hex::encode(h.finalize())
+    };
+    let entry = serde_json::json!({
+        "ts": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+        "token_sha256": hash,
+        "outcome": "unknown-504",
+    });
+    let result = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut f| {
+            writeln!(f, "{entry}")?;
+            f.sync_all()
+        });
+    if let Err(e) = result {
+        tracing::error!(error = %e, path = %path.display(), "CRITICAL: could not persist payment-timeout record");
+    }
+}
+
+/// HTTP semantics for a failed receive (issue #33): a timeout is an
+/// UNKNOWN outcome, not a rejection — the mint may have accepted the swap
+/// (AGENTS.md: ambiguous results are reconciled, not retried). Answering
+/// 400 "rejected" would invite the customer to treat a possibly-consumed
+/// token as failed; 504 + `payment-outcome-unknown` says "do not resubmit,
+/// it is being reconciled".
+fn receive_failure_shape(e: &crate::wallet::WalletError) -> (StatusCode, &'static str, String) {
+    match e {
+        crate::wallet::WalletError::Timeout(_) => (
+            StatusCode::GATEWAY_TIMEOUT,
+            "payment-outcome-unknown",
+            "payment outcome unknown after timeout; do not resubmit this token — it is being reconciled automatically".to_string(),
+        ),
+        e => (
+            StatusCode::BAD_REQUEST,
+            "wallet-receive-failed",
+            format!("payment rejected: wallet receive failed: {e}"),
+        ),
+    }
 }
 
 /// Validate and price a payment from pre-receive facts only.
@@ -265,19 +326,23 @@ pub async fn handle_pay(
             }
             Err(e) => {
                 tracing::warn!(error = %e, "wallet receive failed");
+                if matches!(e, crate::wallet::WalletError::Timeout(_)) {
+                    record_payment_timeout(&token);
+                }
                 drop(wallet_guard);
+                let (status, code, message) = receive_failure_shape(&e);
                 let event = nostr_event::create_event(
                     21023,
                     vec![
                         vec!["level".to_string(), "error".to_string()],
-                        vec!["code".to_string(), "wallet-receive-failed".to_string()],
+                        vec!["code".to_string(), code.to_string()],
                     ],
-                    &format!("payment rejected: wallet receive failed: {e}"),
+                    &message,
                     &state.identity.secret_key,
                 );
                 let json = serde_json::to_string(&event).unwrap_or_default();
                 return (
-                    StatusCode::BAD_REQUEST,
+                    status,
                     [
                         ("content-type", "application/json"),
                         ("access-control-allow-origin", "*"),
@@ -455,6 +520,38 @@ mod tests {
         assert_eq!(session.allotment, 5000);
         assert_eq!(session.metric, "bytes");
         assert!(mgr.is_active("test:mac"));
+    }
+
+    #[test]
+    fn receive_timeout_maps_to_outcome_unknown_not_rejected() {
+        let (status, code, _) = receive_failure_shape(&crate::wallet::WalletError::Timeout(
+            std::time::Duration::from_secs(30),
+        ));
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(code, "payment-outcome-unknown");
+    }
+
+    #[test]
+    fn payment_timeout_record_hashes_token_and_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("TOLLGATE_TEST_CONFIG_DIR", dir.path());
+        let token = "cashuAsecretbearervalue";
+        record_payment_timeout(token);
+        let body = std::fs::read_to_string(dir.path().join("payment-timeouts.jsonl")).unwrap();
+        assert!(
+            !body.contains(token),
+            "bearer token must never be persisted"
+        );
+        assert!(body.contains("token_sha256"));
+        assert!(body.contains("unknown-504"));
+    }
+
+    #[test]
+    fn definitive_receive_failure_maps_to_rejected() {
+        let (status, code, _) =
+            receive_failure_shape(&crate::wallet::WalletError::TokenParse("bad".into()));
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(code, "wallet-receive-failed");
     }
 
     /// Test that rejected tokens return 400 (simulated).
