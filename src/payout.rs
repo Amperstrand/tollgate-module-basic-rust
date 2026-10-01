@@ -482,8 +482,11 @@ pub(crate) async fn journalled_melt(
 ) -> MeltResult {
     // Journal resume decision (#41): settled melts are never repeated,
     // ambiguities are surfaced — and never block the rest of the plan.
-    let id = crate::payout_journal::entry_id(mint_url, identity, &invoice);
-    let last = crate::payout_journal::last_for(cfg_dir, mint_url, identity, &invoice);
+    // Canonicalize the mint (Codex P2 on #45): a config respelling must
+    // not fork the journal identity CDK itself resolves to one wallet.
+    let mint = crate::wallet::canonical_mint_url(mint_url);
+    let id = crate::payout_journal::entry_id(&mint, identity, &invoice);
+    let last = crate::payout_journal::last_for(cfg_dir, &mint, identity, &invoice);
     let unresolved_melt = match wallet {
         Some(w) => w.mint_has_unresolved_melt(mint_url).await.unwrap_or(true),
         None => false,
@@ -496,7 +499,7 @@ pub(crate) async fn journalled_melt(
             &crate::payout_journal::PayoutEntry {
                 id: id.clone(),
                 ts: now_secs(),
-                mint: mint_url.to_string(),
+                mint: mint.clone(),
                 identity: identity.to_string(),
                 invoice: invoice.clone(),
                 amount_sat: amount_sats,
@@ -525,7 +528,7 @@ pub(crate) async fn journalled_melt(
     let intent = crate::payout_journal::PayoutEntry {
         id,
         ts: now_secs(),
-        mint: mint_url.to_string(),
+        mint: mint.clone(),
         identity: identity.to_string(),
         invoice: invoice.clone(),
         amount_sat: amount_sats,
@@ -560,7 +563,14 @@ pub(crate) async fn journalled_melt(
     match wallet.melt(mint_url, &invoice).await {
         Ok(_) => {
             tracing::info!(mint_url, identity, amount_sats, "melt successful");
-            let _ = journal_terminal(cfg_dir, &intent, crate::payout_journal::PayoutPhase::Paid);
+            if let Err(e) =
+                journal_terminal(cfg_dir, &intent, crate::payout_journal::PayoutPhase::Paid)
+            {
+                // The payment happened; the terminal record did not. The
+                // durable Intent is the recovery record — surface loudly so
+                // the operator knows the journal is behind the wallet.
+                tracing::error!(error = %e, "CRITICAL: melt PAID but the payout journal append failed — intent entry is the recovery record; treat this invoice as ambiguous if it is ever re-considered");
+            }
             MeltResult::Paid { invoice }
         }
         Err(crate::wallet::WalletError::Timeout(d)) => {
@@ -796,9 +806,8 @@ mod tests {
         .unwrap();
 
         // No wallet in the test → no unresolved saga → the ambiguity
-        // CLOSES as resolved and the melt is skipped as done (never
-        // re-melted). The unresolved-saga SkipSurface arm is covered by
-        // the decide() table tests in tests/payout_regression.rs.
+        // closes as resolved, and a LITERAL invoice stays surfaced (paid
+        // vs compensated is indistinguishable; the operator decides).
         let result = journalled_melt(
             None,
             dir.path(),
@@ -811,10 +820,10 @@ mod tests {
         .await;
         assert_eq!(
             result,
-            MeltResult::AlreadyDone {
+            MeltResult::AmbiguousSkipped {
                 invoice: invoice.to_string()
             },
-            "ambiguous invoice must never be re-melted"
+            "ambiguous literal invoice must never be re-melted nor reported done"
         );
         assert_eq!(
             crate::payout_journal::last_for(dir.path(), mint, "owner", invoice),
