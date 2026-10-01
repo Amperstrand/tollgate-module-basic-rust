@@ -308,9 +308,10 @@ impl TollWallet {
     /// works even when the mint is unreachable (AGENTS.md: ambiguous results
     /// are reconciled, not retried).
     pub async fn mint_has_unresolved_receive(&self, token_str: &str) -> Result<bool, WalletError> {
-        use cdk::wallet::types::WalletSagaState;
+        use cdk::nuts::{KeySetInfo, Token};
+        use cdk::wallet::types::KeysetLoadPolicy;
 
-        let token: cashu::nuts::Token = token_str
+        let token: Token = token_str
             .parse()
             .map_err(|e| WalletError::TokenParse(format!("{e}")))?;
         let mint_url = token
@@ -321,20 +322,61 @@ impl TollWallet {
 
         let wallet = match self.wallets.get(normalized.as_str()) {
             Some(w) => w.clone(),
-            // No wallet for this mint => no saga can exist for it; the
-            // receive path will surface the underlying classification.
+            // No wallet for this mint => nothing of this token can be
+            // in flight locally; the receive path surfaces the rest.
             None => return Ok(false),
         };
 
-        let w = wallet.lock().await;
-        let sagas = w
-            .localstore
-            .get_incomplete_sagas()
-            .await
-            .map_err(|e| WalletError::Database(e.to_string()))?;
-        Ok(sagas
-            .into_iter()
-            .any(|s| matches!(s.state, WalletSagaState::Receive(_))))
+        // Per-token linkage (issue #31): instead of "any receive saga for
+        // this mint" (which deferred every sibling token), ask whether THIS
+        // token's input Ys are reserved by an incomplete RECEIVE saga —
+        // i.e. an earlier attempt of this very token is still in flight.
+        // Scoped to receive sagas (Codex P2 on #44): sends also reserve
+        // proofs, and a token minted by this wallet and sent to a customer
+        // would otherwise false-positive when the customer pays it back.
+        let result = timeout(OP_TIMEOUT, async {
+            let w = wallet.lock().await;
+            let keysets = w.keysets(KeysetLoadPolicy::default()).await?;
+            let keyset_infos: Vec<KeySetInfo> = keysets
+                .iter()
+                .map(|ks| KeySetInfo {
+                    id: ks.id,
+                    unit: ks.unit.clone(),
+                    active: ks.active.unwrap_or(true),
+                    input_fee_ppk: ks.input_fee_ppk,
+                    final_expiry: ks.final_expiry,
+                })
+                .collect();
+            let proofs = token.proofs(keyset_infos.as_slice())?;
+            let token_ys: std::collections::HashSet<_> = proofs
+                .iter()
+                .map(|p| p.y())
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .collect();
+
+            let mut in_flight_ys: std::collections::HashSet<cdk::nuts::PublicKey> =
+                std::collections::HashSet::new();
+            for saga in w
+                .localstore
+                .get_incomplete_sagas()
+                .await?
+                .into_iter()
+                .filter(|s| matches!(s.state, cdk::wallet::types::WalletSagaState::Receive(_)))
+            {
+                for info in w.localstore.get_reserved_proofs(&saga.id).await? {
+                    in_flight_ys.insert(info.y);
+                }
+            }
+            Ok::<_, cdk::Error>(in_flight_ys.intersection(&token_ys).next().is_some())
+        })
+        .await;
+
+        match result {
+            Ok(Ok(v)) => Ok(v),
+            Ok(Err(e)) => Err(WalletError::Cdk(e)),
+            Err(_) => Err(WalletError::Timeout(OP_TIMEOUT)),
+        }
     }
 
     /// Send tokens (maps gonuts `Send`).

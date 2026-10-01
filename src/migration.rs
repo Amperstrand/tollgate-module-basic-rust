@@ -110,10 +110,12 @@ pub trait TokenSink: Send + Sync {
     /// (mint unreachable), NOT "unspent".
     async fn token_spent(&self, token: &str) -> Result<Option<u64>, crate::wallet::WalletError>;
 
-    /// Whether the token's mint wallet still holds an incomplete CDK
-    /// receive saga — a purely local query (works with the mint down).
-    /// While true, an earlier receive's outcome is undecided and the token
-    /// must be neither re-submitted nor terminalized this boot.
+    /// Whether THIS token's input proofs are currently Reserved/Pending in
+    /// the local wallet — i.e. an earlier attempt of this very token is
+    /// still in flight (per-token Y linkage, issue #31). A purely local
+    /// query (works with the mint down). While true, the token's outcome
+    /// is undecided and it must be neither re-submitted nor terminalized
+    /// this boot.
     async fn mint_has_unresolved_receive(
         &self,
         token: &str,
