@@ -132,6 +132,12 @@ pub enum TokenSpendState {
     /// remainder is real value — recoverable by splitting the token and
     /// re-importing only the unspent proofs (issue #35).
     PartiallySpent { spent_sat: u64, unspent_sat: u64 },
+    /// At least one proof is PENDING (or RESERVED) at the mint: the mint is
+    /// mid-operation and its answer is not final, so neither a terminal
+    /// outcome nor a receive decision can be made — the token is deferred
+    /// to a later run (Codex P1 on #42; same tri-state contract as
+    /// `TollWallet::token_check_state`).
+    Indeterminate,
     /// No proof SPENT: the token is (still) receivable.
     Unspent,
 }
@@ -266,7 +272,14 @@ impl FirstBootMigration {
         let mut partially_spent_unspent_sat = 0u64;
 
         let already = fold_last_outcomes(&read_journal(&self.journal));
-        let tokens = read_tokens(&self.tokens_file)?;
+        // A duplicated line is the same token: attempt it once, and keep the
+        // batched classification map one-entry-per-token (the loop consumes
+        // entries by removal).
+        let mut seen = std::collections::HashSet::new();
+        let tokens: Vec<String> = read_tokens(&self.tokens_file)?
+            .into_iter()
+            .filter(|t| seen.insert(t.clone()))
+            .collect();
         let mut journal_file = open_append(&self.journal)?;
 
         // Batched NUT-07 pre-pass (issue #34): one checkstate call per mint
@@ -403,6 +416,16 @@ impl FirstBootMigration {
                         },
                     )?;
                     journal_file.sync_all()?;
+                    continue;
+                }
+                Ok(TokenSpendState::Indeterminate) => {
+                    // A PENDING/RESERVED proof can settle either way; a
+                    // terminal entry now could journal a speculative
+                    // remainder and finalize over still-moving value.
+                    tracing::warn!(
+                        "migration: token has proofs pending at the mint (in-flight operation); deferring to a later run"
+                    );
+                    pending += 1;
                     continue;
                 }
                 Ok(TokenSpendState::Unspent) => {}

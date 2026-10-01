@@ -17,6 +17,8 @@ struct FakeSink {
     spent: HashMap<String, Option<u64>>,
     /// token -> (spent, unspent) for partially-spent tokens.
     partial: HashMap<String, (u64, u64)>,
+    /// Tokens whose proofs are PENDING/RESERVED at the mint.
+    indeterminate: std::collections::HashSet<String>,
     /// token -> receive result.
     receive: HashMap<String, Rx>,
     /// When set, every NUT-07 pre-check errors (mint unreachable).
@@ -72,6 +74,8 @@ impl TokenSink for FakeSink {
                         t.clone(),
                         Err(WalletError::Timeout(std::time::Duration::from_secs(30))),
                     )
+                } else if self.indeterminate.contains(t) {
+                    (t.clone(), Ok(TokenSpendState::Indeterminate))
                 } else if let Some((spent_sat, unspent_sat)) = self.partial.get(t).copied() {
                     (
                         t.clone(),
@@ -255,6 +259,98 @@ async fn partially_spent_token_is_terminal_not_retriable_failed() {
         .unwrap()
         .iter()
         .any(|c| c.starts_with("receive:")));
+}
+
+/// Codex P2 on #42: a tokens file containing the same line twice (manual
+/// copy-paste) must attempt the token ONCE — the batched classification is
+/// consumed by removal, so an undeduped second occurrence previously hit an
+/// unreachable lookup and panicked the daemon at startup on every retry.
+#[tokio::test]
+async fn duplicate_token_lines_attempt_once_without_panicking() {
+    let dir = tempfile::tempdir().unwrap();
+    let m = setup(dir.path(), &["cashuA1", "cashuA1"]);
+
+    let sink = FakeSink {
+        receive: [("cashuA1".to_string(), Rx::Ok(5))].into_iter().collect(),
+        ..Default::default()
+    };
+    let summary = m.import_tokens(&sink).await.unwrap();
+    assert_eq!(summary.imported, 5);
+    assert_eq!(summary.skipped_already_imported, 0);
+
+    let calls = sink.calls.lock().unwrap().clone();
+    assert_eq!(
+        calls.iter().filter(|c| c.starts_with("receive:")).count(),
+        1,
+        "the duplicated line is the same token: one receive: {calls:?}"
+    );
+    let batches = sink.batch_calls.lock().unwrap().clone();
+    assert_eq!(batches, vec![1], "one candidate after dedup: {batches:?}");
+}
+
+/// Codex P1 on #42: a token with a SPENT proof and a PENDING proof must NOT
+/// terminalize as PartiallySpent — the pending proof can settle either way,
+/// so a journaled "unspent remainder" would be speculative. The token is
+/// deferred (no journal entry, no receive, blocks finalization) and
+/// converges once the mint's answer is definitive.
+#[tokio::test]
+async fn pending_at_mint_tokens_defer_not_terminalize() {
+    let dir = tempfile::tempdir().unwrap();
+    let m = setup(dir.path(), &["cashuA1"]);
+    write_journal(
+        dir.path(),
+        &[JournalEntry {
+            token: "cashuA1".to_string(),
+            outcome: TokenOutcome::Failed {
+                reason: "mint rejected swap: inputs already spent".into(),
+            },
+        }],
+    );
+
+    let sink = FakeSink {
+        indeterminate: ["cashuA1".to_string()].into(),
+        receive: [("cashuA1".to_string(), Rx::Ok(999))].into_iter().collect(),
+        ..Default::default()
+    };
+    let summary = m.import_tokens(&sink).await.unwrap();
+    assert_eq!(summary.pending, 1);
+    assert_eq!(summary.partially_spent, 0);
+    assert_eq!(summary.failed, 0);
+
+    let calls = sink.calls.lock().unwrap().clone();
+    assert!(
+        !calls.iter().any(|c| c.starts_with("receive:")),
+        "an indeterminate token must not be received: {calls:?}"
+    );
+    assert_eq!(
+        fold_last(&read_journal(dir.path())).get("cashuA1"),
+        Some(&TokenOutcome::Failed {
+            reason: "mint rejected swap: inputs already spent".into()
+        }),
+        "no journal entry is written while the mint's answer is not final"
+    );
+    assert_eq!(
+        m.finish(summary).unwrap(),
+        tollgate_module_basic_rust::migration::MigrationFinish::Partial
+    );
+
+    // The mint's operation completed: one proof stayed spent, one unspent —
+    // now the answer is definitive and the token terminalizes.
+    let sink2 = FakeSink {
+        partial: [("cashuA1".to_string(), (4u64, 6u64))]
+            .into_iter()
+            .collect(),
+        ..Default::default()
+    };
+    let summary2 = m.import_tokens(&sink2).await.unwrap();
+    assert_eq!(summary2.partially_spent, 1);
+    assert_eq!(
+        fold_last(&read_journal(dir.path())).get("cashuA1"),
+        Some(&TokenOutcome::PartiallySpent {
+            spent_sat: 4,
+            unspent_sat: 6
+        })
+    );
 }
 
 /// Codex P1 finding 1 (migration.rs:132): a durable Pending intent must

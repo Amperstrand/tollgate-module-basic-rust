@@ -196,7 +196,8 @@ to a terminal outcome:
 | `Failed` | Receive failed definitively (reason retained) | retried |
 | `Pending` | Attempted but unsettled — process died mid-receive, or the receive timed out (ambiguous) | reconciled via NUT-07 checkstate: spent → terminal `Spent`, unspent → retried |
 | `Spent` | All proofs spent at the mint — the value already sits in this wallet (earlier receive completed) or is unrecoverable | terminal, does not block completion |
-| `PartiallySpent` | A strict subset of the token's proofs is spent at the mint — the atomic swap can never succeed, but the unspent remainder is real value | terminal, does not block completion; recover the remainder manually (below) |
+| `PartiallySpent` | A strict subset of the token's proofs is spent at the mint and none are pending — the atomic swap can never succeed, but the unspent remainder is real value | terminal, does not block completion; recover the remainder manually (below) |
+| *(no entry)* | The token has a proof PENDING/RESERVED at the mint (the mint is mid-operation on it) — its answer is not final | deferred: no journal entry, retried on a later boot, blocks finalization until definitive |
 
 `wallet.db` is renamed to `wallet.db.pre-migration` only when no token
 failed and none is unsettled; otherwise it stays in place and the
