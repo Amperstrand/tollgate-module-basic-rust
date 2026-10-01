@@ -4,9 +4,9 @@
 //! Read-only: verifies proofs are unspent at the mint. No spending/receiving.
 
 use crate::error::VerifyError;
-use cashu::nuts::Token;
+use cdk::nuts::Token;
+use cdk::secret::Secret;
 use std::collections::HashSet;
-use std::convert::TryFrom;
 
 /// TLS 1.2 hard-pinned HTTP client (matches Go behavior — Go audit §2.4).
 fn build_http_client() -> reqwest::Client {
@@ -74,15 +74,25 @@ impl TokenVerifier {
         Ok((amount_sat * 1_000, mint_base))
     }
 
-    /// NUT-07: check all Y-values are UNSPENT.
-    /// Retries on HTTP 429 with exponential backoff (2s, 4s, 8s).
+    /// NUT-07: check all Y-values are UNSPENT, using CDK's own wire types
+    /// (CheckStateRequest/Response) for the endpoint contract. Retries on
+    /// HTTP 429 with exponential backoff (2s, 4s, 8s).
     async fn check_proofs_unspent(
         &self,
         mint_base: &str,
         ys: &[String],
     ) -> Result<(), VerifyError> {
+        use cdk::nuts::nut07::{CheckStateRequest, CheckStateResponse, State};
+        use cdk::nuts::PublicKey;
+        use std::str::FromStr;
+
         let url = format!("{mint_base}/v1/checkstate");
-        let body = serde_json::json!({ "Ys": ys });
+        let ys: Vec<PublicKey> = ys
+            .iter()
+            .map(|y| PublicKey::from_str(y))
+            .collect::<Result<_, _>>()
+            .map_err(|e| VerifyError::InvalidToken(e.to_string()))?;
+        let body = CheckStateRequest { ys };
 
         let mut last_err: Option<VerifyError> = None;
         for attempt in 0..3u32 {
@@ -106,22 +116,20 @@ impl TokenVerifier {
                     continue;
                 }
                 Ok(r) => {
-                    let resp: serde_json::Value = r
+                    let resp: CheckStateResponse = r
                         .error_for_status()
                         .map_err(|e| VerifyError::CheckStateStatus(e.to_string()))?
                         .json()
                         .await
                         .map_err(|e| VerifyError::CheckStateParse(e.to_string()))?;
 
-                    let states = resp["states"]
-                        .as_array()
-                        .ok_or(VerifyError::MissingStates)?;
-
-                    for state in states {
-                        let s = state["state"].as_str().unwrap_or("");
-                        if s.to_uppercase() != "UNSPENT" {
-                            return Err(VerifyError::Spent(s.to_string()));
-                        }
+                    if resp.states.is_empty() {
+                        return Err(VerifyError::MissingStates);
+                    }
+                    // Any non-UNSPENT answer (SPENT, PENDING, ...) rejects
+                    // the token: it is not freely receivable at face value.
+                    if let Some(state) = resp.states.iter().find(|s| s.state != State::Unspent) {
+                        return Err(VerifyError::Spent(state.state.to_string()));
                     }
                     return Ok(());
                 }
@@ -139,25 +147,20 @@ impl TokenVerifier {
 
 /// Check if a proof secret is a NUT-10 spending condition (P2PK or HTLC).
 /// Plain secrets fail NUT-10 deserialization and return false.
-fn is_locked_secret(secret: &cashu::secret::Secret) -> bool {
-    cashu::nuts::nut10::Secret::try_from(secret).is_ok()
+///
+/// Deliberately the *structural* check (`nut10::Secret` parse), not the
+/// strict `SpendingConditions` conversion: a NUT-10-shaped secret whose
+/// data does not form a valid pubkey/hash is still not a secret we can
+/// freely spend upstream, so over-detecting "locked" is the conservative
+/// answer for a gateway that must never accept tokens it cannot re-spend.
+fn is_locked_secret(secret: &Secret) -> bool {
+    cdk::nuts::nut10::Secret::try_from(secret).is_ok()
 }
 
 /// Check if any proof in the token has a spending condition that prevents
 /// the gateway from spending it upstream. Rejects P2PK and HTLC locked tokens.
 fn has_locked_proofs(token: &Token) -> bool {
-    match token {
-        Token::TokenV3(t) => t
-            .token
-            .iter()
-            .flat_map(|e| e.proofs.iter())
-            .any(|p| is_locked_secret(&p.secret)),
-        Token::TokenV4(t) => t
-            .token
-            .iter()
-            .flat_map(|e| e.proofs.iter())
-            .any(|p| is_locked_secret(&p.secret)),
-    }
+    token.token_secrets().iter().any(|s| is_locked_secret(s))
 }
 
 /// Extract Y-values (compressed blinded pubkey hex) from token proofs.
@@ -318,22 +321,64 @@ mod tests {
     #[test]
     fn detects_p2pk_secret_as_locked() {
         let p2pk = r#"["P2PK",{"nonce":"5d11913e","data":"026562efcfadc8e86d44da6a8adf80633d974302e62c850774db1fb36ff4cc7198"}]"#;
-        assert!(is_locked_secret(&cashu::secret::Secret::new(p2pk)));
+        assert!(is_locked_secret(&Secret::new(p2pk)));
     }
 
     #[test]
     fn detects_htlc_secret_as_locked() {
         let htlc = r#"["HTLC",{"nonce":"abc","data":"","tags":[["payment_hash","xyz"]]}]"#;
-        assert!(is_locked_secret(&cashu::secret::Secret::new(htlc)));
+        assert!(is_locked_secret(&Secret::new(htlc)));
     }
 
     #[test]
     fn allows_plain_secret() {
-        assert!(!is_locked_secret(&cashu::secret::Secret::new(
-            "deadbeef00aabb"
-        )));
-        assert!(!is_locked_secret(&cashu::secret::Secret::new(
-            "plain-secret-string"
-        )));
+        assert!(!is_locked_secret(&Secret::new("deadbeef00aabb")));
+        assert!(!is_locked_secret(&Secret::new("plain-secret-string")));
+    }
+
+    /// cashuA (V3) tokens round-trip through CDK's parser: serialize,
+    /// re-parse, and re-serialize produce the same wire form, and value /
+    /// mint survive. Pins the cdk-types port (legacy `cashu` crate removed)
+    /// against the V3 format the Go exporter historically emitted.
+    #[test]
+    fn cashua_v3_token_round_trips_through_cdk_parser() {
+        use cdk::amount::Amount;
+        use cdk::nuts::{CurrencyUnit, Id, Proof, TokenV3};
+        use cdk::secret::Secret as PlainSecret;
+        use std::str::FromStr;
+
+        let proof = Proof {
+            amount: Amount::from(2),
+            keyset_id: Id::from_bytes(&{
+                // Version-0 keyset id: one version tag byte + 7 id bytes.
+                let mut id = [0u8; 8];
+                id[1..].fill(7);
+                id
+            })
+            .expect("version-0 keyset id"),
+            secret: PlainSecret::new("deadbeef00aabb"),
+            c: cdk::nuts::PublicKey::from_str(
+                "026562efcfadc8e86d44da6a8adf80633d974302e62c850774db1fb36ff4cc7198",
+            )
+            .expect("valid compressed pubkey"),
+            witness: None,
+            dleq: None,
+            p2pk_e: None,
+        };
+        let mint = cdk::mint_url::MintUrl::from_str("https://v3-mint.example").unwrap();
+        let v3 = TokenV3::new(mint, vec![proof], None, Some(CurrencyUnit::Sat)).unwrap();
+        let once = v3.to_string();
+        assert!(once.starts_with("cashuA"), "V3 prefix: {once}");
+
+        let parsed: Token = once.parse().expect("cashuA token parses via cdk");
+        assert_eq!(
+            u64::from(parsed.value().expect("value survives round-trip")),
+            2
+        );
+        assert_eq!(
+            parsed.mint_url().expect("mint survives").to_string(),
+            "https://v3-mint.example"
+        );
+        assert_eq!(parsed.to_string(), once, "re-serialization is stable");
     }
 }

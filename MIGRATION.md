@@ -196,10 +196,32 @@ to a terminal outcome:
 | `Failed` | Receive failed definitively (reason retained) | retried |
 | `Pending` | Attempted but unsettled — process died mid-receive, or the receive timed out (ambiguous) | reconciled via NUT-07 checkstate: spent → terminal `Spent`, unspent → retried |
 | `Spent` | All proofs spent at the mint — the value already sits in this wallet (earlier receive completed) or is unrecoverable | terminal, does not block completion |
+| `PartiallySpent` | A strict subset of the token's proofs is spent at the mint and none are pending — the atomic swap can never succeed, but the unspent remainder is real value | terminal, does not block completion; recover the remainder manually (below) |
+| *(no entry)* | The token has a proof PENDING/RESERVED at the mint (the mint is mid-operation on it) — its answer is not final | deferred: no journal entry, retried on a later boot, blocks finalization until definitive |
 
 `wallet.db` is renamed to `wallet.db.pre-migration` only when no token
 failed and none is unsettled; otherwise it stays in place and the
 `.migration_complete` marker records `state=partial`.
+
+##### Partially spent tokens
+
+A `PartiallySpent` journal entry carries the split as
+`{"spent_sat":N,"unspent_sat":M}` — the migration cannot import such a
+token (the mint rejects mixed spent/unspent inputs in one swap), so it
+terminates instead of retrying a doomed receive every boot. The
+`M` unspent sats are recoverable by hand:
+
+1. The full token string is retained in `migration-journal.jsonl` (and
+   `tokens.jsonl`).
+2. Split the token with any Cashu wallet that can select proofs by Y
+   (e.g. `cdk-cli`): keep only the proofs the mint reports UNSPENT in a
+   new token.
+3. Import that remainder token via the CLI (`migrate` with a one-line
+   tokens file, or directly into another wallet).
+
+The CLI `status` command surfaces `partially_spent` and
+`partially_spent_unspent_sat` so the operator can audit outstanding
+remainders at any time.
 
 ---
 
@@ -207,6 +229,23 @@ failed and none is unsettled; otherwise it stays in place and the
 
 If the automated export succeeded but tokens haven't been imported yet,
 or if you're migrating from a pre-exported `tokens.jsonl`:
+
+### Step 0: Build the exporter (if the binary is not installed)
+
+`gonuts-export` is built from source in this repo — the binary itself is
+not shipped in git (issue #36: a committed host-arch binary goes stale
+the moment anyone runs `go build`). For the router, cross-compile
+statically and copy it over:
+
+```bash
+cd tools/gonuts-export
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o gonuts-export .
+# then: scp gonuts-export root@router:/usr/bin/gonuts-export
+```
+
+(Adjust `GOARCH` to the router's architecture — `amd64`, `arm`, `arm64`,
+`mips`, `mipsle` with `GOARM`/GOMIPS as needed. `go test ./...` runs the
+exporter's unit tests host-side.)
 
 ### Step 1: Ensure the binary is running
 

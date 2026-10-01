@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use cdk::amount::SplitTarget;
-use cdk::nuts::{CurrencyUnit, MintQuoteState, PaymentMethod};
+use cdk::nuts::{CurrencyUnit, MintQuoteState, PaymentMethod, Token as CdkToken};
 use cdk::wallet::{ReceiveOptions, SendOptions, Wallet};
 use cdk::Amount;
 use cdk_sqlite::wallet::WalletSqliteDatabase;
@@ -83,6 +83,74 @@ pub fn canonical_mint_url(url: &str) -> String {
     cdk::mint_url::MintUrl::from_str(trimmed)
         .map(|u| u.to_string())
         .unwrap_or_else(|_| trimmed.to_string())
+}
+
+/// Pure NUT-07 classification of one token from per-proof mint states.
+///
+/// Y = hash_to_curve(secret), so no keyset resolution is needed. A proof
+/// absent from the mint's response is treated as Indeterminate (deferred),
+/// never as silently unspent.
+fn classify_spend_state(
+    pairs: &[(cdk::Amount, cdk::secret::Secret)],
+    amount_sat: u64,
+    spent_ys: &std::collections::HashSet<cdk::nuts::PublicKey>,
+    pending_ys: &std::collections::HashSet<cdk::nuts::PublicKey>,
+    answered_ys: &std::collections::HashSet<cdk::nuts::PublicKey>,
+) -> Result<crate::migration::TokenSpendState, WalletError> {
+    use crate::migration::TokenSpendState;
+    use cdk::dhke::hash_to_curve;
+
+    if pairs.is_empty() {
+        return Err(WalletError::TokenParse("token has no proofs".into()));
+    }
+    let token_ys: Vec<Option<cdk::nuts::PublicKey>> = pairs
+        .iter()
+        .map(|(_, secret)| hash_to_curve(secret.as_bytes()).ok())
+        .collect();
+    let unanswerable = token_ys.iter().any(|y| match y {
+        Some(y) => !answered_ys.contains(y),
+        None => true,
+    });
+    let spent_sat: u64 = token_ys
+        .iter()
+        .zip(pairs.iter().map(|(amount, _)| u64::from(*amount)))
+        .filter(|(y, _)| matches!(y, Some(y) if spent_ys.contains(y)))
+        .map(|(_, amount)| amount)
+        .sum();
+    let has_pending = token_ys
+        .iter()
+        .any(|y| matches!(y, Some(y) if pending_ys.contains(y)));
+
+    if unanswerable || has_pending {
+        Ok(TokenSpendState::Indeterminate)
+    } else if spent_sat == amount_sat {
+        Ok(TokenSpendState::AllSpent { amount_sat })
+    } else if spent_sat == 0 {
+        Ok(TokenSpendState::Unspent)
+    } else {
+        Ok(TokenSpendState::PartiallySpent {
+            spent_sat,
+            unspent_sat: amount_sat - spent_sat,
+        })
+    }
+}
+
+/// Per-proof (face value, secret) pairs from a token, V3/V4 agnostic and
+/// keyset-free — the inputs for NUT-07 spend classification.
+fn token_proof_amounts_secrets(token: &CdkToken) -> Vec<(cdk::Amount, cdk::secret::Secret)> {
+    use cdk::nuts::Token;
+    match token {
+        Token::TokenV3(t) => t
+            .token
+            .iter()
+            .flat_map(|entry| entry.proofs.iter().map(|p| (p.amount, p.secret.clone())))
+            .collect(),
+        Token::TokenV4(t) => t
+            .token
+            .iter()
+            .flat_map(|entry| entry.proofs.iter().map(|p| (p.amount, p.secret.clone())))
+            .collect(),
+    }
 }
 
 /// TollWallet wraps multiple CDK Wallet instances (one per mint URL) behind
@@ -176,11 +244,66 @@ impl TollWallet {
         self.db_dir.join(format!("{sanitized}.sqlite"))
     }
 
+    /// Settle incomplete CDK sagas before a money-moving operation.
+    ///
+    /// CDK documents recovery as *required* before swap/send/receive/melt;
+    /// cashu-service runs it before every send. Called under the wallet
+    /// lock, inside the operation's timeout: with a settled wallet it is a
+    /// local SQLite query (no network, no per-poll cost — quote-status
+    /// polling never enters here); when a saga IS incomplete — e.g. one
+    /// left behind by a mid-session `timeout()` cancellation — the
+    /// operation must not move value over unreconciled state, so the
+    /// recovery error aborts the money move with a distinct, observable
+    /// cause (issue #33).
+    async fn recover_before_op(w: &Wallet, op: &str, withdrawal: bool) -> Result<(), WalletError> {
+        let report = w
+            .recover_incomplete_sagas()
+            .await
+            .map_err(|e| WalletError::SagaRecovery(format!("{op}: {e}")))?;
+        if !report.is_empty() {
+            tracing::info!(
+                op,
+                recovered = report.recovered,
+                compensated = report.compensated,
+                skipped = report.skipped,
+                failed = report.failed,
+                "settled incomplete sagas before money-moving op"
+            );
+        }
+        // Only fully-settled wallets may move value: a saga that recovery
+        // failed on or skipped (e.g. mint unreachable mid-recovery) is still
+        // an undecided operation — proceeding would spend over unreconciled
+        // state (Codex P1 on #42; AGENTS.md fund-safety hard rules). The
+        // next op or boot retries recovery; nothing is lost by waiting.
+        if report.failed > 0 || report.skipped > 0 {
+            return Err(WalletError::SagaRecovery(format!(
+                "{op}: recovery left {} failed and {} skipped saga(s) unresolved; refusing to move value over unreconciled wallet state",
+                report.failed, report.skipped
+            )));
+        }
+        // Withdrawal-shaped ops (send/melt) must not replay right after
+        // recovery COMPLETED an earlier ambiguous operation of the same
+        // shape: the earlier send may already have moved tokens (or the
+        // earlier melt already paid), so an immediate fresh op doubles the
+        // caller's intent. The caller reconciles the earlier outcome against
+        // its own durable intent (payout derives a fresh invoice per cycle;
+        // CLI callers reconcile manually) and re-issues on a later call,
+        // when recovery reports no further activity. Receive/mint are
+        // replay-safe: the mint one-shots their inputs/quotes.
+        if withdrawal && (report.recovered > 0 || report.compensated > 0) {
+            return Err(WalletError::SagaRecovery(format!(
+                "{op}: recovery completed an earlier ambiguous operation (recovered {}, compensated {}); refusing an immediate replay — reconcile that outcome before re-issuing",
+                report.recovered, report.compensated
+            )));
+        }
+        Ok(())
+    }
+
     /// Receive a Cashu token (maps gonuts `Receive`).
     ///
     /// CDK's receive is atomic — no counter race. Wrapped in 30s timeout.
     pub async fn receive(&self, token_str: &str) -> Result<u64, WalletError> {
-        let token: cashu::nuts::Token = token_str
+        let token: CdkToken = token_str
             .parse()
             .map_err(|e| WalletError::TokenParse(format!("{e}")))?;
         let mint_url = token
@@ -197,7 +320,10 @@ impl TollWallet {
 
         let result = timeout(OP_TIMEOUT, async {
             let w = wallet.lock().await;
-            w.receive(token_str, ReceiveOptions::default()).await
+            Self::recover_before_op(&w, "receive", false).await?;
+            w.receive(token_str, ReceiveOptions::default())
+                .await
+                .map_err(WalletError::from)
         })
         .await;
 
@@ -206,7 +332,7 @@ impl TollWallet {
                 let sat: u64 = amount.into();
                 Ok(sat)
             }
-            Ok(Err(e)) => Err(WalletError::Cdk(e)),
+            Ok(Err(e)) => Err(e),
             Err(_) => {
                 self.spawn_saga_recovery(&normalized);
                 Err(WalletError::Timeout(OP_TIMEOUT))
@@ -297,21 +423,155 @@ impl TollWallet {
         }
     }
 
-    /// Whether the per-mint CDK wallet still holds an incomplete *receive*
-    /// saga — an earlier receive for this mint that `recover_incomplete_sagas`
-    /// has not settled. CDK deletes a saga exactly when its outcome is
-    /// persisted: outputs recovered via NUT-19 replay or NUT-09 `/restore`,
-    /// compensated, or — with a logged warning — closed value-less. While a
-    /// receive saga is incomplete, the operation's outcome is undecided.
+    /// Batched NUT-07 spend classification for the migration pre-check
+    /// (issue #34): one checkstate call per mint carrying every candidate
+    /// token's Ys, instead of one call per token per boot.
+    ///
+    /// Classification needs only each proof's Y (hash_to_curve of the
+    /// secret — keyset-independent); keyset resolution is needed solely to
+    /// build V3 request proofs, so it runs once per mint alongside the
+    /// checkstate call. `Wallet::check_proofs_spent` is used (not a raw
+    /// connector call) to keep its side effect of marking mint-confirmed
+    /// Spent Ys in the local store.
+    pub async fn check_tokens_spent(
+        &self,
+        tokens: &[String],
+    ) -> HashMap<String, Result<crate::migration::TokenSpendState, WalletError>> {
+        use crate::migration::TokenSpendState;
+        use cdk::nuts::nut07::State;
+        use cdk::nuts::{KeySetInfo, Token};
+        use cdk::wallet::types::KeysetLoadPolicy;
+
+        let mut out: HashMap<String, Result<TokenSpendState, WalletError>> = HashMap::new();
+        let mut by_mint: HashMap<String, Vec<(String, Token)>> = HashMap::new();
+
+        for token_str in tokens {
+            match token_str.parse::<CdkToken>() {
+                Ok(token) => match token.mint_url() {
+                    Ok(url) => by_mint
+                        .entry(canonical_mint_url(&url.to_string()))
+                        .or_default()
+                        .push((token_str.clone(), token)),
+                    Err(e) => {
+                        out.insert(
+                            token_str.clone(),
+                            Err(WalletError::TokenParse(format!("{e}"))),
+                        );
+                    }
+                },
+                Err(e) => {
+                    out.insert(
+                        token_str.clone(),
+                        Err(WalletError::TokenParse(format!("{e}"))),
+                    );
+                }
+            }
+        }
+
+        for (mint, entries) in by_mint {
+            let Some(wallet) = self.wallets.get(&mint) else {
+                for (token_str, _) in &entries {
+                    out.insert(
+                        token_str.clone(),
+                        Err(WalletError::WalletNotFound(mint.clone())),
+                    );
+                }
+                continue;
+            };
+
+            let result = timeout(OP_TIMEOUT, async {
+                let w = wallet.lock().await;
+                let keysets = w.keysets(KeysetLoadPolicy::default()).await?;
+                let keyset_infos: Vec<KeySetInfo> = keysets
+                    .iter()
+                    .map(|ks| KeySetInfo {
+                        id: ks.id,
+                        unit: ks.unit.clone(),
+                        active: ks.active.unwrap_or(true),
+                        input_fee_ppk: ks.input_fee_ppk,
+                        final_expiry: ks.final_expiry,
+                    })
+                    .collect();
+                let mut proofs = Vec::new();
+                for (_, token) in &entries {
+                    proofs.extend(token.proofs(&keyset_infos)?);
+                }
+                let states = w.check_proofs_spent(proofs).await?;
+                Ok::<_, cdk::Error>(states)
+            })
+            .await;
+
+            match result {
+                Ok(Ok(states)) => {
+                    let spent_ys: std::collections::HashSet<cdk::nuts::PublicKey> = states
+                        .iter()
+                        .filter(|s| s.state == State::Spent)
+                        .map(|s| s.y)
+                        .collect();
+                    // PENDING/RESERVED proofs are mid-operation at the mint —
+                    // their word is not final, so any token holding one is
+                    // indeterminate regardless of its spent mix (same
+                    // tri-state contract as `token_check_state`).
+                    let pending_ys: std::collections::HashSet<cdk::nuts::PublicKey> = states
+                        .iter()
+                        .filter(|s| matches!(s.state, State::Pending | State::Reserved))
+                        .map(|s| s.y)
+                        .collect();
+                    // A successful-but-incomplete NUT-07 batch (a mint that
+                    // omits proof states) is not an all-unspent answer: any
+                    // proof the mint did not speak to is an unanswered
+                    // question, and terminalizing on it could finalize over
+                    // still-moving value.
+                    let answered_ys: std::collections::HashSet<cdk::nuts::PublicKey> =
+                        states.iter().map(|s| s.y).collect();
+                    for (token_str, token) in entries {
+                        let amount_sat: u64 = token.value().map(|a| a.into()).unwrap_or(0);
+                        let pairs = token_proof_amounts_secrets(&token);
+                        out.insert(
+                            token_str,
+                            classify_spend_state(
+                                &pairs,
+                                amount_sat,
+                                &spent_ys,
+                                &pending_ys,
+                                &answered_ys,
+                            ),
+                        );
+                    }
+                }
+                Ok(Err(e)) => {
+                    // cdk::Error is not Clone: each per-token error is built
+                    // from the mint-level cause text (the migration loop only
+                    // branches on Ok/Err and TokenParse).
+                    let cause = format!("NUT-07 batch checkstate failed: {e}");
+                    for (token_str, _) in entries {
+                        out.insert(token_str, Err(WalletError::Database(cause.clone())));
+                    }
+                }
+                Err(_) => {
+                    for (token_str, _) in entries {
+                        out.insert(token_str, Err(WalletError::Timeout(OP_TIMEOUT)));
+                    }
+                }
+            }
+        }
+
+        out
+    }
+
+    /// Whether an incomplete CDK *receive* saga still holds inputs that
+    /// overlap THIS token's proofs — the per-Y linkage issue #31 asks for
+    /// (the old per-mint gate deferred every sibling token of a mint with
+    /// one stuck saga, delaying value that was never at risk).
     ///
     /// Local SQLite query (no network): the migration reconciliation gate
     /// works even when the mint is unreachable (AGENTS.md: ambiguous results
     /// are reconciled, not retried).
     pub async fn mint_has_unresolved_receive(&self, token_str: &str) -> Result<bool, WalletError> {
-        use cdk::nuts::{KeySetInfo, Token};
+        use cdk::nuts::KeySetInfo;
         use cdk::wallet::types::KeysetLoadPolicy;
 
-        let token: Token = token_str
+        let token: CdkToken = token_str
             .parse()
             .map_err(|e| WalletError::TokenParse(format!("{e}")))?;
         let mint_url = token
@@ -401,15 +661,19 @@ impl TollWallet {
 
         let result = timeout(OP_TIMEOUT, async {
             let w = wallet.lock().await;
-            let prepared = w.prepare_send(Amount::from(amount_sat), opts).await?;
-            let token = prepared.confirm(None).await?;
-            Ok::<_, cdk::Error>(token.to_string())
+            Self::recover_before_op(&w, "send", true).await?;
+            let prepared = w
+                .prepare_send(Amount::from(amount_sat), opts)
+                .await
+                .map_err(WalletError::from)?;
+            let token = prepared.confirm(None).await.map_err(WalletError::from)?;
+            Ok::<_, WalletError>(token.to_string())
         })
         .await;
 
         match result {
             Ok(Ok(token_str)) => Ok(token_str),
-            Ok(Err(e)) => Err(WalletError::Cdk(e)),
+            Ok(Err(e)) => Err(e),
             Err(_) => {
                 self.spawn_saga_recovery(&normalized);
                 Err(WalletError::Timeout(OP_TIMEOUT))
@@ -519,15 +783,19 @@ impl TollWallet {
 
         let result = timeout(OP_TIMEOUT, async {
             let w = wallet.lock().await;
-            let proofs = w.mint(quote_id, SplitTarget::default(), None).await?;
+            Self::recover_before_op(&w, "mint", false).await?;
+            let proofs = w
+                .mint(quote_id, SplitTarget::default(), None)
+                .await
+                .map_err(WalletError::from)?;
             let total: u64 = proofs.iter().map(|p| -> u64 { p.amount.into() }).sum();
-            Ok::<_, cdk::Error>(total)
+            Ok::<_, WalletError>(total)
         })
         .await;
 
         match result {
             Ok(Ok(total)) => Ok(total),
-            Ok(Err(e)) => Err(WalletError::Cdk(e)),
+            Ok(Err(e)) => Err(e),
             Err(_) => {
                 self.spawn_saga_recovery(&normalized);
                 Err(WalletError::Timeout(OP_TIMEOUT))
@@ -548,15 +816,20 @@ impl TollWallet {
         let invoice_owned = invoice.to_string();
         let result = timeout(OP_TIMEOUT, async {
             let w = wallet.lock().await;
+            Self::recover_before_op(&w, "melt", true).await?;
             // Step 1: create melt quote
             let quote = w
                 .melt_quote(PaymentMethod::BOLT11, invoice_owned, None, None)
-                .await?;
+                .await
+                .map_err(WalletError::from)?;
             // Step 2: prepare melt with the quote ID
-            let prepared = w.prepare_melt(&quote.id, HashMap::new()).await?;
+            let prepared = w
+                .prepare_melt(&quote.id, HashMap::new())
+                .await
+                .map_err(WalletError::from)?;
             // Step 3: confirm
-            let finalized = prepared.confirm().await?;
-            Ok::<_, cdk::Error>((quote, finalized))
+            let finalized = prepared.confirm().await.map_err(WalletError::from)?;
+            Ok::<_, WalletError>((quote, finalized))
         })
         .await;
 
@@ -566,7 +839,7 @@ impl TollWallet {
                 amount: quote.amount.into(),
                 fee: quote.fee_reserve.into(),
             }),
-            Ok(Err(e)) => Err(WalletError::Cdk(e)),
+            Ok(Err(e)) => Err(e),
             Err(_) => {
                 self.spawn_saga_recovery(&normalized);
                 Err(WalletError::Timeout(OP_TIMEOUT))
@@ -830,6 +1103,159 @@ pub struct MeltQuoteInfo {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// Codex P1 on #42 (round 2): when pre-op recovery COMPLETES an earlier
+    /// ambiguous withdrawal (here: compensates a planted interrupted receive
+    /// locally), a fresh send must not replay immediately — the caller must
+    /// reconcile the earlier outcome first. Pre-fix, send proceeded to its
+    /// own swap (and failed at the dead mint); the abort is the fix.
+    #[tokio::test]
+    async fn send_refuses_replay_right_after_recovery_activity() {
+        use cdk::dhke::hash_to_curve;
+        use cdk::nuts::{nut07::State, Id, Proof};
+        use cdk::wallet::types::{
+            OperationData, ProofInfo, ReceiveOperationData, ReceiveSagaState, WalletSaga,
+            WalletSagaState,
+        };
+        use std::str::FromStr;
+
+        let tmp = TempDir::new().unwrap();
+        let mut wallet = make_test_wallet(tmp.path(), vec![]);
+        let mint = "http://127.0.0.1:1";
+        wallet.ensure_mint(mint).await.unwrap();
+
+        let mint_url = cdk::mint_url::MintUrl::from_str(mint).unwrap();
+        let saga_id = uuid::Uuid::new_v4();
+        let proof = Proof::new(
+            cdk::Amount::from(1),
+            Id::from_bytes(&[0u8, 1, 2, 3, 4, 5, 6, 7]).unwrap(),
+            cdk::secret::Secret::new("interrupted-withdrawal-adjacent-saga"),
+            cdk::nuts::PublicKey::from_str(
+                "026562efcfadc8e86d44da6a8adf80633d974302e62c850774db1fb36ff4cc7198",
+            )
+            .unwrap(),
+        );
+        let y = hash_to_curve(proof.secret.as_bytes()).unwrap();
+        {
+            let w = wallet.wallets.get(mint).unwrap().clone();
+            let guard = w.lock().await;
+            guard
+                .localstore
+                .update_proofs(
+                    vec![ProofInfo {
+                        proof,
+                        y,
+                        mint_url: mint_url.clone(),
+                        state: State::Unspent,
+                        spending_condition: None,
+                        unit: cdk::nuts::CurrencyUnit::Sat,
+                        derivation_index: None,
+                        used_by_operation: None,
+                        created_by_operation: None,
+                    }],
+                    vec![],
+                )
+                .await
+                .unwrap();
+            guard
+                .localstore
+                .reserve_proofs(vec![y], &saga_id)
+                .await
+                .unwrap();
+            guard
+                .localstore
+                .add_saga(WalletSaga::new(
+                    saga_id,
+                    WalletSagaState::Receive(ReceiveSagaState::ProofsPending),
+                    cdk::Amount::from(1),
+                    mint_url,
+                    cdk::nuts::CurrencyUnit::Sat,
+                    OperationData::Receive(ReceiveOperationData {
+                        token: None,
+                        counter_start: None,
+                        counter_end: None,
+                        amount: Some(cdk::Amount::from(1)),
+                        blinded_messages: None,
+                    }),
+                ))
+                .await
+                .unwrap();
+        }
+
+        let err = wallet.send(mint, 1, false).await.expect_err("must abort");
+        assert!(
+            matches!(err, WalletError::SagaRecovery(ref m) if m.contains("refusing an immediate replay")),
+            "expected withdrawal replay refusal, got {err:?}"
+        );
+    }
+
+    fn classifier_fixture() -> (
+        Vec<(cdk::Amount, cdk::secret::Secret)>,
+        Vec<cdk::nuts::PublicKey>,
+    ) {
+        use cdk::dhke::hash_to_curve;
+        let pairs: Vec<(cdk::Amount, cdk::secret::Secret)> = ["a", "b", "c"]
+            .iter()
+            .map(|s| (cdk::Amount::from(2), cdk::secret::Secret::new(*s)))
+            .collect();
+        let ys = pairs
+            .iter()
+            .map(|(_, s)| hash_to_curve(s.as_bytes()).unwrap())
+            .collect();
+        (pairs, ys)
+    }
+
+    /// Codex P1 on #42 (round 2): a successful-but-incomplete NUT-07 batch
+    /// must defer, never terminalize — a proof the mint did not speak to is
+    /// an unanswered question, not an unspent proof.
+    #[test]
+    fn classifier_defers_when_the_mint_omits_a_proof_state() {
+        let (pairs, ys) = classifier_fixture();
+        let spent: std::collections::HashSet<_> = [ys[0]].into_iter().collect();
+        let pending: std::collections::HashSet<_> = [].into_iter().collect();
+        // The mint answered only two of the three requested Ys.
+        let answered: std::collections::HashSet<_> = [ys[0], ys[1]].into_iter().collect();
+        assert_eq!(
+            classify_spend_state(&pairs, 6, &spent, &pending, &answered).unwrap(),
+            crate::migration::TokenSpendState::Indeterminate
+        );
+        // Same spent set, complete answer: definitive PartiallySpent.
+        let answered_all: std::collections::HashSet<_> = ys.clone().into_iter().collect();
+        assert_eq!(
+            classify_spend_state(&pairs, 6, &spent, &pending, &answered_all).unwrap(),
+            crate::migration::TokenSpendState::PartiallySpent {
+                spent_sat: 2,
+                unspent_sat: 4
+            }
+        );
+        // Every Y answered UNSPENT elsewhere is Unspent, not Indeterminate.
+        assert_eq!(
+            classify_spend_state(&pairs, 6, &pending, &pending, &answered_all).unwrap(),
+            crate::migration::TokenSpendState::Unspent
+        );
+        // A PENDING answer defers even when everything else is spent.
+        let spent_2: std::collections::HashSet<_> = [ys[0], ys[1]].into_iter().collect();
+        let pending_1: std::collections::HashSet<_> = [ys[2]].into_iter().collect();
+        assert_eq!(
+            classify_spend_state(&pairs, 6, &spent_2, &pending_1, &answered_all).unwrap(),
+            crate::migration::TokenSpendState::Indeterminate
+        );
+        assert_eq!(
+            classify_spend_state(&pairs, 6, &spent_all(&ys), &pending_1, &answered_all).unwrap(),
+            crate::migration::TokenSpendState::Indeterminate
+        );
+        // All spent, nothing pending: terminal.
+        assert_eq!(
+            classify_spend_state(&pairs, 6, &spent_all(&ys), &pending, &answered_all).unwrap(),
+            crate::migration::TokenSpendState::AllSpent { amount_sat: 6 }
+        );
+        // Empty token cannot be classified.
+        assert!(classify_spend_state(&[], 0, &spent, &pending, &answered_all).is_err());
+    }
+
+    fn spent_all(ys: &[cdk::nuts::PublicKey]) -> std::collections::HashSet<cdk::nuts::PublicKey> {
+        ys.iter().copied().collect()
+    }
 
     fn make_test_wallet(dir: &Path, accepted_mints: Vec<String>) -> TollWallet {
         let mut seed = [0u8; 64];
@@ -1131,5 +1557,389 @@ mod tests {
         let result = tokio::time::timeout(Duration::from_secs(35), wallet.receive(token)).await;
 
         assert!(result.is_ok(), "receive should not hang forever");
+    }
+
+    /// Codex P1 on #42: recovery that merely SKIPS a saga (mint unreachable —
+    /// cdk returns Ok(Skipped) by design) has NOT reconciled the wallet, so
+    /// the money op must abort with a distinct cause instead of proceeding
+    /// to spend over undecided state. A `SwapRequested` saga needs the mint
+    /// to settle; against an instantly-refused one, recovery skips and the
+    /// receive must refuse to move value.
+    #[tokio::test]
+    async fn receive_aborts_when_recovery_skips_a_saga() {
+        use cdk::dhke::hash_to_curve;
+        use cdk::nuts::{nut07::State, Id, Proof};
+        use cdk::wallet::types::{
+            OperationData, ProofInfo, ReceiveOperationData, ReceiveSagaState, WalletSaga,
+            WalletSagaState,
+        };
+        use std::str::FromStr;
+
+        let tmp = TempDir::new().unwrap();
+        let mut wallet = make_test_wallet(tmp.path(), vec![]);
+        // TCP port 1 on loopback: refused instantly, no external network.
+        let mint = "http://127.0.0.1:1";
+        wallet.ensure_mint(mint).await.unwrap();
+
+        let mint_url = cdk::mint_url::MintUrl::from_str(mint).unwrap();
+        let saga_id = uuid::Uuid::new_v4();
+        let proof = Proof::new(
+            cdk::Amount::from(1),
+            Id::from_bytes(&[0u8, 1, 2, 3, 4, 5, 6, 7]).unwrap(),
+            cdk::secret::Secret::new("interrupted-saga-input-secret"),
+            cdk::nuts::PublicKey::from_str(
+                "026562efcfadc8e86d44da6a8adf80633d974302e62c850774db1fb36ff4cc7198",
+            )
+            .unwrap(),
+        );
+        let y = hash_to_curve(proof.secret.as_bytes()).unwrap();
+
+        let store = {
+            let w = wallet.wallets.get(mint).unwrap().clone();
+            let guard = w.lock().await;
+            guard
+                .localstore
+                .update_proofs(
+                    vec![ProofInfo {
+                        proof: proof.clone(),
+                        y,
+                        mint_url: mint_url.clone(),
+                        state: State::Unspent,
+                        spending_condition: None,
+                        unit: cdk::nuts::CurrencyUnit::Sat,
+                        derivation_index: None,
+                        used_by_operation: None,
+                        created_by_operation: None,
+                    }],
+                    vec![],
+                )
+                .await
+                .unwrap();
+            guard
+                .localstore
+                .reserve_proofs(vec![y], &saga_id)
+                .await
+                .unwrap();
+            guard
+                .localstore
+                .add_saga(WalletSaga::new(
+                    saga_id,
+                    WalletSagaState::Receive(ReceiveSagaState::SwapRequested),
+                    cdk::Amount::from(1),
+                    mint_url.clone(),
+                    cdk::nuts::CurrencyUnit::Sat,
+                    OperationData::Receive(ReceiveOperationData {
+                        token: None,
+                        counter_start: None,
+                        counter_end: None,
+                        amount: Some(cdk::Amount::from(1)),
+                        blinded_messages: None,
+                    }),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                guard.localstore.get_incomplete_sagas().await.unwrap().len(),
+                1,
+                "plant sanity: one incomplete saga before the op"
+            );
+            guard.localstore.clone()
+        };
+
+        let fresh = Proof::new(
+            cdk::Amount::from(2),
+            Id::from_bytes(&[0u8, 1, 2, 3, 4, 5, 6, 7]).unwrap(),
+            cdk::secret::Secret::new("fresh-token-secret"),
+            cdk::nuts::PublicKey::from_str(
+                "026562efcfadc8e86d44da6a8adf80633d974302e62c850774db1fb36ff4cc7198",
+            )
+            .unwrap(),
+        );
+        let token_str =
+            cdk::nuts::Token::new(mint_url, vec![fresh], None, cdk::nuts::CurrencyUnit::Sat)
+                .to_string();
+
+        let err = wallet.receive(&token_str).await.expect_err("must abort");
+        assert!(
+            matches!(err, WalletError::SagaRecovery(ref m) if m.contains("skipped")),
+            "expected SagaRecovery abort with unresolved sagas, got {err:?}"
+        );
+
+        let remaining = store.get_incomplete_sagas().await.unwrap();
+        assert_eq!(
+            remaining.len(),
+            1,
+            "the skipped saga survives for the next recovery attempt"
+        );
+    }
+
+    /// Issue #33: an interrupted saga left behind by a mid-session timeout
+    /// must be settled BEFORE the next money move on that wallet — not left
+    /// unresolved until the next boot. Plants exactly what a killed process
+    /// leaves in SQLite (a reserved input proof + a `ProofsPending` receive
+    /// saga — the state a pre-swap crash leaves, compensable locally) and
+    /// asserts the saga is gone after the next receive, proving pre-op
+    /// recovery actually ran. The receive itself still fails (dead mint),
+    /// so no money moves in either version — the observable is the saga's
+    /// convergence, not the error kind.
+    #[tokio::test]
+    async fn receive_settles_interrupted_saga_before_moving_money() {
+        use cdk::dhke::hash_to_curve;
+        use cdk::nuts::{nut07::State, Id, Proof};
+        use cdk::wallet::types::{
+            OperationData, ProofInfo, ReceiveOperationData, ReceiveSagaState, WalletSaga,
+            WalletSagaState,
+        };
+        use std::str::FromStr;
+
+        let tmp = TempDir::new().unwrap();
+        let mut wallet = make_test_wallet(tmp.path(), vec![]);
+        // TCP port 1 on loopback: refused instantly, no external network.
+        let mint = "http://127.0.0.1:1";
+        wallet.ensure_mint(mint).await.unwrap();
+
+        let mint_url = cdk::mint_url::MintUrl::from_str(mint).unwrap();
+        let saga_id = uuid::Uuid::new_v4();
+        let proof = Proof::new(
+            cdk::Amount::from(1),
+            Id::from_bytes(&[0u8, 1, 2, 3, 4, 5, 6, 7]).unwrap(),
+            cdk::secret::Secret::new("interrupted-saga-input-secret"),
+            cdk::nuts::PublicKey::from_str(
+                "026562efcfadc8e86d44da6a8adf80633d974302e62c850774db1fb36ff4cc7198",
+            )
+            .unwrap(),
+        );
+        let y = hash_to_curve(proof.secret.as_bytes()).unwrap();
+
+        let store = {
+            let w = wallet.wallets.get(mint).unwrap().clone();
+            let guard = w.lock().await;
+            guard
+                .localstore
+                .update_proofs(
+                    vec![ProofInfo {
+                        proof: proof.clone(),
+                        y,
+                        mint_url: mint_url.clone(),
+                        state: State::Unspent,
+                        spending_condition: None,
+                        unit: cdk::nuts::CurrencyUnit::Sat,
+                        derivation_index: None,
+                        used_by_operation: None,
+                        created_by_operation: None,
+                    }],
+                    vec![],
+                )
+                .await
+                .unwrap();
+            guard
+                .localstore
+                .reserve_proofs(vec![y], &saga_id)
+                .await
+                .unwrap();
+            guard
+                .localstore
+                .add_saga(WalletSaga::new(
+                    saga_id,
+                    WalletSagaState::Receive(ReceiveSagaState::ProofsPending),
+                    cdk::Amount::from(1),
+                    mint_url.clone(),
+                    cdk::nuts::CurrencyUnit::Sat,
+                    OperationData::Receive(ReceiveOperationData {
+                        token: None,
+                        counter_start: None,
+                        counter_end: None,
+                        amount: Some(cdk::Amount::from(1)),
+                        blinded_messages: None,
+                    }),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                guard.localstore.get_incomplete_sagas().await.unwrap().len(),
+                1,
+                "plant sanity: one incomplete saga before the op"
+            );
+            guard.localstore.clone()
+        };
+
+        let fresh = Proof::new(
+            cdk::Amount::from(2),
+            Id::from_bytes(&[0u8, 1, 2, 3, 4, 5, 6, 7]).unwrap(),
+            cdk::secret::Secret::new("fresh-token-secret"),
+            cdk::nuts::PublicKey::from_str(
+                "026562efcfadc8e86d44da6a8adf80633d974302e62c850774db1fb36ff4cc7198",
+            )
+            .unwrap(),
+        );
+        let token_str =
+            cdk::nuts::Token::new(mint_url, vec![fresh], None, cdk::nuts::CurrencyUnit::Sat)
+                .to_string();
+
+        let err = wallet.receive(&token_str).await.expect_err("dead mint");
+        assert!(
+            matches!(err, WalletError::Cdk(_)),
+            "receive itself fails at the dead mint, got {err:?}"
+        );
+
+        let remaining = store.get_incomplete_sagas().await.unwrap();
+        assert!(
+            remaining.is_empty(),
+            "pre-op recovery must settle the interrupted saga this call, not at next boot; still present: {:?}",
+            remaining.iter().map(|s| s.state).collect::<Vec<_>>()
+        );
+    }
+
+    /// Issue #31: the saga gate links per-token (by input Ys), not per-mint.
+    /// One stuck receive saga holding token A's inputs must defer token A —
+    /// but sibling token B of the SAME mint has disjoint inputs and proceeds
+    /// (the old per-mint gate deferred B too, delaying value never at risk).
+    /// A saga with nothing linkable on record still blocks (conservative).
+    #[tokio::test]
+    async fn saga_gate_links_per_token_not_per_mint() {
+        use cdk::dhke::hash_to_curve;
+        use cdk::nuts::{nut07::State, Id, Proof};
+        use cdk::wallet::types::{
+            OperationData, ProofInfo, ReceiveOperationData, ReceiveSagaState, WalletSaga,
+            WalletSagaState,
+        };
+        use std::str::FromStr;
+
+        let tmp = TempDir::new().unwrap();
+        let mut wallet = make_test_wallet(tmp.path(), vec![]);
+        let mint = "http://127.0.0.1:1";
+        wallet.ensure_mint(mint).await.unwrap();
+
+        let mint_url = cdk::mint_url::MintUrl::from_str(mint).unwrap();
+        let pubkey = |hex: &str| cdk::nuts::PublicKey::from_str(hex).unwrap();
+        // NUT-02: a keyset id is derived from its keys — the planted store
+        // rows must carry a self-consistent id or `keysets()` rejects them.
+        let mut key_map = std::collections::BTreeMap::new();
+        key_map.insert(
+            cdk::Amount::from(1),
+            pubkey("026562efcfadc8e86d44da6a8adf80633d974302e62c850774db1fb36ff4cc7198"),
+        );
+        let test_keys = cdk::nuts::Keys::new(key_map);
+        let keyset = Id::v1_from_keys(&test_keys);
+
+        let make_token = |secret: &str| {
+            cdk::nuts::Token::new(
+                mint_url.clone(),
+                vec![Proof::new(
+                    cdk::Amount::from(1),
+                    keyset,
+                    cdk::secret::Secret::new(secret),
+                    pubkey("026562efcfadc8e86d44da6a8adf80633d974302e62c850774db1fb36ff4cc7198"),
+                )],
+                None,
+                cdk::nuts::CurrencyUnit::Sat,
+            )
+            .to_string()
+        };
+        let token_a = make_token("token-a-input-secret");
+        let token_b = make_token("token-b-input-secret");
+
+        // Interrupted receive for token A: its proof reserved by the saga.
+        let proof_a = Proof::new(
+            cdk::Amount::from(1),
+            keyset,
+            cdk::secret::Secret::new("token-a-input-secret"),
+            pubkey("026562efcfadc8e86d44da6a8adf80633d974302e62c850774db1fb36ff4cc7198"),
+        );
+        let y_a = hash_to_curve(proof_a.secret.as_bytes()).unwrap();
+        let saga_id = uuid::Uuid::new_v4();
+
+        {
+            let w = wallet.wallets.get(mint).unwrap().clone();
+            let guard = w.lock().await;
+            // #44's gate resolves V3/V4 proofs through the keyset cache
+            // (CacheThenNetwork): seed the keyset row so the query stays
+            // purely local, as it is in production after ensure_mint.
+            guard
+                .localstore
+                .add_mint(mint_url.clone(), None)
+                .await
+                .unwrap();
+            guard
+                .localstore
+                .add_mint_keysets(
+                    mint_url.clone(),
+                    vec![cdk::nuts::KeySetInfo {
+                        id: keyset,
+                        unit: cdk::nuts::CurrencyUnit::Sat,
+                        active: true,
+                        input_fee_ppk: 0,
+                        final_expiry: None,
+                    }],
+                )
+                .await
+                .unwrap();
+            // `Wallet::keysets` drops infos without key material.
+            guard
+                .localstore
+                .add_keys(cdk::nuts::KeySet {
+                    id: keyset,
+                    unit: cdk::nuts::CurrencyUnit::Sat,
+                    active: Some(true),
+                    keys: test_keys.clone(),
+                    input_fee_ppk: 0,
+                    final_expiry: None,
+                })
+                .await
+                .unwrap();
+            guard
+                .localstore
+                .update_proofs(
+                    vec![ProofInfo {
+                        proof: proof_a,
+                        y: y_a,
+                        mint_url: mint_url.clone(),
+                        state: State::Unspent,
+                        spending_condition: None,
+                        unit: cdk::nuts::CurrencyUnit::Sat,
+                        derivation_index: None,
+                        used_by_operation: None,
+                        created_by_operation: None,
+                    }],
+                    vec![],
+                )
+                .await
+                .unwrap();
+            guard
+                .localstore
+                .reserve_proofs(vec![y_a], &saga_id)
+                .await
+                .unwrap();
+            guard
+                .localstore
+                .add_saga(WalletSaga::new(
+                    saga_id,
+                    WalletSagaState::Receive(ReceiveSagaState::SwapRequested),
+                    cdk::Amount::from(1),
+                    mint_url.clone(),
+                    cdk::nuts::CurrencyUnit::Sat,
+                    OperationData::Receive(ReceiveOperationData {
+                        token: Some(token_a.clone()),
+                        counter_start: None,
+                        counter_end: None,
+                        amount: Some(cdk::Amount::from(1)),
+                        blinded_messages: None,
+                    }),
+                ))
+                .await
+                .unwrap();
+        }
+
+        assert!(
+            wallet.mint_has_unresolved_receive(&token_a).await.unwrap(),
+            "token A's own inputs are held by the interrupted saga — deferred"
+        );
+        assert!(
+            !wallet.mint_has_unresolved_receive(&token_b).await.unwrap(),
+            "sibling token B has disjoint inputs — must proceed (issue #31)"
+        );
+
+        // (#44's gate is proof-state based: an orphan saga holding no
+        // reserved proofs defers nothing — no conservative block needed.)
     }
 }

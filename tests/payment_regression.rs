@@ -44,6 +44,24 @@ impl TokenSink for FakeSink {
         Ok(self.spent.get(token).copied().flatten())
     }
 
+    async fn check_tokens_spent(
+        &self,
+        tokens: &[String],
+    ) -> std::collections::HashMap<
+        String,
+        Result<tollgate_module_basic_rust::migration::TokenSpendState, WalletError>,
+    > {
+        tokens
+            .iter()
+            .map(|t| {
+                (
+                    t.clone(),
+                    Ok(tollgate_module_basic_rust::migration::TokenSpendState::Unspent),
+                )
+            })
+            .collect()
+    }
+
     async fn mint_has_unresolved_receive(&self, _token: &str) -> Result<bool, WalletError> {
         Ok(false)
     }

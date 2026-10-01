@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use tollgate_module_basic_rust::migration::{
     should_import_tokens, ExportOutcome, FirstBootMigration, JournalEntry, TokenOutcome, TokenSink,
-    JOURNAL_NAME, MARKER_NAME, OLD_DB_NAME, TOKENS_FILE_NAME,
+    TokenSpendState, JOURNAL_NAME, MARKER_NAME, OLD_DB_NAME, TOKENS_FILE_NAME,
 };
 
 #[derive(Debug, Default)]
@@ -15,6 +15,10 @@ struct FakeSink {
     /// token -> mint-side NUT-07 answer: `Some(amount)` = all proofs spent,
     /// `None` = still spendable.
     spent: HashMap<String, Option<u64>>,
+    /// token -> (spent, unspent) for partially-spent tokens.
+    partial: HashMap<String, (u64, u64)>,
+    /// Tokens whose proofs are PENDING/RESERVED at the mint.
+    indeterminate: std::collections::HashSet<String>,
     /// token -> receive result.
     receive: HashMap<String, Rx>,
     /// When set, every NUT-07 pre-check errors (mint unreachable).
@@ -22,6 +26,8 @@ struct FakeSink {
     /// Simulates an incomplete CDK receive saga for the mint (local state).
     unresolved: bool,
     calls: std::sync::Mutex<Vec<String>>,
+    /// (tokens-per-call) for every `check_tokens_spent` invocation.
+    batch_calls: std::sync::Mutex<Vec<usize>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -48,14 +54,46 @@ impl TokenSink for FakeSink {
 
     async fn token_spent(
         &self,
-        token: &str,
+        _token: &str,
     ) -> Result<Option<u64>, tollgate_module_basic_rust::wallet::WalletError> {
+        Ok(None)
+    }
+
+    async fn check_tokens_spent(
+        &self,
+        tokens: &[String],
+    ) -> HashMap<String, Result<TokenSpendState, tollgate_module_basic_rust::wallet::WalletError>>
+    {
         use tollgate_module_basic_rust::wallet::WalletError;
-        self.calls.lock().unwrap().push(format!("spent:{token}"));
-        if self.spent_err {
-            return Err(WalletError::Timeout(std::time::Duration::from_secs(30)));
-        }
-        Ok(self.spent.get(token).copied().flatten())
+        self.batch_calls.lock().unwrap().push(tokens.len());
+        tokens
+            .iter()
+            .map(|t| {
+                if self.spent_err {
+                    (
+                        t.clone(),
+                        Err(WalletError::Timeout(std::time::Duration::from_secs(30))),
+                    )
+                } else if self.indeterminate.contains(t) {
+                    (t.clone(), Ok(TokenSpendState::Indeterminate))
+                } else if let Some((spent_sat, unspent_sat)) = self.partial.get(t).copied() {
+                    (
+                        t.clone(),
+                        Ok(TokenSpendState::PartiallySpent {
+                            spent_sat,
+                            unspent_sat,
+                        }),
+                    )
+                } else {
+                    match self.spent.get(t).copied().flatten() {
+                        Some(amount_sat) => {
+                            (t.clone(), Ok(TokenSpendState::AllSpent { amount_sat }))
+                        }
+                        None => (t.clone(), Ok(TokenSpendState::Unspent)),
+                    }
+                }
+            })
+            .collect()
     }
 
     async fn mint_has_unresolved_receive(
@@ -106,6 +144,215 @@ fn fold_last(entries: &[JournalEntry]) -> HashMap<String, TokenOutcome> {
     folded
 }
 
+/// Issue #34: the NUT-07 pre-check is issued as ONE batched call per import
+/// run carrying only the non-terminal candidate tokens — not one call per
+/// token. A second run with some tokens terminal must shrink the batch to
+/// the remaining candidates instead of re-checking the finished ones.
+#[tokio::test]
+async fn nut07_pre_check_is_one_batch_per_run_with_candidates_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let m = setup(dir.path(), &["cashuA1", "cashuA2", "cashuA3"]);
+
+    let sink = FakeSink {
+        spent: [
+            ("cashuA1".to_string(), Some(3u64)),
+            ("cashuA2".to_string(), None),
+            ("cashuA3".to_string(), None),
+        ]
+        .into_iter()
+        .collect(),
+        receive: [
+            ("cashuA2".to_string(), Rx::Ok(2)),
+            ("cashuA3".to_string(), Rx::Ok(3)),
+        ]
+        .into_iter()
+        .collect(),
+        ..Default::default()
+    };
+    let summary = m.import_tokens(&sink).await.unwrap();
+    assert_eq!(summary.spent, 1);
+    assert_eq!(summary.imported, 5);
+
+    let batches = sink.batch_calls.lock().unwrap().clone();
+    assert_eq!(
+        batches,
+        vec![3],
+        "one batched pre-check per run, carrying all three candidates: {batches:?}"
+    );
+
+    let sink2 = FakeSink::default();
+    let summary2 = m.import_tokens(&sink2).await.unwrap();
+    assert_eq!(summary2.skipped_already_imported, 2);
+    let batches2 = sink2.batch_calls.lock().unwrap().clone();
+    assert!(
+        batches2.is_empty(),
+        "with no candidates there is no pre-check call at all: {batches2:?}"
+    );
+}
+
+/// Issue #35: a token whose proofs are PARTIALLY spent at the mint can
+/// never satisfy the atomic swap — the pre-check classifies it terminal
+/// `PartiallySpent` (with the unspent remainder surfaced for the operator)
+/// instead of the old blanket retriable-`Failed` that re-attempted a doomed
+/// receive on every boot. The remainder value is retained in the journal
+/// (and tokens.jsonl) for split-and-reimport recovery.
+#[tokio::test]
+async fn partially_spent_token_is_terminal_not_retriable_failed() {
+    let dir = tempfile::tempdir().unwrap();
+    let m = setup(dir.path(), &["cashuA1"]);
+    write_journal(
+        dir.path(),
+        &[JournalEntry {
+            token: "cashuA1".to_string(),
+            outcome: TokenOutcome::Failed {
+                reason: "mint rejected swap: inputs already spent".into(),
+            },
+        }],
+    );
+
+    let sink = FakeSink {
+        partial: [("cashuA1".to_string(), (4u64, 6u64))]
+            .into_iter()
+            .collect(),
+        receive: [("cashuA1".to_string(), Rx::Ok(999))].into_iter().collect(),
+        ..Default::default()
+    };
+    let summary = m.import_tokens(&sink).await.unwrap();
+    assert_eq!(summary.partially_spent, 1);
+    assert_eq!(summary.partially_spent_unspent_sat, 6);
+    assert_eq!(summary.failed, 0);
+    assert_eq!(summary.imported, 0);
+
+    let calls = sink.calls.lock().unwrap().clone();
+    assert!(
+        !calls.iter().any(|c| c.starts_with("receive:")),
+        "a partially-spent token must never be resubmitted: {calls:?}"
+    );
+
+    assert_eq!(
+        fold_last(&read_journal(dir.path())).get("cashuA1"),
+        Some(&TokenOutcome::PartiallySpent {
+            spent_sat: 4,
+            unspent_sat: 6
+        })
+    );
+
+    // Terminal for finalization too: recovery is an operator action, not a
+    // migration blocker.
+    let finish = m.finish(summary).unwrap();
+    assert_eq!(
+        finish,
+        tollgate_module_basic_rust::migration::MigrationFinish::Complete
+    );
+    let marker = std::fs::read_to_string(&m.marker).unwrap();
+    assert!(marker.contains("partially_spent=1"));
+    assert!(marker.contains("partially_spent_unspent_sat=6"));
+
+    // Re-runs stay converged: no re-check, no re-receive.
+    let sink2 = FakeSink::default();
+    let summary2 = m.import_tokens(&sink2).await.unwrap();
+    assert_eq!(summary2.partially_spent, 1);
+    assert!(sink2.batch_calls.lock().unwrap().is_empty());
+    assert!(!sink2
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|c| c.starts_with("receive:")));
+}
+
+/// Codex P2 on #42: a tokens file containing the same line twice (manual
+/// copy-paste) must attempt the token ONCE — the batched classification is
+/// consumed by removal, so an undeduped second occurrence previously hit an
+/// unreachable lookup and panicked the daemon at startup on every retry.
+#[tokio::test]
+async fn duplicate_token_lines_attempt_once_without_panicking() {
+    let dir = tempfile::tempdir().unwrap();
+    let m = setup(dir.path(), &["cashuA1", "cashuA1"]);
+
+    let sink = FakeSink {
+        receive: [("cashuA1".to_string(), Rx::Ok(5))].into_iter().collect(),
+        ..Default::default()
+    };
+    let summary = m.import_tokens(&sink).await.unwrap();
+    assert_eq!(summary.imported, 5);
+    assert_eq!(summary.skipped_already_imported, 0);
+
+    let calls = sink.calls.lock().unwrap().clone();
+    assert_eq!(
+        calls.iter().filter(|c| c.starts_with("receive:")).count(),
+        1,
+        "the duplicated line is the same token: one receive: {calls:?}"
+    );
+    let batches = sink.batch_calls.lock().unwrap().clone();
+    assert_eq!(batches, vec![1], "one candidate after dedup: {batches:?}");
+}
+
+/// Codex P1 on #42: a token with a SPENT proof and a PENDING proof must NOT
+/// terminalize as PartiallySpent — the pending proof can settle either way,
+/// so a journaled "unspent remainder" would be speculative. The token is
+/// deferred (no journal entry, no receive, blocks finalization) and
+/// converges once the mint's answer is definitive.
+#[tokio::test]
+async fn pending_at_mint_tokens_defer_not_terminalize() {
+    let dir = tempfile::tempdir().unwrap();
+    let m = setup(dir.path(), &["cashuA1"]);
+    write_journal(
+        dir.path(),
+        &[JournalEntry {
+            token: "cashuA1".to_string(),
+            outcome: TokenOutcome::Failed {
+                reason: "mint rejected swap: inputs already spent".into(),
+            },
+        }],
+    );
+
+    let sink = FakeSink {
+        indeterminate: ["cashuA1".to_string()].into(),
+        receive: [("cashuA1".to_string(), Rx::Ok(999))].into_iter().collect(),
+        ..Default::default()
+    };
+    let summary = m.import_tokens(&sink).await.unwrap();
+    assert_eq!(summary.pending, 1);
+    assert_eq!(summary.partially_spent, 0);
+    assert_eq!(summary.failed, 0);
+
+    let calls = sink.calls.lock().unwrap().clone();
+    assert!(
+        !calls.iter().any(|c| c.starts_with("receive:")),
+        "an indeterminate token must not be received: {calls:?}"
+    );
+    assert_eq!(
+        fold_last(&read_journal(dir.path())).get("cashuA1"),
+        Some(&TokenOutcome::Failed {
+            reason: "mint rejected swap: inputs already spent".into()
+        }),
+        "no journal entry is written while the mint's answer is not final"
+    );
+    assert_eq!(
+        m.finish(summary).unwrap(),
+        tollgate_module_basic_rust::migration::MigrationFinish::Partial
+    );
+
+    // The mint's operation completed: one proof stayed spent, one unspent —
+    // now the answer is definitive and the token terminalizes.
+    let sink2 = FakeSink {
+        partial: [("cashuA1".to_string(), (4u64, 6u64))]
+            .into_iter()
+            .collect(),
+        ..Default::default()
+    };
+    let summary2 = m.import_tokens(&sink2).await.unwrap();
+    assert_eq!(summary2.partially_spent, 1);
+    assert_eq!(
+        fold_last(&read_journal(dir.path())).get("cashuA1"),
+        Some(&TokenOutcome::PartiallySpent {
+            spent_sat: 4,
+            unspent_sat: 6
+        })
+    );
+}
+
 /// Codex P1 finding 1 (migration.rs:132): a durable Pending intent must
 /// exist before `receive()` is called, so death between receive and the
 /// outcome append leaves a reconcilable record instead of nothing.
@@ -140,6 +387,17 @@ async fn pending_intent_is_durable_before_receive_touches_the_mint() {
             _token: &str,
         ) -> Result<Option<u64>, tollgate_module_basic_rust::wallet::WalletError> {
             Ok(None)
+        }
+
+        async fn check_tokens_spent(
+            &self,
+            tokens: &[String],
+        ) -> HashMap<String, Result<TokenSpendState, tollgate_module_basic_rust::wallet::WalletError>>
+        {
+            tokens
+                .iter()
+                .map(|t| (t.clone(), Ok(TokenSpendState::Unspent)))
+                .collect()
         }
 
         async fn mint_has_unresolved_receive(
