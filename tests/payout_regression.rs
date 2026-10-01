@@ -66,15 +66,32 @@ fn ambiguous_resolved_saga_closes_as_resolved() {
 /// (LNURL fetches one per attempt) but NEVER with a literal bolt11 —
 /// the already-paid wedge from the issue.
 #[test]
-fn intent_only_crash_retries_only_with_fresh_invoice() {
+fn intent_only_crash_never_remelts_same_invoice() {
+    // Codex P1 on #45: the melt may have run before the crash — the same
+    // invoice is never re-attempted. Fresh-invoice attempts land on a new
+    // journal key and are unaffected.
     let (d, _) = decide(Some(&PayoutPhase::Intent), false, false);
-    assert_eq!(d, MeltDecision::Proceed);
+    assert_eq!(d, MeltDecision::SkipSurface);
     let (d, _) = decide(Some(&PayoutPhase::Intent), true, false);
-    assert_eq!(
-        d,
-        MeltDecision::SkipSurface,
-        "literal bolt11 ambiguity must never re-melt"
-    );
+    assert_eq!(d, MeltDecision::SkipSurface);
+}
+
+#[test]
+fn settled_ambiguity_literal_stays_surfaced() {
+    // Compensated is indistinguishable from paid, and a literal invoice
+    // has no fresh-invoice fallback — close the entry but surface it.
+    let (d, advance) = decide(Some(&PayoutPhase::Ambiguous), true, false);
+    assert_eq!(d, MeltDecision::SkipSurface);
+    assert_eq!(advance, Some(PayoutPhase::Resolved));
+}
+
+#[test]
+fn settled_ambiguity_fresh_invoice_closes_done() {
+    // A compensated melt restores the balance; the next tick's plan
+    // re-pays with a fresh invoice.
+    let (d, advance) = decide(Some(&PayoutPhase::Ambiguous), false, false);
+    assert_eq!(d, MeltDecision::SkipDone);
+    assert_eq!(advance, Some(PayoutPhase::Resolved));
 }
 
 #[test]
