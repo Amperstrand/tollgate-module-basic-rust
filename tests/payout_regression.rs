@@ -175,32 +175,30 @@ fn resolved_ambiguity_is_visible_but_not_counted_paid() {
 fn compaction_keeps_last_per_id_beyond_threshold() {
     use tollgate_module_basic_rust::payout_journal::compact_if_large;
     let dir = tempfile::tempdir().unwrap();
-    // Two ids, one with a long history: only the last per id must survive.
-    for i in 0..50 {
+    // Real churn shape: each invoice id accrues an intent + terminal line
+    // (2 lines per payout); compaction keeps the last line per id.
+    for i in 0..30 {
+        let inv = format!("inv-{i}");
         let mut e = entry("a", PayoutPhase::Intent, false);
-        e.id = entry_id("https://mint.example", "owner", &format!("inv-{i}"));
-        e.invoice = format!("inv-{i}");
-        e.phase = if i == 49 {
-            PayoutPhase::Paid
-        } else {
-            PayoutPhase::Intent
-        };
+        e.id = entry_id("https://mint.example", "owner", &inv);
+        e.invoice = inv;
+        append_entry(dir.path(), &e).unwrap();
+        e.phase = PayoutPhase::Paid;
         append_entry(dir.path(), &e).unwrap();
     }
-    let mut e = entry("b", PayoutPhase::Paid, false);
-    e.id = entry_id("https://mint.example", "owner", "inv-final");
-    e.invoice = "inv-final".to_string();
-    append_entry(dir.path(), &e).unwrap();
+    assert_eq!(read_journal(dir.path()).len(), 60);
 
-    assert_eq!(read_journal(dir.path()).len(), 51);
     assert!(compact_if_large(dir.path(), 10).unwrap());
     let after = read_journal(dir.path());
-    assert_eq!(after.len(), 50, "one line per id");
-    // inv-49 (the latest of the churned id) and inv-final survive.
-    assert!(after
-        .iter()
-        .any(|e| e.invoice == "inv-49" && e.phase == PayoutPhase::Paid));
-    assert!(after.iter().any(|e| e.invoice == "inv-final"));
+    assert_eq!(
+        after.len(),
+        30,
+        "one line per id — the 2x factor is bounded"
+    );
+    assert!(
+        after.iter().all(|e| e.phase == PayoutPhase::Paid),
+        "last per id wins"
+    );
     // Below threshold: no-op.
     assert!(!compact_if_large(dir.path(), 100).unwrap());
 }
