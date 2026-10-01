@@ -85,6 +85,20 @@ fn settled_ambiguity_literal_stays_surfaced() {
     assert_eq!(advance, Some(PayoutPhase::Resolved));
 }
 
+/// …and it STAYS surfaced on every later tick: a literal `Resolved`
+/// record must never fall into the unconditional done arm and report
+/// AlreadyDone for a melt that may have been compensated (Codex P1 on
+/// #45, round 2).
+#[test]
+fn resolved_literal_stays_surfaced_forever() {
+    let (d, _) = decide(Some(&PayoutPhase::Resolved), true, false);
+    assert_eq!(d, MeltDecision::SkipSurface);
+    // Fresh invoices: done is correct — a compensated melt restored the
+    // balance and the next tick's plan re-pays.
+    let (d, _) = decide(Some(&PayoutPhase::Resolved), false, false);
+    assert_eq!(d, MeltDecision::SkipDone);
+}
+
 #[test]
 fn settled_ambiguity_fresh_invoice_closes_done() {
     // A compensated melt restores the balance; the next tick's plan

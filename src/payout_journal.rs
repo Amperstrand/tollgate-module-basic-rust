@@ -163,7 +163,18 @@ pub fn decide(
             (MeltDecision::SkipSurface, None)
         }
         Some(PayoutPhase::Paid) => (MeltDecision::SkipDone, None),
-        Some(PayoutPhase::Resolved) => (MeltDecision::SkipDone, None),
+        Some(PayoutPhase::Resolved) => {
+            // A resolved AMBIGUITY is not proof of payment — compensated
+            // melts resolve identically. Fresh invoices are safe to treat
+            // as done (a compensated melt restored the balance and the
+            // next tick re-pays); a literal invoice has no fallback and
+            // must stay surfaced forever (Codex P1 on #45, round 2).
+            if literal_invoice {
+                (MeltDecision::SkipSurface, None)
+            } else {
+                (MeltDecision::SkipDone, None)
+            }
+        }
         Some(PayoutPhase::Failed { .. }) => (MeltDecision::Proceed, None),
         Some(PayoutPhase::Ambiguous) => {
             if mint_has_unresolved_melt_saga {
