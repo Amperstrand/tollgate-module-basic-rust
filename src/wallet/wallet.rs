@@ -330,8 +330,11 @@ impl TollWallet {
 
         // Per-token linkage (issue #31): instead of "any receive saga for
         // this mint" (which deferred every sibling token), ask whether THIS
-        // token's input Ys are currently Reserved/Pending in the wallet —
+        // token's input Ys are reserved by an incomplete RECEIVE saga —
         // i.e. an earlier attempt of this very token is still in flight.
+        // Scoped to receive sagas (Codex P2 on #44): sends also reserve
+        // proofs, and a token minted by this wallet and sent to a customer
+        // would otherwise false-positive when the customer pays it back.
         let result = timeout(OP_TIMEOUT, async {
             let w = wallet.lock().await;
             let keysets = w.keysets(KeysetLoadPolicy::default()).await?;
@@ -352,17 +355,20 @@ impl TollWallet {
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
                 .collect();
-            // get_proofs_by_states returns Proofs (Vec<Proof>) — Ys via
-            // the y() method, same as the token side above.
-            let in_flight = w
-                .get_proofs_by_states(vec![State::Reserved, State::Pending])
-                .await?;
-            let in_flight_ys: std::collections::HashSet<_> = in_flight
-                .iter()
-                .map(|p| p.y())
-                .collect::<Result<Vec<_>, _>>()?
+
+            let mut in_flight_ys: std::collections::HashSet<cdk::nuts::PublicKey> =
+                std::collections::HashSet::new();
+            for saga in w
+                .localstore
+                .get_incomplete_sagas()
+                .await?
                 .into_iter()
-                .collect();
+                .filter(|s| matches!(s.state, cdk::wallet::types::WalletSagaState::Receive(_)))
+            {
+                for info in w.localstore.get_reserved_proofs(&saga.id).await? {
+                    in_flight_ys.insert(info.y);
+                }
+            }
             Ok::<_, cdk::Error>(in_flight_ys.intersection(&token_ys).next().is_some())
         })
         .await;
