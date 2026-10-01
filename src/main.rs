@@ -169,6 +169,7 @@ async fn main() {
                     spent_sat = summary.spent_sat,
                     partially_spent = summary.partially_spent,
                     partially_spent_unspent_sat = summary.partially_spent_unspent_sat,
+                    remainder_recovered_sat = summary.remainder_recovered_sat,
                     "migration import pass complete"
                 );
                 match migration.finish(summary) {

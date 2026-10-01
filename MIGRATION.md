@@ -207,9 +207,19 @@ failed and none is unsettled; otherwise it stays in place and the
 
 A `PartiallySpent` journal entry carries the split as
 `{"spent_sat":N,"unspent_sat":M}` — the migration cannot import such a
-token (the mint rejects mixed spent/unspent inputs in one swap), so it
-terminates instead of retrying a doomed receive every boot. The
-`M` unspent sats are recoverable by hand:
+token whole (the mint rejects mixed spent/unspent inputs in one swap), so
+it terminates instead of retrying a doomed receive every boot.
+
+**Automatic recovery (#47, default on):** immediately after terminalizing
+the parent, the migration receives a sub-token of only the proofs the
+mint definitively reported UNSPENT (never PENDING/RESERVED/omitted) into
+the wallet. On success the journal advances to
+`RemainderImported{parent_spent_sat, remainder_sat}`; the attempt is
+one-shot per boot with a write-ahead `Pending` row, so a crash mid-attempt
+re-classifies on the next boot and recovers whatever is still unspent.
+
+**Manual fallback** (automatic recovery returned nothing or failed — the
+entry stays `PartiallySpent`):
 
 1. The full token string is retained in `migration-journal.jsonl` (and
    `tokens.jsonl`).
@@ -219,9 +229,10 @@ terminates instead of retrying a doomed receive every boot. The
 3. Import that remainder token via the CLI (`migrate` with a one-line
    tokens file, or directly into another wallet).
 
-The CLI `status` command surfaces `partially_spent` and
-`partially_spent_unspent_sat` so the operator can audit outstanding
-remainders at any time.
+The CLI `status` command surfaces `partially_spent`,
+`partially_spent_unspent_sat` (still outstanding) and
+`remainder_recovered_sat` (recovered automatically) so the operator can
+audit remainders at any time.
 
 ---
 

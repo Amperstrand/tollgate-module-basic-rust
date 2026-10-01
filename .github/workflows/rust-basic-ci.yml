@@ -10,6 +10,29 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  exporter-hygiene:
+    name: gonuts-export hygiene (#36/#49)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout tollgate-module-basic-rust
+        uses: actions/checkout@v4
+
+      - name: Compiled exporter must stay untracked
+        run: |
+          tracked="$(git ls-files tools/gonuts-export/gonuts-export)"
+          if [ -n "$tracked" ]; then
+            echo "::error::tools/gonuts-export/gonuts-export is tracked again — build it from source instead (MIGRATION.md Step 0)"
+            exit 1
+          fi
+
+      - name: Documented build step works (MIGRATION.md Step 0)
+        run: |
+          cd tools/gonuts-export
+          CGO_ENABLED=0 go build -o gonuts-export .
+          ./gonuts-export 2>&1 | head -2 || true
+          go test ./...
+
   rust-basic-tests:
     name: Rust basic + PRTA tests
     runs-on: ubuntu-latest

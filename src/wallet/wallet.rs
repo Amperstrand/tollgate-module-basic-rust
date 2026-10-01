@@ -660,6 +660,83 @@ impl TollWallet {
         }
     }
 
+    /// One-shot recovery of a partially-spent token's unspent remainder
+    /// (#47): NUT-07 per-proof, then receive ONLY the definitively-UNSPENT
+    /// proofs as a fresh sub-token. Proofs the mint reported SPENT,
+    /// PENDING/RESERVED, or omitted from its answer are excluded — only an
+    /// answered UNSPENT proof may move. `Ok(None)` when nothing is
+    /// recoverable right now (caller keeps its terminal classification and
+    /// the manual runbook applies).
+    pub async fn receive_unspent_remainder(
+        &self,
+        token_str: &str,
+    ) -> Result<Option<u64>, WalletError> {
+        use cdk::nuts::nut07::State;
+        use cdk::nuts::{KeySetInfo, Token as NutToken};
+        use cdk::wallet::types::KeysetLoadPolicy;
+
+        let token: CdkToken = token_str
+            .parse()
+            .map_err(|e| WalletError::TokenParse(format!("{e}")))?;
+        let mint_url = token
+            .mint_url()
+            .map_err(|e| WalletError::TokenParse(format!("{e}")))?
+            .to_string();
+        let normalized = canonical_mint_url(&mint_url);
+        let wallet = self
+            .wallets
+            .get(normalized.as_str())
+            .ok_or_else(|| WalletError::WalletNotFound(normalized.to_string()))?
+            .clone();
+
+        // Build the sub-token under the wallet lock; the receive itself
+        // runs through the normal money path (own lock, own recovery).
+        let result = timeout(OP_TIMEOUT, async {
+            let w = wallet.lock().await;
+            let keysets = w.keysets(KeysetLoadPolicy::default()).await?;
+            let keyset_infos: Vec<KeySetInfo> = keysets
+                .iter()
+                .map(|ks| KeySetInfo {
+                    id: ks.id,
+                    unit: ks.unit.clone(),
+                    active: ks.active.unwrap_or(true),
+                    input_fee_ppk: ks.input_fee_ppk,
+                    final_expiry: ks.final_expiry,
+                })
+                .collect();
+            let proofs = token.proofs(&keyset_infos)?;
+            let states = w.check_proofs_spent(proofs.clone()).await?;
+            let answered: std::collections::HashSet<cdk::nuts::PublicKey> =
+                states.iter().map(|s| s.y).collect();
+            let blocked: std::collections::HashSet<cdk::nuts::PublicKey> = states
+                .iter()
+                .filter(|s| s.state != State::Unspent)
+                .map(|s| s.y)
+                .collect();
+            let unspent: Vec<_> = proofs
+                .into_iter()
+                .filter(|p| {
+                    p.y()
+                        .map(|y| answered.contains(&y) && !blocked.contains(&y))
+                        .unwrap_or(false)
+                })
+                .collect();
+            if unspent.is_empty() {
+                return Ok::<_, cdk::Error>(None);
+            }
+            let sub = NutToken::new(w.mint_url.clone(), unspent, None, w.unit.clone());
+            Ok(Some(sub.to_string()))
+        })
+        .await;
+
+        match result {
+            Ok(Ok(Some(sub_token))) => self.receive(&sub_token).await.map(Some),
+            Ok(Ok(None)) => Ok(None),
+            Ok(Err(e)) => Err(WalletError::Cdk(e)),
+            Err(_) => Err(WalletError::Timeout(OP_TIMEOUT)),
+        }
+    }
+
     /// Send tokens (maps gonuts `Send`).
     /// Returns the serialized Cashu V4 token string.
     pub async fn send(
