@@ -228,6 +228,9 @@ impl PayoutRoutine {
         profit_shares: &[ProfitShareEntry],
         wallet: &TollWallet,
     ) {
+        // Flash-wear guard (Codex P2 on #45): the journal grows by ~2 lines
+        // per payout; compact to last-per-id past 4096 lines.
+        let _ = crate::payout_journal::compact_if_large(&crate::config::config_dir(), 4096);
         // Get per-mint balance.
         let balances = match wallet.get_balance_by_mint().await {
             Ok(b) => b,
@@ -342,7 +345,6 @@ impl PayoutRoutine {
         // one permanently-failing owner melt blocked every maintainer
         // forever. Only a DEFINITIVE owner failure aborts (e-cash retained,
         // retried next tick with a fresh invoice).
-        let mut owner_ambiguous = false;
         let owner_paid = if let Some(ref ln_addr) = owner.lightning_address {
             let tolerance_amount = owner.amount * config.balance_tolerance_percent / 100;
             let max_cost = owner.amount + tolerance_amount;
@@ -359,13 +361,16 @@ impl PayoutRoutine {
                 MeltResult::Paid { .. } => true,
                 MeltResult::AlreadyDone { .. } => true,
                 MeltResult::AmbiguousSkipped { .. } => {
-                    owner_ambiguous = true;
                     tracing::error!(
                         mint = %config.mint_url,
                         identity = %owner.identity,
-                        "owner payout AMBIGUOUS — continuing maintainer payouts; owner outcome is surfaced and journaled, never blind-retried"
+                        "owner payout AMBIGUOUS — deferring maintainer payouts one tick: if the owner melt is compensated, the full balance returns and the next plan recomputes the exact split; paying maintainers now would permanently skew it (Codex P1 on #45). Owner outcome is journaled and surfaced, never blind-retried"
                     );
-                    false
+                    return PayoutOutcome::Completed {
+                        owner_paid: false,
+                        maintainers_reached: vec![],
+                        maintainers_failed: vec![],
+                    };
                 }
                 MeltResult::Failed { reason, .. } => {
                     tracing::error!(
@@ -384,7 +389,6 @@ impl PayoutRoutine {
         } else {
             false
         };
-        let _ = owner_ambiguous; // surfaced via the error log above
 
         // Phase 3: Pay remaining reachable maintainers.
         let mut maintainers_reached = Vec::new();
@@ -596,26 +600,30 @@ pub(crate) async fn journalled_melt(
             MeltResult::AmbiguousSkipped { invoice }
         }
         Err(e) => {
-            tracing::error!(mint_url, identity, error = %e, "melt failed");
-            // A failed terminal append leaves only the intent durable —
-            // the next tick surfaces it (never re-melts the same
-            // invoice), which is the safe reading of an unknown outcome
-            // (Codex P2 on #45). Surface the append failure loudly.
+            // Every error FROM the melt call is ambiguous (Codex P1 on
+            // #45, round 3): a connection reset after confirm() started
+            // surfaces as a Cdk error, not a Timeout — the invoice may
+            // have been paid. Failed is reserved for failures provably
+            // BEFORE value movement (no wallet / journal unavailable,
+            // handled above). The durable ambiguity keeps this invoice
+            // surfaced; a fresh-invoice attempt lands on a new key, so
+            // liveness is preserved without ever risking a double pay.
+            tracing::error!(
+                mint_url,
+                identity,
+                error = %e,
+                "melt errored — outcome treated as AMBIGUOUS (payment may have fired); journaling ambiguity, never re-melting this invoice"
+            );
             if journal_terminal(
                 cfg_dir,
                 &intent,
-                crate::payout_journal::PayoutPhase::Failed {
-                    reason: e.to_string(),
-                },
+                crate::payout_journal::PayoutPhase::Ambiguous,
             )
             .is_err()
             {
-                tracing::error!("CRITICAL: melt failed AND its terminal journal append failed — the durable intent will keep this invoice surfaced on later ticks");
+                tracing::error!("CRITICAL: melt errored AND its terminal journal append failed — the durable intent keeps this invoice surfaced");
             }
-            MeltResult::Failed {
-                invoice,
-                reason: e.to_string(),
-            }
+            MeltResult::AmbiguousSkipped { invoice }
         }
     }
 }

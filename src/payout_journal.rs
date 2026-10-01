@@ -200,6 +200,53 @@ pub fn decide(
     }
 }
 
+/// Rewrite the journal to the last entry per id once it grows past
+/// `threshold_lines` (atomic tmp+rename+dirsync). Successful LNURL
+/// payouts use a fresh invoice id every tick, so the append-only file
+/// grows without bound on a long-running router (Codex P2 on #45);
+/// last-per-id is exactly the reconcile-relevant state.
+pub fn compact_if_large(dir: &Path, threshold_lines: usize) -> std::io::Result<bool> {
+    let entries = read_journal(dir);
+    if entries.len() <= threshold_lines {
+        return Ok(false);
+    }
+    let folded: Vec<PayoutEntry> = {
+        let mut ordered: Vec<PayoutEntry> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for e in entries.into_iter().rev() {
+            if seen.insert(e.id.clone()) {
+                ordered.push(e);
+            }
+        }
+        ordered.reverse();
+        ordered
+    };
+    let path = journal_path(dir);
+    let tmp = path.with_extension("tmp");
+    let mut body = String::new();
+    for e in &folded {
+        body.push_str(&serde_json::to_string(e).map_err(std::io::Error::other)?);
+        body.push('\n');
+    }
+    std::fs::write(&tmp, body.as_bytes())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+    }
+    std::fs::rename(&tmp, &path)?;
+    if let Some(parent) = path.parent() {
+        if let Ok(dirf) = std::fs::File::open(parent) {
+            let _ = dirf.sync_all();
+        }
+    }
+    tracing::info!(
+        kept = folded.len(),
+        "payout journal compacted to last entry per id"
+    );
+    Ok(true)
+}
+
 /// Operator summary for CLI `status`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PayoutsSummary {
