@@ -584,22 +584,34 @@ pub(crate) async fn journalled_melt(
                 timeout_secs = d.as_secs(),
                 "melt timed out — PAYMENT MAY HAVE BEEN PAID; saga reconciling automatically; journal records ambiguity; remaining payouts continue"
             );
-            let _ = journal_terminal(
+            if journal_terminal(
                 cfg_dir,
                 &intent,
                 crate::payout_journal::PayoutPhase::Ambiguous,
-            );
+            )
+            .is_err()
+            {
+                tracing::error!("CRITICAL: melt ambiguous AND its terminal journal append failed — the durable intent keeps this invoice surfaced");
+            }
             MeltResult::AmbiguousSkipped { invoice }
         }
         Err(e) => {
             tracing::error!(mint_url, identity, error = %e, "melt failed");
-            let _ = journal_terminal(
+            // A failed terminal append leaves only the intent durable —
+            // the next tick surfaces it (never re-melts the same
+            // invoice), which is the safe reading of an unknown outcome
+            // (Codex P2 on #45). Surface the append failure loudly.
+            if journal_terminal(
                 cfg_dir,
                 &intent,
                 crate::payout_journal::PayoutPhase::Failed {
                     reason: e.to_string(),
                 },
-            );
+            )
+            .is_err()
+            {
+                tracing::error!("CRITICAL: melt failed AND its terminal journal append failed — the durable intent will keep this invoice surfaced on later ticks");
+            }
             MeltResult::Failed {
                 invoice,
                 reason: e.to_string(),

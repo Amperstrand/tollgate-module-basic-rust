@@ -102,10 +102,12 @@ pub fn append_entry(dir: &Path, entry: &PayoutEntry) -> std::io::Result<()> {
     }
     f.write_all(line.as_bytes())?;
     f.sync_all()?;
+    // The directory entry must be durable or a first-created journal can
+    // vanish with the file on power loss (Codex P2 on #45) — propagate
+    // the failure so callers never believe a non-durable intent.
     if let Some(parent) = path.parent() {
-        if let Ok(dirf) = std::fs::File::open(parent) {
-            let _ = dirf.sync_all();
-        }
+        let dirf = std::fs::File::open(parent)?;
+        dirf.sync_all()?;
     }
     Ok(())
 }
@@ -211,7 +213,12 @@ pub fn summarize(dir: &Path) -> PayoutsSummary {
     for (_, e) in fold_last(&read_journal(dir)) {
         s.total += 1;
         match e.phase {
-            PayoutPhase::Paid | PayoutPhase::Resolved => s.paid_sat += e.amount_sat,
+            // Only Paid counts as paid: Resolved is a settled AMBIGUITY
+            // that may have been compensated — counting it as paid would
+            // overstate what recipients actually received (Codex P2 on
+            // #45). It stays visible via `total`.
+            PayoutPhase::Paid => s.paid_sat += e.amount_sat,
+            PayoutPhase::Resolved => {}
             PayoutPhase::Ambiguous => s.ambiguous += 1,
             _ => {}
         }

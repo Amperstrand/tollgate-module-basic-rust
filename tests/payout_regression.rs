@@ -153,3 +153,20 @@ fn summarize_and_last_for() {
     let s = summarize(dir.path());
     assert_eq!((s.total, s.ambiguous, s.paid_sat), (1, 0, 100));
 }
+
+#[test]
+fn resolved_ambiguity_is_visible_but_not_counted_paid() {
+    // Codex P2 on #45: Resolved may have been compensated — it must not
+    // inflate paid_sat, but it stays visible in total.
+    let dir = tempfile::tempdir().unwrap();
+    append_entry(
+        dir.path(),
+        &PayoutEntry {
+            phase: PayoutPhase::Resolved,
+            ..entry("a", PayoutPhase::Resolved, true)
+        },
+    )
+    .unwrap();
+    let s = summarize(dir.path());
+    assert_eq!((s.total, s.paid_sat, s.ambiguous), (1, 0, 0));
+}
