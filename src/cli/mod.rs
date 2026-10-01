@@ -764,6 +764,7 @@ mod tests {
         assert!(json["message"].is_string());
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn wallet_fund_journals_intent_and_ambiguous_outcome() {
         // #46: CLI fund entries hit the payment journal — durable intent
@@ -784,6 +785,7 @@ mod tests {
             body.contains("timeout-unknown"),
             "receive errors are journaled ambiguous, not failed: {body}"
         );
+        std::env::remove_var("TOLLGATE_TEST_CONFIG_DIR");
     }
 
     #[tokio::test]
@@ -876,6 +878,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    #[serial_test::serial]
     async fn test_config_set_writes_to_disk() {
         let dir = tempfile::TempDir::new().unwrap();
         std::env::set_var("TOLLGATE_TEST_CONFIG_DIR", dir.path());
