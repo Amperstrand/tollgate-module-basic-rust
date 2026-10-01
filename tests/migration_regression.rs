@@ -19,6 +19,11 @@ struct FakeSink {
     partial: HashMap<String, (u64, u64)>,
     /// Tokens whose proofs are PENDING/RESERVED at the mint.
     indeterminate: std::collections::HashSet<String>,
+    /// token -> remainder recovery answer (#47).
+    remainder: HashMap<String, Option<u64>>,
+    /// When set, remainder recovery errors.
+    remainder_err: bool,
+    remainder_calls: std::sync::Mutex<Vec<String>>,
     /// token -> receive result.
     receive: HashMap<String, Rx>,
     /// When set, every NUT-07 pre-check errors (mint unreachable).
@@ -57,6 +62,21 @@ impl TokenSink for FakeSink {
         _token: &str,
     ) -> Result<Option<u64>, tollgate_module_basic_rust::wallet::WalletError> {
         Ok(None)
+    }
+
+    async fn receive_unspent_remainder(
+        &self,
+        token: &str,
+    ) -> Result<Option<u64>, tollgate_module_basic_rust::wallet::WalletError> {
+        use tollgate_module_basic_rust::wallet::WalletError;
+        self.remainder_calls
+            .lock()
+            .unwrap()
+            .push(format!("remainder:{token}"));
+        if self.remainder_err {
+            return Err(WalletError::Timeout(std::time::Duration::from_secs(30)));
+        }
+        Ok(self.remainder.get(token).copied().flatten())
     }
 
     async fn check_tokens_spent(
@@ -259,6 +279,152 @@ async fn partially_spent_token_is_terminal_not_retriable_failed() {
         .unwrap()
         .iter()
         .any(|c| c.starts_with("receive:")));
+}
+
+/// #47: a partially-spent token's unspent remainder is recovered
+/// automatically — one-shot, journaled terminally, converged on re-runs.
+#[tokio::test]
+async fn partially_spent_remainder_recovered_automatically() {
+    let dir = tempfile::tempdir().unwrap();
+    let m = setup(dir.path(), &["cashuA1"]);
+
+    let sink = FakeSink {
+        partial: [("cashuA1".to_string(), (4u64, 6u64))]
+            .into_iter()
+            .collect(),
+        remainder: [("cashuA1".to_string(), Some(6u64))].into_iter().collect(),
+        ..Default::default()
+    };
+    let summary = m.import_tokens(&sink).await.unwrap();
+    assert_eq!(summary.remainder_recovered_sat, 6);
+    assert_eq!(
+        summary.partially_spent_unspent_sat, 0,
+        "outstanding remainder cleared"
+    );
+    assert_eq!(summary.partially_spent, 1);
+
+    // The parent was never resubmitted whole; exactly one remainder attempt.
+    let calls = sink.calls.lock().unwrap().clone();
+    assert!(
+        !calls.iter().any(|c| c.starts_with("receive:")),
+        "{calls:?}"
+    );
+    let rcalls = sink.remainder_calls.lock().unwrap().clone();
+    assert_eq!(rcalls, vec!["remainder:cashuA1"]);
+
+    // Fold-last is the terminal remainder outcome; the journal also carries
+    // the write-ahead Pending between the two terminal rows.
+    let entries = read_journal(dir.path());
+    let outcomes: Vec<_> = entries.iter().map(|e| &e.outcome).collect();
+    assert_eq!(
+        outcomes[0],
+        &TokenOutcome::PartiallySpent {
+            spent_sat: 4,
+            unspent_sat: 6
+        }
+    );
+    assert_eq!(outcomes[1], &TokenOutcome::Pending);
+    assert_eq!(
+        outcomes.last(),
+        Some(&&TokenOutcome::RemainderImported {
+            parent_spent_sat: 4,
+            remainder_sat: 6
+        })
+    );
+
+    // Completion unblocked; re-runs never re-attempt.
+    assert_eq!(
+        m.finish(summary).unwrap(),
+        tollgate_module_basic_rust::migration::MigrationFinish::Complete
+    );
+    let sink2 = FakeSink::default();
+    let summary2 = m.import_tokens(&sink2).await.unwrap();
+    assert_eq!(
+        summary2.remainder_recovered_sat, 6,
+        "skip-arm replays the recovered total"
+    );
+    assert!(sink2.remainder_calls.lock().unwrap().is_empty());
+    assert!(sink2.batch_calls.lock().unwrap().is_empty());
+}
+
+/// #47 failure modes stay one-shot and never loop: Ok(None) and Err both
+/// re-state the terminal PartiallySpent (manual runbook applies), and a
+/// crash mid-attempt (fold-last = Pending) re-classifies on the next boot.
+#[tokio::test]
+async fn remainder_recovery_failures_are_one_shot() {
+    for (name, sink) in [
+        (
+            "none-recoverable",
+            FakeSink {
+                partial: [("cashuA1".to_string(), (4u64, 6u64))]
+                    .into_iter()
+                    .collect(),
+                remainder: [("cashuA1".to_string(), None)].into_iter().collect(),
+                ..Default::default()
+            },
+        ),
+        (
+            "attempt-failed",
+            FakeSink {
+                partial: [("cashuA1".to_string(), (4u64, 6u64))]
+                    .into_iter()
+                    .collect(),
+                remainder_err: true,
+                ..Default::default()
+            },
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let m = setup(dir.path(), &["cashuA1"]);
+        let summary = m.import_tokens(&sink).await.unwrap();
+        assert_eq!(summary.remainder_recovered_sat, 0, "{name}");
+        assert_eq!(summary.partially_spent_unspent_sat, 6, "{name}");
+        assert_eq!(
+            fold_last(&read_journal(dir.path())).get("cashuA1"),
+            Some(&TokenOutcome::PartiallySpent {
+                spent_sat: 4,
+                unspent_sat: 6
+            }),
+            "{name}: terminal re-stated"
+        );
+        // Second boot: terminal, no further attempts.
+        let sink2 = FakeSink::default();
+        m.import_tokens(&sink2).await.unwrap();
+        assert!(sink2.remainder_calls.lock().unwrap().is_empty(), "{name}");
+    }
+
+    // Crash mid-attempt: the journal folds to Pending, so the next boot
+    // re-classifies fresh — the still-unspent remainder is attempted again.
+    let dir = tempfile::tempdir().unwrap();
+    let m = setup(dir.path(), &["cashuA1"]);
+    write_journal(
+        dir.path(),
+        &[
+            JournalEntry {
+                token: "cashuA1".to_string(),
+                outcome: TokenOutcome::PartiallySpent {
+                    spent_sat: 4,
+                    unspent_sat: 6,
+                },
+            },
+            JournalEntry {
+                token: "cashuA1".to_string(),
+                outcome: TokenOutcome::Pending,
+            },
+        ],
+    );
+    let sink = FakeSink {
+        partial: [("cashuA1".to_string(), (4u64, 4u64))]
+            .into_iter()
+            .collect(),
+        remainder: [("cashuA1".to_string(), Some(4u64))].into_iter().collect(),
+        ..Default::default()
+    };
+    let summary = m.import_tokens(&sink).await.unwrap();
+    assert_eq!(
+        summary.remainder_recovered_sat, 4,
+        "crash window converges on the remainder that is still unspent"
+    );
 }
 
 /// Codex P2 on #42: a tokens file containing the same line twice (manual

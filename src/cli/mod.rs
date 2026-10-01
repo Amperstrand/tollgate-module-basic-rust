@@ -309,6 +309,7 @@ async fn handle_command(cmd: &str, state: &AppState) -> String {
                     "spent_sat": m.spent_sat,
                     "partially_spent": m.partially_spent,
                     "partially_spent_unspent_sat": m.partially_spent_unspent_sat,
+                    "remainder_recovered_sat": m.remainder_recovered_sat,
                     "settled": m.is_settled(),
                 },
                 "payments": {
