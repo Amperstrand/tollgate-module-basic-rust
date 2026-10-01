@@ -15,6 +15,7 @@ pub mod monitor;
 pub mod nostr_event;
 pub mod payment_journal;
 pub mod payout;
+pub mod payout_journal;
 pub mod portal;
 pub mod rate_limiter;
 pub mod reseller;

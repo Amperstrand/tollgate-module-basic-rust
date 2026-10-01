@@ -567,6 +567,27 @@ impl TollWallet {
     /// Local SQLite query (no network): the migration reconciliation gate
     /// works even when the mint is unreachable (AGENTS.md: ambiguous results
     /// are reconciled, not retried).
+    /// Whether the mint's wallet still holds an incomplete MELT saga —
+    /// i.e. a payout melt whose Lightning outcome is still being settled
+    /// by CDK's recovery. Local query (issue #41): used by the payout
+    /// journal to decide whether an ambiguous melt may advance.
+    pub async fn mint_has_unresolved_melt(&self, mint_url: &str) -> Result<bool, WalletError> {
+        let normalized = canonical_mint_url(mint_url);
+        let wallet = match self.wallets.get(normalized.as_str()) {
+            Some(w) => w.clone(),
+            None => return Ok(false),
+        };
+        let w = wallet.lock().await;
+        let sagas = w
+            .localstore
+            .get_incomplete_sagas()
+            .await
+            .map_err(|e| WalletError::Database(e.to_string()))?;
+        Ok(sagas
+            .into_iter()
+            .any(|s| matches!(s.state, cdk::wallet::types::WalletSagaState::Melt(_))))
+    }
+
     pub async fn mint_has_unresolved_receive(&self, token_str: &str) -> Result<bool, WalletError> {
         use cdk::nuts::KeySetInfo;
         use cdk::wallet::types::KeysetLoadPolicy;
@@ -839,7 +860,14 @@ impl TollWallet {
                 amount: quote.amount.into(),
                 fee: quote.fee_reserve.into(),
             }),
-            Ok(Err(e)) => Err(e),
+            Ok(Err(e)) => {
+                // A CDK error after confirm() started (connection reset
+                // mid-melt) is as ambiguous as a timeout — the payment may
+                // have fired. Trigger the same in-session saga recovery
+                // (Codex P1 on #45): the melt quote state settles it.
+                self.spawn_saga_recovery(&normalized);
+                Err(e)
+            }
             Err(_) => {
                 self.spawn_saga_recovery(&normalized);
                 Err(WalletError::Timeout(OP_TIMEOUT))

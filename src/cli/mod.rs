@@ -297,6 +297,7 @@ async fn handle_command(cmd: &str, state: &AppState) -> String {
         "status" => {
             let m = crate::migration::summarize_state(&config::config_dir());
             let p = crate::payment_journal::summarize(&config::config_dir());
+            let po = crate::payout_journal::summarize(&config::config_dir());
             serde_json::json!({
                 "success": true,
                 "message": "running",
@@ -315,6 +316,11 @@ async fn handle_command(cmd: &str, state: &AppState) -> String {
                     "total": p.total,
                     "needs_reconciliation": p.needs_reconciliation,
                     "received_sat": p.received_sat,
+                },
+                "payouts": {
+                    "total": po.total,
+                    "paid_sat": po.paid_sat,
+                    "ambiguous": po.ambiguous,
                 }
             })
             .to_string()
