@@ -502,6 +502,7 @@ pub(crate) async fn journalled_melt(
             cfg_dir,
             &crate::payout_journal::PayoutEntry {
                 id: id.clone(),
+                token: None,
                 ts: now_secs(),
                 mint: mint.clone(),
                 identity: identity.to_string(),
@@ -532,6 +533,7 @@ pub(crate) async fn journalled_melt(
     let intent = crate::payout_journal::PayoutEntry {
         id,
         ts: now_secs(),
+        token: None,
         mint: mint.clone(),
         identity: identity.to_string(),
         invoice: invoice.clone(),
@@ -814,6 +816,7 @@ mod tests {
             dir.path(),
             &crate::payout_journal::PayoutEntry {
                 id: crate::payout_journal::entry_id(mint, "owner", invoice),
+                token: None,
                 ts: 1,
                 mint: mint.to_string(),
                 identity: "owner".to_string(),
@@ -864,6 +867,7 @@ mod tests {
             dir.path(),
             &crate::payout_journal::PayoutEntry {
                 id: crate::payout_journal::entry_id(mint, "owner", invoice),
+                token: None,
                 ts: 1,
                 mint: mint.to_string(),
                 identity: "owner".to_string(),

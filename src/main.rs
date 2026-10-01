@@ -20,6 +20,23 @@ async fn reconcile_payments_once(state: &Arc<http::AppState>) {
         payment_journal::reconcile(&cfg_dir, wallet).await
     };
     for (entry, amount_sat) in grants {
+        // CLI fund entries (#46) owe no session/gate: the value lands in
+        // the wallet via the same saga recovery; the operator sees the
+        // balance. Advance the journal and continue.
+        if entry.mac == payment_journal::CLI_FUND_MAC {
+            let _ = payment_journal::append_entry(
+                &cfg_dir,
+                &payment_journal::PaymentEntry {
+                    phase: payment_journal::PaymentPhase::ReconcileSpent { amount_sat },
+                    ..entry.clone()
+                },
+            );
+            tracing::info!(
+                amount_sat,
+                "reconciled CLI fund: value recovered into the wallet (no session owed)"
+            );
+            continue;
+        }
         // Grant from the pricing facts frozen at intent time (Codex P2 on
         // #43), not current config.
         let steps = amount_sat / entry.price_per_step.max(1);

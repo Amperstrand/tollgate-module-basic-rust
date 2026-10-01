@@ -571,6 +571,27 @@ impl TollWallet {
     /// i.e. a payout melt whose Lightning outcome is still being settled
     /// by CDK's recovery. Local query (issue #41): used by the payout
     /// journal to decide whether an ambiguous melt may advance.
+    /// Whether the mint's wallet still holds an incomplete SEND saga —
+    /// e.g. a CLI drain whose output token may have been created without
+    /// being delivered. Local query (issue #46): the drain path consults
+    /// it before re-issuing, mirroring the melt gate from #45.
+    pub async fn mint_has_unresolved_send(&self, mint_url: &str) -> Result<bool, WalletError> {
+        let normalized = canonical_mint_url(mint_url);
+        let wallet = match self.wallets.get(normalized.as_str()) {
+            Some(w) => w.clone(),
+            None => return Ok(false),
+        };
+        let w = wallet.lock().await;
+        let sagas = w
+            .localstore
+            .get_incomplete_sagas()
+            .await
+            .map_err(|e| WalletError::Database(e.to_string()))?;
+        Ok(sagas
+            .into_iter()
+            .any(|s| matches!(s.state, cdk::wallet::types::WalletSagaState::Send(_))))
+    }
+
     pub async fn mint_has_unresolved_melt(&self, mint_url: &str) -> Result<bool, WalletError> {
         let normalized = canonical_mint_url(mint_url);
         let wallet = match self.wallets.get(normalized.as_str()) {

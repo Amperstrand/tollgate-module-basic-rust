@@ -39,6 +39,13 @@ use crate::wallet::WalletError;
 
 pub const PAYMENT_JOURNAL_NAME: &str = "payment-journal.jsonl";
 
+/// MAC marker for CLI `wallet fund` entries (#46): a receive initiated by
+/// the operator, not a customer payment. Real client MACs are hex-colon
+/// strings, so this can never collide. Reconciliation advances these like
+/// any payment but owes no session/gate — the value lands in the wallet
+/// via the same saga recovery; the operator sees it in the balance.
+pub const CLI_FUND_MAC: &str = "cli-fund";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "phase", rename_all = "kebab-case")]
 pub enum PaymentPhase {
