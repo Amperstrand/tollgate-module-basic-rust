@@ -85,6 +85,56 @@ pub fn canonical_mint_url(url: &str) -> String {
         .unwrap_or_else(|_| trimmed.to_string())
 }
 
+/// Pure NUT-07 classification of one token from per-proof mint states.
+///
+/// Y = hash_to_curve(secret), so no keyset resolution is needed. A proof
+/// absent from the mint's response is treated as Indeterminate (deferred),
+/// never as silently unspent.
+fn classify_spend_state(
+    pairs: &[(cdk::Amount, cdk::secret::Secret)],
+    amount_sat: u64,
+    spent_ys: &std::collections::HashSet<cdk::nuts::PublicKey>,
+    pending_ys: &std::collections::HashSet<cdk::nuts::PublicKey>,
+    answered_ys: &std::collections::HashSet<cdk::nuts::PublicKey>,
+) -> Result<crate::migration::TokenSpendState, WalletError> {
+    use crate::migration::TokenSpendState;
+    use cdk::dhke::hash_to_curve;
+
+    if pairs.is_empty() {
+        return Err(WalletError::TokenParse("token has no proofs".into()));
+    }
+    let token_ys: Vec<Option<cdk::nuts::PublicKey>> = pairs
+        .iter()
+        .map(|(_, secret)| hash_to_curve(secret.as_bytes()).ok())
+        .collect();
+    let unanswerable = token_ys.iter().any(|y| match y {
+        Some(y) => !answered_ys.contains(y),
+        None => true,
+    });
+    let spent_sat: u64 = token_ys
+        .iter()
+        .zip(pairs.iter().map(|(amount, _)| u64::from(*amount)))
+        .filter(|(y, _)| matches!(y, Some(y) if spent_ys.contains(y)))
+        .map(|(_, amount)| amount)
+        .sum();
+    let has_pending = token_ys
+        .iter()
+        .any(|y| matches!(y, Some(y) if pending_ys.contains(y)));
+
+    if unanswerable || has_pending {
+        Ok(TokenSpendState::Indeterminate)
+    } else if spent_sat == amount_sat {
+        Ok(TokenSpendState::AllSpent { amount_sat })
+    } else if spent_sat == 0 {
+        Ok(TokenSpendState::Unspent)
+    } else {
+        Ok(TokenSpendState::PartiallySpent {
+            spent_sat,
+            unspent_sat: amount_sat - spent_sat,
+        })
+    }
+}
+
 /// Per-proof (face value, secret) pairs from a token, V3/V4 agnostic and
 /// keyset-free — the inputs for NUT-07 spend classification.
 fn token_proof_amounts_secrets(token: &CdkToken) -> Vec<(cdk::Amount, cdk::secret::Secret)> {
@@ -205,7 +255,7 @@ impl TollWallet {
     /// operation must not move value over unreconciled state, so the
     /// recovery error aborts the money move with a distinct, observable
     /// cause (issue #33).
-    async fn recover_before_op(w: &Wallet, op: &str) -> Result<(), WalletError> {
+    async fn recover_before_op(w: &Wallet, op: &str, withdrawal: bool) -> Result<(), WalletError> {
         let report = w
             .recover_incomplete_sagas()
             .await
@@ -229,6 +279,21 @@ impl TollWallet {
             return Err(WalletError::SagaRecovery(format!(
                 "{op}: recovery left {} failed and {} skipped saga(s) unresolved; refusing to move value over unreconciled wallet state",
                 report.failed, report.skipped
+            )));
+        }
+        // Withdrawal-shaped ops (send/melt) must not replay right after
+        // recovery COMPLETED an earlier ambiguous operation of the same
+        // shape: the earlier send may already have moved tokens (or the
+        // earlier melt already paid), so an immediate fresh op doubles the
+        // caller's intent. The caller reconciles the earlier outcome against
+        // its own durable intent (payout derives a fresh invoice per cycle;
+        // CLI callers reconcile manually) and re-issues on a later call,
+        // when recovery reports no further activity. Receive/mint are
+        // replay-safe: the mint one-shots their inputs/quotes.
+        if withdrawal && (report.recovered > 0 || report.compensated > 0) {
+            return Err(WalletError::SagaRecovery(format!(
+                "{op}: recovery completed an earlier ambiguous operation (recovered {}, compensated {}); refusing an immediate replay — reconcile that outcome before re-issuing",
+                report.recovered, report.compensated
             )));
         }
         Ok(())
@@ -255,7 +320,7 @@ impl TollWallet {
 
         let result = timeout(OP_TIMEOUT, async {
             let w = wallet.lock().await;
-            Self::recover_before_op(&w, "receive").await?;
+            Self::recover_before_op(&w, "receive", false).await?;
             w.receive(token_str, ReceiveOptions::default())
                 .await
                 .map_err(WalletError::from)
@@ -373,7 +438,6 @@ impl TollWallet {
         tokens: &[String],
     ) -> HashMap<String, Result<crate::migration::TokenSpendState, WalletError>> {
         use crate::migration::TokenSpendState;
-        use cdk::dhke::hash_to_curve;
         use cdk::nuts::nut07::State;
         use cdk::nuts::{KeySetInfo, Token};
         use cdk::wallet::types::KeysetLoadPolicy;
@@ -453,45 +517,26 @@ impl TollWallet {
                         .filter(|s| matches!(s.state, State::Pending | State::Reserved))
                         .map(|s| s.y)
                         .collect();
+                    // A successful-but-incomplete NUT-07 batch (a mint that
+                    // omits proof states) is not an all-unspent answer: any
+                    // proof the mint did not speak to is an unanswered
+                    // question, and terminalizing on it could finalize over
+                    // still-moving value.
+                    let answered_ys: std::collections::HashSet<cdk::nuts::PublicKey> =
+                        states.iter().map(|s| s.y).collect();
                     for (token_str, token) in entries {
                         let amount_sat: u64 = token.value().map(|a| a.into()).unwrap_or(0);
-                        // Per-proof (face value, secret) pairs, keyset-free:
-                        // Y is hash_to_curve(secret), so classification never
-                        // needs keyset resolution.
                         let pairs = token_proof_amounts_secrets(&token);
-                        if pairs.is_empty() {
-                            out.insert(
-                                token_str,
-                                Err(WalletError::TokenParse("token has no proofs".into())),
-                            );
-                            continue;
-                        }
-                        let token_ys: Vec<cdk::nuts::PublicKey> = pairs
-                            .iter()
-                            .filter_map(|(_, secret)| hash_to_curve(secret.as_bytes()).ok())
-                            .collect();
-                        let spent_sat: u64 = token_ys
-                            .iter()
-                            .zip(pairs.iter().map(|(amount, _)| u64::from(*amount)))
-                            .filter(|(y, _)| spent_ys.contains(y))
-                            .map(|(_, amount)| amount)
-                            .sum();
-                        let has_pending = token_ys.iter().any(|y| pending_ys.contains(y));
-                        if has_pending {
-                            out.insert(token_str, Ok(TokenSpendState::Indeterminate));
-                        } else if spent_sat == amount_sat {
-                            out.insert(token_str, Ok(TokenSpendState::AllSpent { amount_sat }));
-                        } else if spent_sat == 0 {
-                            out.insert(token_str, Ok(TokenSpendState::Unspent));
-                        } else {
-                            out.insert(
-                                token_str,
-                                Ok(TokenSpendState::PartiallySpent {
-                                    spent_sat,
-                                    unspent_sat: amount_sat - spent_sat,
-                                }),
-                            );
-                        }
+                        out.insert(
+                            token_str,
+                            classify_spend_state(
+                                &pairs,
+                                amount_sat,
+                                &spent_ys,
+                                &pending_ys,
+                                &answered_ys,
+                            ),
+                        );
                     }
                 }
                 Ok(Err(e)) => {
@@ -616,7 +661,7 @@ impl TollWallet {
 
         let result = timeout(OP_TIMEOUT, async {
             let w = wallet.lock().await;
-            Self::recover_before_op(&w, "send").await?;
+            Self::recover_before_op(&w, "send", true).await?;
             let prepared = w
                 .prepare_send(Amount::from(amount_sat), opts)
                 .await
@@ -738,7 +783,7 @@ impl TollWallet {
 
         let result = timeout(OP_TIMEOUT, async {
             let w = wallet.lock().await;
-            Self::recover_before_op(&w, "mint").await?;
+            Self::recover_before_op(&w, "mint", false).await?;
             let proofs = w
                 .mint(quote_id, SplitTarget::default(), None)
                 .await
@@ -771,7 +816,7 @@ impl TollWallet {
         let invoice_owned = invoice.to_string();
         let result = timeout(OP_TIMEOUT, async {
             let w = wallet.lock().await;
-            Self::recover_before_op(&w, "melt").await?;
+            Self::recover_before_op(&w, "melt", true).await?;
             // Step 1: create melt quote
             let quote = w
                 .melt_quote(PaymentMethod::BOLT11, invoice_owned, None, None)
@@ -1058,6 +1103,159 @@ pub struct MeltQuoteInfo {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// Codex P1 on #42 (round 2): when pre-op recovery COMPLETES an earlier
+    /// ambiguous withdrawal (here: compensates a planted interrupted receive
+    /// locally), a fresh send must not replay immediately — the caller must
+    /// reconcile the earlier outcome first. Pre-fix, send proceeded to its
+    /// own swap (and failed at the dead mint); the abort is the fix.
+    #[tokio::test]
+    async fn send_refuses_replay_right_after_recovery_activity() {
+        use cdk::dhke::hash_to_curve;
+        use cdk::nuts::{nut07::State, Id, Proof};
+        use cdk::wallet::types::{
+            OperationData, ProofInfo, ReceiveOperationData, ReceiveSagaState, WalletSaga,
+            WalletSagaState,
+        };
+        use std::str::FromStr;
+
+        let tmp = TempDir::new().unwrap();
+        let mut wallet = make_test_wallet(tmp.path(), vec![]);
+        let mint = "http://127.0.0.1:1";
+        wallet.ensure_mint(mint).await.unwrap();
+
+        let mint_url = cdk::mint_url::MintUrl::from_str(mint).unwrap();
+        let saga_id = uuid::Uuid::new_v4();
+        let proof = Proof::new(
+            cdk::Amount::from(1),
+            Id::from_bytes(&[0u8, 1, 2, 3, 4, 5, 6, 7]).unwrap(),
+            cdk::secret::Secret::new("interrupted-withdrawal-adjacent-saga"),
+            cdk::nuts::PublicKey::from_str(
+                "026562efcfadc8e86d44da6a8adf80633d974302e62c850774db1fb36ff4cc7198",
+            )
+            .unwrap(),
+        );
+        let y = hash_to_curve(proof.secret.as_bytes()).unwrap();
+        {
+            let w = wallet.wallets.get(mint).unwrap().clone();
+            let guard = w.lock().await;
+            guard
+                .localstore
+                .update_proofs(
+                    vec![ProofInfo {
+                        proof,
+                        y,
+                        mint_url: mint_url.clone(),
+                        state: State::Unspent,
+                        spending_condition: None,
+                        unit: cdk::nuts::CurrencyUnit::Sat,
+                        derivation_index: None,
+                        used_by_operation: None,
+                        created_by_operation: None,
+                    }],
+                    vec![],
+                )
+                .await
+                .unwrap();
+            guard
+                .localstore
+                .reserve_proofs(vec![y], &saga_id)
+                .await
+                .unwrap();
+            guard
+                .localstore
+                .add_saga(WalletSaga::new(
+                    saga_id,
+                    WalletSagaState::Receive(ReceiveSagaState::ProofsPending),
+                    cdk::Amount::from(1),
+                    mint_url,
+                    cdk::nuts::CurrencyUnit::Sat,
+                    OperationData::Receive(ReceiveOperationData {
+                        token: None,
+                        counter_start: None,
+                        counter_end: None,
+                        amount: Some(cdk::Amount::from(1)),
+                        blinded_messages: None,
+                    }),
+                ))
+                .await
+                .unwrap();
+        }
+
+        let err = wallet.send(mint, 1, false).await.expect_err("must abort");
+        assert!(
+            matches!(err, WalletError::SagaRecovery(ref m) if m.contains("refusing an immediate replay")),
+            "expected withdrawal replay refusal, got {err:?}"
+        );
+    }
+
+    fn classifier_fixture() -> (
+        Vec<(cdk::Amount, cdk::secret::Secret)>,
+        Vec<cdk::nuts::PublicKey>,
+    ) {
+        use cdk::dhke::hash_to_curve;
+        let pairs: Vec<(cdk::Amount, cdk::secret::Secret)> = ["a", "b", "c"]
+            .iter()
+            .map(|s| (cdk::Amount::from(2), cdk::secret::Secret::new(*s)))
+            .collect();
+        let ys = pairs
+            .iter()
+            .map(|(_, s)| hash_to_curve(s.as_bytes()).unwrap())
+            .collect();
+        (pairs, ys)
+    }
+
+    /// Codex P1 on #42 (round 2): a successful-but-incomplete NUT-07 batch
+    /// must defer, never terminalize — a proof the mint did not speak to is
+    /// an unanswered question, not an unspent proof.
+    #[test]
+    fn classifier_defers_when_the_mint_omits_a_proof_state() {
+        let (pairs, ys) = classifier_fixture();
+        let spent: std::collections::HashSet<_> = [ys[0]].into_iter().collect();
+        let pending: std::collections::HashSet<_> = [].into_iter().collect();
+        // The mint answered only two of the three requested Ys.
+        let answered: std::collections::HashSet<_> = [ys[0], ys[1]].into_iter().collect();
+        assert_eq!(
+            classify_spend_state(&pairs, 6, &spent, &pending, &answered).unwrap(),
+            crate::migration::TokenSpendState::Indeterminate
+        );
+        // Same spent set, complete answer: definitive PartiallySpent.
+        let answered_all: std::collections::HashSet<_> = ys.clone().into_iter().collect();
+        assert_eq!(
+            classify_spend_state(&pairs, 6, &spent, &pending, &answered_all).unwrap(),
+            crate::migration::TokenSpendState::PartiallySpent {
+                spent_sat: 2,
+                unspent_sat: 4
+            }
+        );
+        // Every Y answered UNSPENT elsewhere is Unspent, not Indeterminate.
+        assert_eq!(
+            classify_spend_state(&pairs, 6, &pending, &pending, &answered_all).unwrap(),
+            crate::migration::TokenSpendState::Unspent
+        );
+        // A PENDING answer defers even when everything else is spent.
+        let spent_2: std::collections::HashSet<_> = [ys[0], ys[1]].into_iter().collect();
+        let pending_1: std::collections::HashSet<_> = [ys[2]].into_iter().collect();
+        assert_eq!(
+            classify_spend_state(&pairs, 6, &spent_2, &pending_1, &answered_all).unwrap(),
+            crate::migration::TokenSpendState::Indeterminate
+        );
+        assert_eq!(
+            classify_spend_state(&pairs, 6, &spent_all(&ys), &pending_1, &answered_all).unwrap(),
+            crate::migration::TokenSpendState::Indeterminate
+        );
+        // All spent, nothing pending: terminal.
+        assert_eq!(
+            classify_spend_state(&pairs, 6, &spent_all(&ys), &pending, &answered_all).unwrap(),
+            crate::migration::TokenSpendState::AllSpent { amount_sat: 6 }
+        );
+        // Empty token cannot be classified.
+        assert!(classify_spend_state(&[], 0, &spent, &pending, &answered_all).is_err());
+    }
+
+    fn spent_all(ys: &[cdk::nuts::PublicKey]) -> std::collections::HashSet<cdk::nuts::PublicKey> {
+        ys.iter().copied().collect()
+    }
 
     fn make_test_wallet(dir: &Path, accepted_mints: Vec<String>) -> TollWallet {
         let mut seed = [0u8; 64];
