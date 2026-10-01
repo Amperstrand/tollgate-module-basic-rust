@@ -860,7 +860,14 @@ impl TollWallet {
                 amount: quote.amount.into(),
                 fee: quote.fee_reserve.into(),
             }),
-            Ok(Err(e)) => Err(e),
+            Ok(Err(e)) => {
+                // A CDK error after confirm() started (connection reset
+                // mid-melt) is as ambiguous as a timeout — the payment may
+                // have fired. Trigger the same in-session saga recovery
+                // (Codex P1 on #45): the melt quote state settles it.
+                self.spawn_saga_recovery(&normalized);
+                Err(e)
+            }
             Err(_) => {
                 self.spawn_saga_recovery(&normalized);
                 Err(WalletError::Timeout(OP_TIMEOUT))

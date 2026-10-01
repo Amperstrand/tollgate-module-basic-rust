@@ -84,7 +84,13 @@ pub fn entry_id(mint: &str, identity: &str, invoice: &str) -> String {
 /// Append + fsync (journal is 0600; contains no bearer material — the
 /// invoice identifies a payment, it cannot spend — but keep it private
 /// with the wallet's siblings for uniformity).
+/// Payout tasks for multiple mints append to one journal concurrently —
+/// appends and compaction must be serialized or a compacted snapshot can
+/// drop an intent appended after the snapshot was read (Codex P1 on #45).
+static JOURNAL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub fn append_entry(dir: &Path, entry: &PayoutEntry) -> std::io::Result<()> {
+    let _guard = JOURNAL_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let path = journal_path(dir);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -153,7 +159,19 @@ pub fn decide(
     mint_has_unresolved_melt_saga: bool,
 ) -> (MeltDecision, Option<PayoutPhase>) {
     match last {
-        None => (MeltDecision::Proceed, None),
+        None => {
+            // A fresh invoice has no journal history of its own, but an
+            // unresolved melt saga for this mint means a PRIOR payout's
+            // outcome is undecided — starting another melt from the
+            // reserved/reduced balance risks double-payment or split
+            // skew once that saga settles (Codex P1 on #45, round 4).
+            // Wait one tick; the saga settles within the recovery budget.
+            if mint_has_unresolved_melt_saga {
+                (MeltDecision::SkipSurface, None)
+            } else {
+                (MeltDecision::Proceed, None)
+            }
+        }
         Some(PayoutPhase::Intent) => {
             // Crash between intent and terminal append: the melt may or
             // may not have run, and that is indistinguishable locally.
@@ -206,6 +224,7 @@ pub fn decide(
 /// grows without bound on a long-running router (Codex P2 on #45);
 /// last-per-id is exactly the reconcile-relevant state.
 pub fn compact_if_large(dir: &Path, threshold_lines: usize) -> std::io::Result<bool> {
+    let _guard = JOURNAL_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let entries = read_journal(dir);
     if entries.len() <= threshold_lines {
         return Ok(false);
@@ -228,17 +247,23 @@ pub fn compact_if_large(dir: &Path, threshold_lines: usize) -> std::io::Result<b
         body.push_str(&serde_json::to_string(e).map_err(std::io::Error::other)?);
         body.push('\n');
     }
-    std::fs::write(&tmp, body.as_bytes())?;
+    // fsync the compacted data BEFORE the rename (Codex P2 on #45): a
+    // rename-visible but unsynced file can survive power loss empty,
+    // discarding paid/ambiguous states later ticks rely on.
+    use std::io::Write;
+    let mut f = std::fs::File::create(&tmp)?;
+    f.write_all(body.as_bytes())?;
+    f.sync_all()?;
+    drop(f);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
     }
     std::fs::rename(&tmp, &path)?;
     if let Some(parent) = path.parent() {
-        if let Ok(dirf) = std::fs::File::open(parent) {
-            let _ = dirf.sync_all();
-        }
+        let dirf = std::fs::File::open(parent)?;
+        dirf.sync_all()?;
     }
     tracing::info!(
         kept = folded.len(),

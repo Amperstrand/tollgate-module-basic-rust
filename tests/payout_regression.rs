@@ -131,6 +131,18 @@ fn paid_and_failed_semantics() {
     assert_eq!(decide(None, false, false).0, MeltDecision::Proceed);
 }
 
+/// A fresh invoice waits while ANY melt saga for the mint is unresolved
+/// (Codex P1 on #45, round 4): the prior payout's outcome is undecided,
+/// and melting from the reserved/reduced balance risks double-payment or
+/// split skew once it settles.
+#[test]
+fn fresh_invoice_waits_while_prior_saga_unresolved() {
+    let (d, _) = decide(None, false, true);
+    assert_eq!(d, MeltDecision::SkipSurface);
+    let (d, _) = decide(None, true, true);
+    assert_eq!(d, MeltDecision::SkipSurface);
+}
+
 #[test]
 fn summarize_and_last_for() {
     let dir = tempfile::tempdir().unwrap();
