@@ -67,6 +67,10 @@ pub struct PayoutEntry {
     /// true when the invoice came verbatim from config (no fresh invoice
     /// is possible on retry — ambiguity can never be safely re-attempted).
     pub literal_invoice: bool,
+    /// For SEND operations (CLI drain): the delivered token string,
+    /// recorded on success for audit. Never present for melts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
     pub phase: PayoutPhase,
 }
 

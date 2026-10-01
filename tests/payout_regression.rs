@@ -11,6 +11,7 @@ fn entry(_id: &str, phase: PayoutPhase, literal: bool) -> PayoutEntry {
     let (mint, identity, invoice) = ("https://mint.example", "owner", "lnbc1invoice");
     PayoutEntry {
         id: entry_id(mint, identity, invoice),
+        token: None,
         ts: 1,
         mint: mint.to_string(),
         identity: identity.to_string(),
@@ -213,4 +214,22 @@ fn compaction_keeps_last_per_id_beyond_threshold() {
     );
     // Below threshold: no-op.
     assert!(!compact_if_large(dir.path(), 100).unwrap());
+}
+
+#[test]
+fn drain_token_field_round_trips() {
+    // #46: successful drains record the delivered token for audit.
+    let dir = tempfile::tempdir().unwrap();
+    append_entry(
+        dir.path(),
+        &PayoutEntry {
+            token: Some("cashuAdelivered".to_string()),
+            phase: PayoutPhase::Paid,
+            ..entry("a", PayoutPhase::Paid, false)
+        },
+    )
+    .unwrap();
+    let last = read_journal(dir.path()).pop().unwrap();
+    assert_eq!(last.token.as_deref(), Some("cashuAdelivered"));
+    assert_eq!(last.phase, PayoutPhase::Paid);
 }
