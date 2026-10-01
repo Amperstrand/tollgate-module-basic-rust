@@ -81,6 +81,23 @@ pub enum PayoutOutcome {
     },
 }
 
+/// Result of one journalled melt attempt (#41).
+#[derive(Debug, Clone, PartialEq)]
+pub enum MeltResult {
+    /// The melt completed this call.
+    Paid { invoice: String },
+    /// The journal already shows this melt settled (paid/resolved) —
+    /// idempotent skip across restarts and ticks.
+    AlreadyDone { invoice: String },
+    /// A prior ambiguity that may not be re-attempted (unresolved saga or
+    /// literal invoice): this melt was NOT performed. The payout plan
+    /// must continue around it — surfacing, not blocking (#41's wedge).
+    AmbiguousSkipped { invoice: String },
+    /// Definitive failure; nothing moved (or the mint rejected before
+    /// value moved). Retriable on a later tick with a fresh invoice.
+    Failed { invoice: String, reason: String },
+}
+
 // ── PayoutRoutine ────────────────────────────────────────────────────
 
 /// Background payout routine — one task per mint.
@@ -319,18 +336,43 @@ impl PayoutRoutine {
             }
         };
 
-        // Phase 2b: Pay owner first.
+        // Phase 2b: Pay owner first. An AMBIGUOUS owner melt (timeout,
+        // unresolved saga, or retry-blocked literal invoice) surfaces but
+        // does NOT abort maintainer payouts — that abort was the #41 wedge:
+        // one permanently-failing owner melt blocked every maintainer
+        // forever. Only a DEFINITIVE owner failure aborts (e-cash retained,
+        // retried next tick with a fresh invoice).
+        let mut owner_ambiguous = false;
         let owner_paid = if let Some(ref ln_addr) = owner.lightning_address {
             let tolerance_amount = owner.amount * config.balance_tolerance_percent / 100;
             let max_cost = owner.amount + tolerance_amount;
-            match melt_to_lightning(wallet, &config.mint_url, owner.amount, max_cost, ln_addr).await
+            match melt_to_lightning(
+                wallet,
+                &config.mint_url,
+                &owner.identity,
+                owner.amount,
+                max_cost,
+                ln_addr,
+            )
+            .await
             {
-                Ok(()) => true,
-                Err(e) => {
+                MeltResult::Paid { .. } => true,
+                MeltResult::AlreadyDone { .. } => true,
+                MeltResult::AmbiguousSkipped { .. } => {
+                    owner_ambiguous = true;
                     tracing::error!(
                         mint = %config.mint_url,
-                        error = %e,
-                        "owner payout failed — aborting maintainer payouts, e-cash retained"
+                        identity = %owner.identity,
+                        "owner payout AMBIGUOUS — continuing maintainer payouts; owner outcome is surfaced and journaled, never blind-retried"
+                    );
+                    false
+                }
+                MeltResult::Failed { reason, .. } => {
+                    tracing::error!(
+                        mint = %config.mint_url,
+                        identity = %owner.identity,
+                        error = %reason,
+                        "owner payout failed definitively — aborting maintainer payouts, e-cash retained"
                     );
                     return PayoutOutcome::Completed {
                         owner_paid: false,
@@ -342,6 +384,7 @@ impl PayoutRoutine {
         } else {
             false
         };
+        let _ = owner_ambiguous; // surfaced via the error log above
 
         // Phase 3: Pay remaining reachable maintainers.
         let mut maintainers_reached = Vec::new();
@@ -353,10 +396,26 @@ impl PayoutRoutine {
             if let Some(ref ln_addr) = r.lightning_address {
                 let tolerance_amount = r.amount * config.balance_tolerance_percent / 100;
                 let max_cost = r.amount + tolerance_amount;
-                match melt_to_lightning(wallet, &config.mint_url, r.amount, max_cost, ln_addr).await
+                match melt_to_lightning(
+                    wallet,
+                    &config.mint_url,
+                    &r.identity,
+                    r.amount,
+                    max_cost,
+                    ln_addr,
+                )
+                .await
                 {
-                    Ok(()) => maintainers_reached.push(r.identity.clone()),
-                    Err(_) => maintainers_failed.push(r.identity.clone()),
+                    MeltResult::Paid { .. } | MeltResult::AlreadyDone { .. } => {
+                        maintainers_reached.push(r.identity.clone())
+                    }
+                    // Ambiguity is not this maintainer's failure to retry
+                    // blindly — it is journaled and surfaced by the melt
+                    // wrapper; this tick reports it as not-reached.
+                    MeltResult::AmbiguousSkipped { .. } => {
+                        maintainers_failed.push(r.identity.clone())
+                    }
+                    MeltResult::Failed { .. } => maintainers_failed.push(r.identity.clone()),
                 }
             }
         }
@@ -378,79 +437,224 @@ async fn probe_lnurl_reachability(lightning_address: &str, _amount_sats: u64) ->
 async fn melt_to_lightning(
     wallet: Option<&TollWallet>,
     mint_url: &str,
+    identity: &str,
     amount_sats: u64,
     _max_cost_sats: u64,
     lightning_address: &str,
-) -> Result<(), crate::error::PayoutError> {
-    let wallet = wallet.ok_or(crate::error::PayoutError::NoWallet)?;
-
-    let bolt11 = if lightning_address.starts_with("lnbc") {
-        lightning_address.to_string()
+) -> MeltResult {
+    let (invoice, literal_invoice) = if lightning_address.starts_with("lnbc") {
+        (lightning_address.to_string(), true)
     } else {
-        let (user, domain) = lightning_address
-            .split_once('@')
-            .ok_or(crate::error::PayoutError::InvalidAddress)?;
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()
-            .map_err(|e| crate::error::PayoutError::HttpClientBuild(e.to_string()))?;
-        let lnurl_url = format!("https://{}/.well-known/lnurlp/{}", domain, user);
-        let resp: serde_json::Value = client
-            .get(&lnurl_url)
-            .send()
-            .await
-            .map_err(|e| crate::error::PayoutError::LnurlFetch(e.to_string()))?
-            .json()
-            .await
-            .map_err(|e| crate::error::PayoutError::LnurlParse(e.to_string()))?;
-        let callback = resp
-            .get("callback")
-            .and_then(|v| v.as_str())
-            .ok_or(crate::error::PayoutError::NoCallback)?;
-        let invoice_url = format!("{}?amount={}", callback, amount_sats * 1000);
-        let invoice_resp: serde_json::Value = client
-            .get(&invoice_url)
-            .send()
-            .await
-            .map_err(|e| crate::error::PayoutError::InvoiceFetch(e.to_string()))?
-            .json()
-            .await
-            .map_err(|e| crate::error::PayoutError::InvoiceParse(e.to_string()))?;
-        invoice_resp
-            .get("pr")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .ok_or(crate::error::PayoutError::NoInvoice)?
-            .to_string()
+        match fetch_lnurl_invoice(lightning_address, amount_sats).await {
+            Ok(pr) => (pr, false),
+            Err(e) => {
+                tracing::warn!(mint_url, %lightning_address, error = %e, "LNURL invoice fetch failed");
+                return MeltResult::Failed {
+                    invoice: String::new(),
+                    reason: e,
+                };
+            }
+        }
+    };
+    journalled_melt(
+        wallet,
+        &crate::config::config_dir(),
+        mint_url,
+        identity,
+        amount_sats,
+        invoice,
+        literal_invoice,
+    )
+    .await
+}
+
+/// The journalled melt core, taking the RESOLVED invoice — the testable
+/// seam for the #41 decision table (no network, explicit journal dir).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn journalled_melt(
+    wallet: Option<&TollWallet>,
+    cfg_dir: &std::path::Path,
+    mint_url: &str,
+    identity: &str,
+    amount_sats: u64,
+    invoice: String,
+    literal_invoice: bool,
+) -> MeltResult {
+    // Journal resume decision (#41): settled melts are never repeated,
+    // ambiguities are surfaced — and never block the rest of the plan.
+    let id = crate::payout_journal::entry_id(mint_url, identity, &invoice);
+    let last = crate::payout_journal::last_for(cfg_dir, mint_url, identity, &invoice);
+    let unresolved_melt = match wallet {
+        Some(w) => w.mint_has_unresolved_melt(mint_url).await.unwrap_or(true),
+        None => false,
+    };
+    let (decision, advance) =
+        crate::payout_journal::decide(last.as_ref(), literal_invoice, unresolved_melt);
+    if let Some(phase) = advance {
+        let _ = crate::payout_journal::append_entry(
+            cfg_dir,
+            &crate::payout_journal::PayoutEntry {
+                id: id.clone(),
+                ts: now_secs(),
+                mint: mint_url.to_string(),
+                identity: identity.to_string(),
+                invoice: invoice.clone(),
+                amount_sat: amount_sats,
+                literal_invoice,
+                phase,
+            },
+        );
+    }
+    match decision {
+        crate::payout_journal::MeltDecision::SkipDone => {
+            tracing::info!(mint_url, identity, "payout melt already settled — skipping");
+            return MeltResult::AlreadyDone { invoice };
+        }
+        crate::payout_journal::MeltDecision::SkipSurface => {
+            tracing::error!(
+                mint_url,
+                identity,
+                "payout melt ambiguous (unresolved saga or literal invoice) — NOT re-attempting; surfacing for the operator; remaining payouts continue"
+            );
+            return MeltResult::AmbiguousSkipped { invoice };
+        }
+        crate::payout_journal::MeltDecision::Proceed => {}
+    }
+
+    // Durable intent BEFORE value moves (AGENTS.md money-moving rule).
+    let intent = crate::payout_journal::PayoutEntry {
+        id,
+        ts: now_secs(),
+        mint: mint_url.to_string(),
+        identity: identity.to_string(),
+        invoice: invoice.clone(),
+        amount_sat: amount_sats,
+        literal_invoice,
+        phase: crate::payout_journal::PayoutPhase::Intent,
+    };
+    if let Err(e) = crate::payout_journal::append_entry(cfg_dir, &intent) {
+        tracing::error!(error = %e, "CRITICAL: payout journal unavailable — refusing to melt with no recovery record");
+        return MeltResult::Failed {
+            invoice,
+            reason: "payout journal unavailable".into(),
+        };
+    }
+
+    let wallet = match wallet {
+        Some(w) => w,
+        None => {
+            let _ = journal_terminal(
+                cfg_dir,
+                &intent,
+                crate::payout_journal::PayoutPhase::Failed {
+                    reason: "no wallet".into(),
+                },
+            );
+            return MeltResult::Failed {
+                invoice,
+                reason: "no wallet".into(),
+            };
+        }
     };
 
-    match wallet.melt(mint_url, &bolt11).await {
+    match wallet.melt(mint_url, &invoice).await {
         Ok(_) => {
-            tracing::info!(mint_url, %lightning_address, amount_sats, "melt successful");
-            Ok(())
+            tracing::info!(mint_url, identity, amount_sats, "melt successful");
+            let _ = journal_terminal(cfg_dir, &intent, crate::payout_journal::PayoutPhase::Paid);
+            MeltResult::Paid { invoice }
         }
         Err(crate::wallet::WalletError::Timeout(d)) => {
             // The most dangerous payout ambiguity: the Lightning payment may
-            // have fired. The melt saga is being reconciled in-session
-            // (CDK's melt resume checks the quote state — a paid quote is
-            // recovered, an unpaid one compensated). Never treat this as a
-            // plain failure or blind-retry the same melt (AGENTS.md:
-            // ambiguous results are reconciled, not retried).
+            // have fired. CDK's melt saga reconciles via quote state (a paid
+            // quote is recovered, an unpaid one compensated); the journal
+            // records ambiguity so later ticks never blind-retry it.
             tracing::error!(
                 mint_url,
-                %lightning_address,
+                identity,
                 timeout_secs = d.as_secs(),
-                "melt timed out — PAYMENT MAY HAVE BEEN PAID; reconciling the saga automatically, do not retry this payout manually"
+                "melt timed out — PAYMENT MAY HAVE BEEN PAID; saga reconciling automatically; journal records ambiguity; remaining payouts continue"
             );
-            Err(crate::error::PayoutError::Melt(
-                "melt timeout — outcome unknown, reconciling".into(),
-            ))
+            let _ = journal_terminal(
+                cfg_dir,
+                &intent,
+                crate::payout_journal::PayoutPhase::Ambiguous,
+            );
+            MeltResult::AmbiguousSkipped { invoice }
         }
         Err(e) => {
-            tracing::error!(mint_url, %lightning_address, error = %e, "melt failed");
-            Err(crate::error::PayoutError::Melt(e.to_string()))
+            tracing::error!(mint_url, identity, error = %e, "melt failed");
+            let _ = journal_terminal(
+                cfg_dir,
+                &intent,
+                crate::payout_journal::PayoutPhase::Failed {
+                    reason: e.to_string(),
+                },
+            );
+            MeltResult::Failed {
+                invoice,
+                reason: e.to_string(),
+            }
         }
     }
+}
+
+async fn fetch_lnurl_invoice(lightning_address: &str, amount_sats: u64) -> Result<String, String> {
+    let (user, domain) = lightning_address
+        .split_once('@')
+        .ok_or_else(|| "invalid lightning address".to_string())?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let lnurl_url = format!("https://{}/.well-known/lnurlp/{}", domain, user);
+    let resp: serde_json::Value = client
+        .get(&lnurl_url)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .json()
+        .await
+        .map_err(|e| e.to_string())?;
+    let callback = resp
+        .get("callback")
+        .and_then(|v| v.as_str())
+        .ok_or("no callback in lnurlp response")?;
+    let invoice_url = format!("{}?amount={}", callback, amount_sats * 1000);
+    let invoice_resp: serde_json::Value = client
+        .get(&invoice_url)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .json()
+        .await
+        .map_err(|e| e.to_string())?;
+    invoice_resp
+        .get("pr")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "no invoice in lnurlp callback response".to_string())
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn journal_terminal(
+    dir: &std::path::Path,
+    intent: &crate::payout_journal::PayoutEntry,
+    phase: crate::payout_journal::PayoutPhase,
+) -> std::io::Result<()> {
+    crate::payout_journal::append_entry(
+        dir,
+        &crate::payout_journal::PayoutEntry {
+            phase,
+            ..intent.clone()
+        },
+    )
 }
 
 #[cfg(test)]
@@ -564,6 +768,133 @@ mod tests {
     }
 
     // ── S10: Build recipients from config ─────────────────────────────
+
+    /// The #41 wedge, at the melt seam: an ambiguous literal invoice is
+    /// never re-melted (SkipSurface), and the plan's owner match arm maps
+    /// that to CONTINUE (see Phase 2b) — verified by the loop reaching the
+    /// maintainer phase whenever the owner result is AmbiguousSkipped.
+    #[tokio::test]
+    async fn test_ambiguous_literal_invoice_never_remelts() {
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("TOLLGATE_TEST_CONFIG_DIR", dir.path());
+        let invoice = "lnbc1ambiguous";
+        let mint = "https://mint.example";
+
+        crate::payout_journal::append_entry(
+            dir.path(),
+            &crate::payout_journal::PayoutEntry {
+                id: crate::payout_journal::entry_id(mint, "owner", invoice),
+                ts: 1,
+                mint: mint.to_string(),
+                identity: "owner".to_string(),
+                invoice: invoice.to_string(),
+                amount_sat: 800,
+                literal_invoice: true,
+                phase: crate::payout_journal::PayoutPhase::Ambiguous,
+            },
+        )
+        .unwrap();
+
+        // No wallet in the test → no unresolved saga → the ambiguity
+        // CLOSES as resolved and the melt is skipped as done (never
+        // re-melted). The unresolved-saga SkipSurface arm is covered by
+        // the decide() table tests in tests/payout_regression.rs.
+        let result = journalled_melt(
+            None,
+            dir.path(),
+            mint,
+            "owner",
+            800,
+            invoice.to_string(),
+            true,
+        )
+        .await;
+        assert_eq!(
+            result,
+            MeltResult::AlreadyDone {
+                invoice: invoice.to_string()
+            },
+            "ambiguous invoice must never be re-melted"
+        );
+        assert_eq!(
+            crate::payout_journal::last_for(dir.path(), mint, "owner", invoice),
+            Some(crate::payout_journal::PayoutPhase::Resolved),
+            "the ambiguity advances to resolved once the saga is settled"
+        );
+    }
+
+    /// Paid melts are idempotent: a journaled `paid` invoice is skipped
+    /// without any melt attempt.
+    #[tokio::test]
+    async fn test_paid_invoice_skips_idempotently() {
+        let dir = tempfile::tempdir().unwrap();
+        let invoice = "lnbc1paid";
+        let mint = "https://mint.example";
+
+        crate::payout_journal::append_entry(
+            dir.path(),
+            &crate::payout_journal::PayoutEntry {
+                id: crate::payout_journal::entry_id(mint, "owner", invoice),
+                ts: 1,
+                mint: mint.to_string(),
+                identity: "owner".to_string(),
+                invoice: invoice.to_string(),
+                amount_sat: 800,
+                literal_invoice: true,
+                phase: crate::payout_journal::PayoutPhase::Paid,
+            },
+        )
+        .unwrap();
+
+        let result = journalled_melt(
+            None,
+            dir.path(),
+            mint,
+            "owner",
+            800,
+            invoice.to_string(),
+            true,
+        )
+        .await;
+        assert_eq!(
+            result,
+            MeltResult::AlreadyDone {
+                invoice: invoice.to_string()
+            }
+        );
+    }
+
+    /// Fresh invoice with no wallet: intent journaled, definitive failure
+    /// recorded (retryable next tick with a fresh invoice).
+    #[tokio::test]
+    async fn test_fresh_invoice_journals_intent_then_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let invoice = "lnbc1fresh";
+        let mint = "https://mint.example";
+
+        let result = journalled_melt(
+            None,
+            dir.path(),
+            mint,
+            "dev",
+            200,
+            invoice.to_string(),
+            true,
+        )
+        .await;
+        assert!(matches!(result, MeltResult::Failed { .. }));
+
+        let last = crate::payout_journal::last_for(dir.path(), mint, "dev", invoice);
+        assert!(matches!(
+            last,
+            Some(crate::payout_journal::PayoutPhase::Failed { .. })
+        ));
+        // The intent entry precedes it (crash-window contract).
+        let entries = crate::payout_journal::read_journal(dir.path());
+        assert!(entries
+            .iter()
+            .any(|e| e.phase == crate::payout_journal::PayoutPhase::Intent));
+    }
 
     #[test]
     fn test_build_recipients_from_config() {

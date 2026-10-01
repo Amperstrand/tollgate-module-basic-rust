@@ -1,0 +1,207 @@
+//! Payout journal (#41) — business-level recovery for profit-share melts.
+//!
+//! AGENTS.md: "Partial successes must never be discarded." The payout loop
+//! melts owner-first then maintainers; any crash or ambiguity in that chain
+//! could wedge later ticks (a literal bolt11 that was actually paid fails
+//! forever on re-melt, permanently blocking maintainer payouts) or discard
+//! the fact that some recipients were already paid.
+//!
+//! Crash-window table (per melt, id = mint + identity + invoice):
+//!
+//! | Death point | Journal | Mint/LN state | Next tick |
+//! |---|---|---|---|
+//! | before intent append | nothing | untouched | fresh plan |
+//! | after intent, before/during melt | `intent` | maybe swap-requested | fresh-invoice (LNURL) retry safe; literal bolt11 → skip + surface (indistinguishable) |
+//! | melt Ok, before `paid` append | `intent` | paid | LNURL: fresh retry safe; literal bolt11 → skip + surface |
+//! | after `paid` | `paid` | paid | skip (idempotent across restarts) |
+//! | timeout, before terminal | `ambiguous` | maybe paid | unresolved melt saga → skip + surface, OTHERS PROCEED; saga resolved → `resolved`, skip |
+//!
+//! The journal never blocks maintainers on an ambiguous owner: that is the
+//! wedge #41 exists to remove. bolt11 invoices pay at most once, so a
+//! literal-invoice ambiguity can never be safely retried — it is surfaced
+//! for the operator instead, while the plan continues around it.
+
+use std::collections::HashMap;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+pub const PAYOUT_JOURNAL_NAME: &str = "payout-journal.jsonl";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "phase", rename_all = "kebab-case")]
+pub enum PayoutPhase {
+    /// Durable intent recorded before `wallet.melt`.
+    Intent,
+    /// Melt completed; the recipient was paid.
+    Paid,
+    /// Melt timed out — the Lightning payment may have fired. CDK's melt
+    /// saga reconciliation (quote-state check) settles it; never retried
+    /// on the same invoice.
+    Ambiguous,
+    /// Definitive melt failure (mint rejected, LNURL fetch failed, ...).
+    Failed { reason: String },
+    /// An ambiguous melt whose saga has since settled; paid-vs-compensated
+    /// is not distinguishable at journal level (the wallet balance is the
+    /// operator's signal). Terminal; never re-melted.
+    Resolved,
+}
+
+impl PayoutPhase {
+    pub fn is_terminal_done(&self) -> bool {
+        matches!(self, PayoutPhase::Paid | PayoutPhase::Resolved)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PayoutEntry {
+    /// Deterministic id: sha256(mint + "|" + identity + "|" + invoice).
+    pub id: String,
+    pub ts: u64,
+    pub mint: String,
+    pub identity: String,
+    /// The invoice actually melted (bolt11) — the single-pay unit.
+    pub invoice: String,
+    pub amount_sat: u64,
+    /// true when the invoice came verbatim from config (no fresh invoice
+    /// is possible on retry — ambiguity can never be safely re-attempted).
+    pub literal_invoice: bool,
+    pub phase: PayoutPhase,
+}
+
+pub fn journal_path(dir: &Path) -> PathBuf {
+    dir.join(PAYOUT_JOURNAL_NAME)
+}
+
+pub fn entry_id(mint: &str, identity: &str, invoice: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(format!("{mint}|{identity}|{invoice}").as_bytes());
+    hex::encode(h.finalize())
+}
+
+/// Append + fsync (journal is 0600; contains no bearer material — the
+/// invoice identifies a payment, it cannot spend — but keep it private
+/// with the wallet's siblings for uniformity).
+pub fn append_entry(dir: &Path, entry: &PayoutEntry) -> std::io::Result<()> {
+    let path = journal_path(dir);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut line = serde_json::to_string(entry).map_err(std::io::Error::other)?;
+    line.push('\n');
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    f.write_all(line.as_bytes())?;
+    f.sync_all()?;
+    if let Some(parent) = path.parent() {
+        if let Ok(dirf) = std::fs::File::open(parent) {
+            let _ = dirf.sync_all();
+        }
+    }
+    Ok(())
+}
+
+pub fn read_journal(dir: &Path) -> Vec<PayoutEntry> {
+    let Ok(file) = std::fs::File::open(journal_path(dir)) else {
+        return Vec::new();
+    };
+    std::io::BufRead::lines(&mut std::io::BufReader::new(file))
+        .map_while(Result::ok)
+        .filter_map(|line| serde_json::from_str(&line).ok())
+        .collect()
+}
+
+/// Last phase per id (append-only journal, last-write-wins).
+pub fn fold_last(entries: &[PayoutEntry]) -> HashMap<String, &PayoutEntry> {
+    let mut folded: HashMap<String, &PayoutEntry> = HashMap::new();
+    for e in entries {
+        folded.insert(e.id.clone(), e);
+    }
+    folded
+}
+
+/// The journal-level decision for a melt attempt about to happen, given the
+/// entry's last state and whether an unresolved CDK melt saga exists for
+/// this mint. This is the resume-the-plan core of #41: settled ⇒ skip,
+/// ambiguous-unresolved ⇒ skip but NEVER block the rest of the plan,
+/// ambiguous-resolved ⇒ advance to terminal, everything else ⇒ proceed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeltDecision {
+    /// No journal objection — melt (and journal a fresh intent first).
+    Proceed,
+    /// Already paid or resolved — skip, plan continues.
+    SkipDone,
+    /// Ambiguous and either unresolved or a literal invoice (unretryable)
+    /// — skip THIS melt, surface to the operator, plan continues around it.
+    SkipSurface,
+}
+
+pub fn decide(
+    last: Option<&PayoutPhase>,
+    literal_invoice: bool,
+    mint_has_unresolved_melt_saga: bool,
+) -> (MeltDecision, Option<PayoutPhase>) {
+    match last {
+        None => (MeltDecision::Proceed, None),
+        Some(PayoutPhase::Intent) => {
+            // Crash between intent and terminal append. A fresh invoice
+            // (LNURL fetch each attempt) makes a retry safe; a literal
+            // bolt11 cannot be re-melted without risking a wedge on an
+            // already-paid invoice — surface instead.
+            if literal_invoice {
+                (MeltDecision::SkipSurface, None)
+            } else {
+                (MeltDecision::Proceed, None)
+            }
+        }
+        Some(PayoutPhase::Paid) => (MeltDecision::SkipDone, None),
+        Some(PayoutPhase::Resolved) => (MeltDecision::SkipDone, None),
+        Some(PayoutPhase::Failed { .. }) => (MeltDecision::Proceed, None),
+        Some(PayoutPhase::Ambiguous) => {
+            if mint_has_unresolved_melt_saga {
+                (MeltDecision::SkipSurface, None)
+            } else {
+                // The CDK melt saga settled; paid-vs-compensated is not
+                // distinguishable here — close it as resolved and skip.
+                (MeltDecision::SkipDone, Some(PayoutPhase::Resolved))
+            }
+        }
+    }
+}
+
+/// Operator summary for CLI `status`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PayoutsSummary {
+    pub total: u64,
+    pub paid_sat: u64,
+    pub ambiguous: u64,
+}
+
+pub fn summarize(dir: &Path) -> PayoutsSummary {
+    let mut s = PayoutsSummary::default();
+    for (_, e) in fold_last(&read_journal(dir)) {
+        s.total += 1;
+        match e.phase {
+            PayoutPhase::Paid | PayoutPhase::Resolved => s.paid_sat += e.amount_sat,
+            PayoutPhase::Ambiguous => s.ambiguous += 1,
+            _ => {}
+        }
+    }
+    s
+}
+
+/// The last phase recorded for a specific melt identity key, if any.
+pub fn last_for(dir: &Path, mint: &str, identity: &str, invoice: &str) -> Option<PayoutPhase> {
+    fold_last(&read_journal(dir))
+        .get(&entry_id(mint, identity, invoice))
+        .map(|e| e.phase.clone())
+}
