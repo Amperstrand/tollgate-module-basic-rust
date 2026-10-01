@@ -308,7 +308,6 @@ impl TollWallet {
     /// works even when the mint is unreachable (AGENTS.md: ambiguous results
     /// are reconciled, not retried).
     pub async fn mint_has_unresolved_receive(&self, token_str: &str) -> Result<bool, WalletError> {
-        use cdk::nuts::nut07::State;
         use cdk::nuts::{KeySetInfo, Token};
         use cdk::wallet::types::KeysetLoadPolicy;
 
