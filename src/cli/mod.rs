@@ -114,11 +114,68 @@ async fn handle_wallet_drain(state: &AppState) -> String {
     if let Some(ref wallet) = *wallet_guard {
         let balances = wallet.get_balance_by_mint().await.unwrap_or_default();
 
+        let cfg_dir = config::config_dir();
         let mut tokens: Vec<serde_json::Value> = Vec::new();
         for (mint_url, balance) in &balances {
             if *balance > 0 {
+                // Issue #46: consult the journal + local saga state BEFORE
+                // re-issuing a drain — an earlier drain's send saga may
+                // still be settling (its output token may exist undelivered).
+                let op = format!(
+                    "drain-{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs()
+                );
+                let id = crate::payout_journal::entry_id(mint_url, "cli-drain", &op);
+                let unresolved = wallet
+                    .mint_has_unresolved_send(mint_url)
+                    .await
+                    .unwrap_or(false);
+                if unresolved {
+                    tracing::error!(
+                        mint = %mint_url,
+                        "drain deferred: a previous drain's send saga is still settling — its token may exist undelivered; retry after settlement"
+                    );
+                    tokens.push(serde_json::json!({
+                        "mint_url": mint_url,
+                        "deferred": "previous drain still settling",
+                    }));
+                    continue;
+                }
+                let intent = crate::payout_journal::PayoutEntry {
+                    id,
+                    ts: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
+                    token: None,
+                    mint: mint_url.clone(),
+                    identity: "cli-drain".to_string(),
+                    invoice: op.clone(),
+                    amount_sat: *balance,
+                    literal_invoice: false,
+                    phase: crate::payout_journal::PayoutPhase::Intent,
+                };
+                if let Err(e) = crate::payout_journal::append_entry(&cfg_dir, &intent) {
+                    tracing::error!(error = %e, "CRITICAL: payout journal unavailable — refusing to drain with no recovery record");
+                    tokens.push(serde_json::json!({
+                        "mint_url": mint_url,
+                        "error": "journal unavailable; drain refused",
+                    }));
+                    continue;
+                }
                 match wallet.send(mint_url, *balance, false).await {
                     Ok(token) => {
+                        let _ = crate::payout_journal::append_entry(
+                            &cfg_dir,
+                            &crate::payout_journal::PayoutEntry {
+                                token: Some(token.clone()),
+                                phase: crate::payout_journal::PayoutPhase::Paid,
+                                ..intent.clone()
+                            },
+                        );
                         tokens.push(serde_json::json!({
                             "mint_url": mint_url,
                             "token": token,
@@ -126,7 +183,25 @@ async fn handle_wallet_drain(state: &AppState) -> String {
                         }));
                     }
                     Err(e) => {
-                        tracing::warn!(error = %e, mint = %mint_url, "drain failed for mint");
+                        // Ambiguous, not failed (#46 / #45 semantics): the
+                        // send may have produced a token after the caller
+                        // gave up — the saga settles at next recovery.
+                        let _ = crate::payout_journal::append_entry(
+                            &cfg_dir,
+                            &crate::payout_journal::PayoutEntry {
+                                phase: crate::payout_journal::PayoutPhase::Ambiguous,
+                                ..intent.clone()
+                            },
+                        );
+                        tracing::error!(
+                            error = %e,
+                            mint = %mint_url,
+                            "drain outcome unknown — journaled ambiguous; the send saga settles at next recovery; a token may exist undelivered"
+                        );
+                        tokens.push(serde_json::json!({
+                            "mint_url": mint_url,
+                            "ambiguous": "drain outcome unknown; check 'status' and wallet transactions after settlement",
+                        }));
                     }
                 }
             }
@@ -151,8 +226,46 @@ async fn handle_wallet_drain(state: &AppState) -> String {
 async fn handle_wallet_fund(state: &AppState, token: &str) -> String {
     let wallet_guard = state.wallet.read().await;
     if let Some(ref wallet) = *wallet_guard {
+        // Issue #46: CLI receives get the same durable-intent discipline as
+        // customer payments (#43) — a timed-out fund may still have landed;
+        // reconciliation settles it (value lands in the wallet via the same
+        // saga recovery; no session is owed for the CLI marker MAC).
+        let cfg_dir = config::config_dir();
+        let entry = crate::payment_journal::PaymentEntry {
+            id: crate::payment_journal::token_id(token),
+            ts: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            token: token.to_string(),
+            mac: crate::payment_journal::CLI_FUND_MAC.to_string(),
+            mint: String::new(),
+            price_per_step: 1,
+            step_size: 1,
+            metric: "cli".to_string(),
+            phase: crate::payment_journal::PaymentPhase::Intent,
+        };
+        if let Err(e) = crate::payment_journal::append_entry(&cfg_dir, &entry) {
+            tracing::error!(error = %e, "CRITICAL: payment journal unavailable — refusing to move value with no recovery record");
+            return serde_json::json!({
+                "success": false,
+                "error": "payment journal unavailable; fund refused"
+            })
+            .to_string()
+                + "\n";
+        }
         match wallet.receive(token).await {
             Ok(amount) => {
+                tracing::info!(amount, "wallet funded via CLI");
+                let _ = crate::payment_journal::append_entry(
+                    &cfg_dir,
+                    &crate::payment_journal::PaymentEntry {
+                        phase: crate::payment_journal::PaymentPhase::Received {
+                            amount_sat: amount,
+                        },
+                        ..entry
+                    },
+                );
                 serde_json::json!({
                     "success": true,
                     "message": format!("received {amount} sats")
@@ -161,9 +274,18 @@ async fn handle_wallet_fund(state: &AppState, token: &str) -> String {
                     + "\n"
             }
             Err(e) => {
+                // Ambiguous, not failed (#43 semantics): a lost response
+                // after the mint accepted surfaces as a Cdk error too.
+                let _ = crate::payment_journal::append_entry(
+                    &cfg_dir,
+                    &crate::payment_journal::PaymentEntry {
+                        phase: crate::payment_journal::PaymentPhase::TimeoutUnknown,
+                        ..entry
+                    },
+                );
                 serde_json::json!({
                     "success": false,
-                    "error": format!("wallet receive failed: {e}")
+                    "error": format!("wallet receive failed (outcome journaled; reconciliation will settle it): {e}")
                 })
                 .to_string()
                     + "\n"
@@ -306,6 +428,8 @@ async fn handle_command(cmd: &str, state: &AppState) -> String {
         "version" => version_string(),
         "status" => {
             let m = crate::migration::summarize_state(&config::config_dir());
+            let p = crate::payment_journal::summarize(&config::config_dir());
+            let po = crate::payout_journal::summarize(&config::config_dir());
             serde_json::json!({
                 "success": true,
                 "message": "running",
@@ -316,7 +440,20 @@ async fn handle_command(cmd: &str, state: &AppState) -> String {
                     "pending": m.pending,
                     "spent": m.spent,
                     "spent_sat": m.spent_sat,
+                    "partially_spent": m.partially_spent,
+                    "partially_spent_unspent_sat": m.partially_spent_unspent_sat,
+                    "remainder_recovered_sat": m.remainder_recovered_sat,
                     "settled": m.is_settled(),
+                },
+                "payments": {
+                    "total": p.total,
+                    "needs_reconciliation": p.needs_reconciliation,
+                    "received_sat": p.received_sat,
+                },
+                "payouts": {
+                    "total": po.total,
+                    "paid_sat": po.paid_sat,
+                    "ambiguous": po.ambiguous,
                 }
             })
             .to_string()
@@ -632,6 +769,30 @@ mod tests {
         assert!(json["message"].is_string());
     }
 
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn wallet_fund_journals_intent_and_ambiguous_outcome() {
+        // #46: CLI fund entries hit the payment journal — durable intent
+        // before receive, ambiguous (never terminal-rejected) on error.
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("TOLLGATE_TEST_CONFIG_DIR", dir.path());
+        let state = make_test_state();
+        let resp = handle_command("wallet fund cashuAnotarealtoken", &state).await;
+        let json: serde_json::Value = serde_json::from_str(resp.trim()).unwrap();
+        assert_eq!(json["success"], false);
+        let jp = dir.path().join("payment-journal.jsonl");
+        let body = std::fs::read_to_string(jp).unwrap();
+        assert!(
+            body.contains("cli-fund"),
+            "fund entries carry the CLI marker"
+        );
+        assert!(
+            body.contains("timeout-unknown"),
+            "receive errors are journaled ambiguous, not failed: {body}"
+        );
+        std::env::remove_var("TOLLGATE_TEST_CONFIG_DIR");
+    }
+
     #[tokio::test]
     async fn wallet_restore_with_no_mints_reports_empty() {
         // No registered mints => restore is a no-op success (the network
@@ -722,6 +883,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    #[serial_test::serial]
     async fn test_config_set_writes_to_disk() {
         let dir = tempfile::TempDir::new().unwrap();
         std::env::set_var("TOLLGATE_TEST_CONFIG_DIR", dir.path());

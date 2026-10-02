@@ -39,6 +39,8 @@ pub enum WalletError {
     WalletNotFound(String),
     #[error("token parse error: {0}")]
     TokenParse(String),
+    #[error("wallet state unreconciled, money move aborted: {0}")]
+    SagaRecovery(String),
 }
 
 // ---------------------------------------------------------------------------

@@ -2,12 +2,88 @@
 
 use std::sync::Arc;
 use tollgate_module_basic_rust::{
-    cli, config, http, identity, lightning_quotes, migration, monitor,
+    cli, config, http, identity, lightning_quotes, migration, monitor, payment_journal,
     portal::{self, CaptivePortal},
     session, tracing_setup, wallet, wireless,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// One payment-journal reconciliation pass: decide undecided payments and
+/// grant what customers are owed. Shared by the startup run and the
+/// periodic re-check.
+async fn reconcile_payments_once(state: &Arc<http::AppState>) {
+    let cfg_dir = config::config_dir();
+    let (report, grants) = {
+        let w = state.wallet.read().await;
+        let Some(wallet) = w.as_ref() else { return };
+        payment_journal::reconcile(&cfg_dir, wallet).await
+    };
+    for (entry, amount_sat) in grants {
+        // CLI fund entries (#46) owe no session/gate: the value lands in
+        // the wallet via the same saga recovery; the operator sees the
+        // balance. Advance the journal and continue.
+        if entry.mac == payment_journal::CLI_FUND_MAC {
+            let _ = payment_journal::append_entry(
+                &cfg_dir,
+                &payment_journal::PaymentEntry {
+                    phase: payment_journal::PaymentPhase::ReconcileSpent { amount_sat },
+                    ..entry.clone()
+                },
+            );
+            tracing::info!(
+                amount_sat,
+                "reconciled CLI fund: value recovered into the wallet (no session owed)"
+            );
+            continue;
+        }
+        // Grant from the pricing facts frozen at intent time (Codex P2 on
+        // #43), not current config.
+        let steps = amount_sat / entry.price_per_step.max(1);
+        let allotment = steps * entry.step_size.max(1);
+        {
+            let mut sessions = state.sessions.lock().await;
+            sessions.create_session(&entry.mac, allotment, &entry.metric, 3600);
+            // save_now: durable before the terminal journal append may
+            // advance — debounced save returns Ok without writing (Codex
+            // P1 on #43). On failure the entry stays undecided and is
+            // retried on the next pass.
+            if let Err(e) = sessions.save_now(&config::config_dir()) {
+                tracing::error!(mac = %entry.mac, error = %e, "CRITICAL: reconciled session not durable — leaving payment undecided for retry");
+                drop(sessions);
+                continue;
+            }
+        }
+        if let Err(e) = state.portal.grant_access(&entry.mac).await {
+            tracing::warn!(mac = %entry.mac, error = %e, "gate open after payment reconcile failed");
+        }
+        tracing::info!(
+            mac = %entry.mac,
+            allotment,
+            amount_sat,
+            "reconciled payment: session granted for a previously-undecided outcome"
+        );
+        // Terminal append AFTER the granted session is durable (Codex P1
+        // on #43): a crash before this leaves the entry reconcilable again
+        // — the same-MAC session overwrite makes the re-grant idempotent.
+        let _ = payment_journal::append_entry(
+            &cfg_dir,
+            &payment_journal::PaymentEntry {
+                phase: payment_journal::PaymentPhase::ReconcileSpent { amount_sat },
+                ..entry.clone()
+            },
+        );
+    }
+    if report.granted_sessions + report.closed_unspent + report.zero_steps + report.undecided > 0 {
+        tracing::info!(
+            granted = report.granted_sessions,
+            closed_unspent = report.closed_unspent,
+            zero_steps = report.zero_steps,
+            undecided = report.undecided,
+            "payment journal reconciled"
+        );
+    }
+}
 
 #[tokio::main]
 async fn main() {
@@ -123,6 +199,9 @@ async fn main() {
                     pending = summary.pending,
                     spent = summary.spent,
                     spent_sat = summary.spent_sat,
+                    partially_spent = summary.partially_spent,
+                    partially_spent_unspent_sat = summary.partially_spent_unspent_sat,
+                    remainder_recovered_sat = summary.remainder_recovered_sat,
                     "migration import pass complete"
                 );
                 match migration.finish(summary) {
@@ -174,6 +253,29 @@ async fn main() {
         let state = state.clone();
         tokio::spawn(async move {
             lightning_quotes::run_monitor(state, ln_quotes, std::time::Duration::from_secs(5)).await
+        });
+    }
+
+    // Payment-journal reconciliation (#40): decide every payment left
+    // intent-only (crash mid-receive) or timeout-unknown, by asking the
+    // mint (NUT-07). Spent => the customer paid => grant the session they
+    // are owed; unspent => nothing owed. Runs at startup AND periodically
+    // (Codex P1 on #43: a long-running router must not hold recovered
+    // value indefinitely without granting — the 504 promised automatic
+    // reconciliation). Boot is never blocked; undecided entries retry.
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            reconcile_payments_once(&state).await;
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+            tick.tick().await; // fires immediately; the pass above already ran
+            loop {
+                tick.tick().await;
+                if payment_journal::summarize(&config::config_dir()).needs_reconciliation == 0 {
+                    continue;
+                }
+                reconcile_payments_once(&state).await;
+            }
         });
     }
 

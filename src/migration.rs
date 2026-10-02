@@ -46,6 +46,21 @@ impl TokenSink for TollWallet {
         TollWallet::token_spent(self, token).await
     }
 
+    async fn receive_unspent_remainder(
+        &self,
+        token: &str,
+    ) -> Result<Option<u64>, crate::wallet::WalletError> {
+        TollWallet::receive_unspent_remainder(self, token).await
+    }
+
+    async fn check_tokens_spent(
+        &self,
+        tokens: &[String],
+    ) -> std::collections::HashMap<String, Result<TokenSpendState, crate::wallet::WalletError>>
+    {
+        TollWallet::check_tokens_spent(self, tokens).await
+    }
+
     async fn mint_has_unresolved_receive(
         &self,
         token: &str,
@@ -82,6 +97,23 @@ pub enum TokenOutcome {
     /// case retrying can never import it. Terminal; the amount is re-derived
     /// from the token so the summary stays honest.
     Spent { amount_sat: u64 },
+    /// A strict subset of the token's proofs is spent at the mint (NUT-07
+    /// per-proof states, issue #35): the atomic receive can never succeed
+    /// (the mint rejects mixed inputs), so the token is terminal for the
+    /// import loop — but the unspent remainder is real, recoverable value.
+    /// The token string is retained in the journal (and `tokens.jsonl` on
+    /// disk), so the operator can split it and re-import the unspent
+    /// remainder; see MIGRATION.md "Partially spent tokens".
+    PartiallySpent { spent_sat: u64, unspent_sat: u64 },
+    /// The unspent remainder of a partially-spent parent token was received
+    /// into the wallet automatically (#47): the parent's spent portion is
+    /// retained for the audit trail, the remainder amount for accounting.
+    /// Terminal; keyed by the parent token string so fold-last supersedes
+    /// the parent's `PartiallySpent` row.
+    RemainderImported {
+        parent_spent_sat: u64,
+        remainder_sat: u64,
+    },
 }
 
 impl TokenOutcome {
@@ -93,27 +125,89 @@ impl TokenOutcome {
         matches!(self, TokenOutcome::Spent { .. })
     }
 
+    fn is_partially_spent(&self) -> bool {
+        matches!(self, TokenOutcome::PartiallySpent { .. })
+    }
+
+    fn is_remainder_imported(&self) -> bool {
+        matches!(self, TokenOutcome::RemainderImported { .. })
+    }
+
     fn is_pending(&self) -> bool {
         matches!(self, TokenOutcome::Pending)
     }
+}
+
+/// NUT-07 spend classification of one token, as answered by the migration
+/// pre-check. Derived from per-proof mint states so outcomes are terminal
+/// where the mint's answer is decisive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenSpendState {
+    /// Every proof SPENT at the mint: an earlier receive of ours completed
+    /// (the value already sits in this deterministic wallet) or the token
+    /// was spent elsewhere — retrying can never import it.
+    AllSpent { amount_sat: u64 },
+    /// Some proofs SPENT, some still spendable: the atomic receive can
+    /// never succeed (the mint rejects mixed inputs), but the unspent
+    /// remainder is real value — recoverable by splitting the token and
+    /// re-importing only the unspent proofs (issue #35).
+    PartiallySpent { spent_sat: u64, unspent_sat: u64 },
+    /// At least one proof is PENDING (or RESERVED) at the mint: the mint is
+    /// mid-operation and its answer is not final, so neither a terminal
+    /// outcome nor a receive decision can be made — the token is deferred
+    /// to a later run (Codex P1 on #42; same tri-state contract as
+    /// `TollWallet::token_check_state`).
+    Indeterminate,
+    /// No proof SPENT: the token is (still) receivable.
+    Unspent,
 }
 
 /// What the import loop may call on the wallet. A trait so crash-window
 /// tests can fake the mint side and observe journal ordering without a
 /// live CDK wallet.
 #[async_trait::async_trait]
-pub trait TokenSink {
+pub trait TokenSink: Send + Sync {
     async fn receive(&self, token: &str) -> Result<u64, crate::wallet::WalletError>;
 
-    /// NUT-07 reconciliation: `Ok(Some(amount_sat))` iff every proof of the
-    /// token is spent at the mint. Errors mean "cannot reconcile right now"
-    /// (mint unreachable), NOT "unspent".
+    /// Single-token tri-state reconciliation surface (delegates to
+    /// `TollWallet::token_spent`): consumed by the payment journal's
+    /// startup reconciliation (#43). `Err` on PENDING/RESERVED proofs —
+    /// the outcome is ambiguous, not unspent.
     async fn token_spent(&self, token: &str) -> Result<Option<u64>, crate::wallet::WalletError>;
 
-    /// Whether the token's mint wallet still holds an incomplete CDK
-    /// receive saga — a purely local query (works with the mint down).
-    /// While true, an earlier receive's outcome is undecided and the token
-    /// must be neither re-submitted nor terminalized this boot.
+    /// Batched NUT-07 pre-check (issue #34): ONE checkstate call per mint
+    /// carrying the Ys of every candidate token — NUT-07 requests are
+    /// spec-native arrays, so per-token calls were pure rate-limit waste.
+    ///
+    /// Contract: the returned map has an entry for EVERY input token.
+    /// Unparseable tokens map to `Err(TokenParse)`; a mint that cannot be
+    /// reached maps each of its tokens to the same transport error — the
+    /// same per-token semantics the per-token pre-check had, so the
+    /// loop's defer/proceed decisions are unchanged.
+    async fn check_tokens_spent(
+        &self,
+        tokens: &[String],
+    ) -> std::collections::HashMap<String, Result<TokenSpendState, crate::wallet::WalletError>>;
+
+    /// One-shot recovery of a partially-spent token's unspent remainder
+    /// (#47): receive only the mint-confirmed-UNSPENT proofs. `Ok(Some(n))`
+    /// — n sats landed in the wallet; `Ok(None)` — nothing recoverable
+    /// right now (manual runbook applies); `Err` — attempt failed, the
+    /// parent stays terminal and is never auto-retried. Default: feature
+    /// unsupported by the sink (behaves as `Ok(None)`).
+    async fn receive_unspent_remainder(
+        &self,
+        _token: &str,
+    ) -> Result<Option<u64>, crate::wallet::WalletError> {
+        Ok(None)
+    }
+
+    /// Whether THIS token's input proofs are currently Reserved/Pending in
+    /// the local wallet — i.e. an earlier attempt of this very token is
+    /// still in flight (per-token Y linkage, issue #31). A purely local
+    /// query (works with the mint down). While true, the token's outcome
+    /// is undecided and it must be neither re-submitted nor terminalized
+    /// this boot.
     async fn mint_has_unresolved_receive(
         &self,
         token: &str,
@@ -141,6 +235,14 @@ pub struct MigrationSummary {
     /// block finalization — retrying can never import them.
     pub spent: u64,
     pub spent_sat: u64,
+    /// Tokens with a spent SUBSET of proofs (issue #35): terminal for the
+    /// import loop, but with real recoverable value left.
+    pub partially_spent: u64,
+    /// Total unspent value still sitting in partially-spent tokens — the
+    /// operator-recoverable remainder (split + re-import, MIGRATION.md).
+    pub partially_spent_unspent_sat: u64,
+    /// Value recovered automatically from partially-spent remainders (#47).
+    pub remainder_recovered_sat: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -201,10 +303,43 @@ impl FirstBootMigration {
         let mut pending = 0u64;
         let mut spent = 0u64;
         let mut spent_sat = 0u64;
+        let mut partially_spent = 0u64;
+        let mut partially_spent_unspent_sat = 0u64;
+        let mut remainder_recovered_sat = 0u64;
 
         let already = fold_last_outcomes(&read_journal(&self.journal));
-        let tokens = read_tokens(&self.tokens_file)?;
+        // A duplicated line is the same token: attempt it once, and keep the
+        // batched classification map one-entry-per-token (the loop consumes
+        // entries by removal).
+        let mut seen = std::collections::HashSet::new();
+        let tokens: Vec<String> = read_tokens(&self.tokens_file)?
+            .into_iter()
+            .filter(|t| seen.insert(t.clone()))
+            .collect();
         let mut journal_file = open_append(&self.journal)?;
+
+        // Batched NUT-07 pre-pass (issue #34): one checkstate call per mint
+        // covering every token this run may (re)attempt. Tokens already
+        // terminal in the journal are excluded — they are neither re-checked
+        // nor re-received.
+        let candidates: Vec<String> = tokens
+            .iter()
+            .filter(|t| {
+                !matches!(
+                    already.get(*t),
+                    Some(o) if o.is_imported()
+                        || o.is_spent()
+                        || o.is_partially_spent()
+                        || o.is_remainder_imported()
+                )
+            })
+            .cloned()
+            .collect();
+        let mut spent_map = if candidates.is_empty() {
+            std::collections::HashMap::new()
+        } else {
+            sink.check_tokens_spent(&candidates).await
+        };
 
         for token in tokens {
             match already.get(&token) {
@@ -219,6 +354,23 @@ impl FirstBootMigration {
                     }
                     continue;
                 }
+                Some(outcome) if outcome.is_partially_spent() => {
+                    partially_spent += 1;
+                    if let TokenOutcome::PartiallySpent { unspent_sat, .. } = outcome {
+                        partially_spent_unspent_sat += unspent_sat;
+                    }
+                    continue;
+                }
+                Some(outcome) if outcome.is_remainder_imported() => {
+                    // Remainder already recovered (#47): terminal, counted as
+                    // a settled partially-spent token with no outstanding
+                    // remainder.
+                    partially_spent += 1;
+                    if let TokenOutcome::RemainderImported { remainder_sat, .. } = outcome {
+                        remainder_recovered_sat += remainder_sat;
+                    }
+                    continue;
+                }
                 _ => {}
             }
 
@@ -229,7 +381,9 @@ impl FirstBootMigration {
             // recover_incomplete_sagas has already run via ensure_mint at
             // boot) and tokens spent under a pre-journal migration, without
             // inferring anything from receive error text.
-            let spent_check = sink.token_spent(&token).await;
+            let spent_check = spent_map
+                .remove(&token)
+                .expect("sink classifies every candidate token");
             let prior_pending = matches!(already.get(&token), Some(TokenOutcome::Pending));
 
             // r4126804510: an all-spent NUT-07 answer proves only that the
@@ -266,7 +420,7 @@ impl FirstBootMigration {
             }
 
             match spent_check {
-                Ok(Some(amount_sat)) => {
+                Ok(TokenSpendState::AllSpent { amount_sat }) => {
                     tracing::warn!(
                         amount_sat,
                         "migration: token already spent at mint; marking terminal Spent (value sits in the wallet from an earlier receive, or is unrecoverable)"
@@ -283,7 +437,118 @@ impl FirstBootMigration {
                     journal_file.sync_all()?;
                     continue;
                 }
-                Ok(None) => {}
+                Ok(TokenSpendState::PartiallySpent {
+                    spent_sat,
+                    unspent_sat,
+                }) => {
+                    // Issue #35: mixed inputs can never satisfy the atomic
+                    // swap — previously this fell through to receive, failed
+                    // on the mint's opaque rejection, and was retried every
+                    // boot forever. Terminal now; the unspent remainder is
+                    // real value the operator recovers by splitting (see
+                    // MIGRATION.md).
+                    tracing::warn!(
+                        spent_sat,
+                        unspent_sat,
+                        "migration: token partially spent at mint; marking terminal PartiallySpent — recover the unspent remainder by splitting the token (MIGRATION.md 'Partially spent tokens')"
+                    );
+                    partially_spent += 1;
+                    partially_spent_unspent_sat += unspent_sat;
+                    append_entry(
+                        &mut journal_file,
+                        &JournalEntry {
+                            token: token.clone(),
+                            outcome: TokenOutcome::PartiallySpent {
+                                spent_sat,
+                                unspent_sat,
+                            },
+                        },
+                    )?;
+                    journal_file.sync_all()?;
+
+                    // #47: recover the remainder automatically, one-shot.
+                    // The Pending intent below is the write-ahead record for
+                    // the remainder's receive: a crash mid-attempt leaves it
+                    // as the token's folded outcome, so the next boot
+                    // re-classifies and re-attempts only what is still
+                    // unspent — convergent, never a loop. A settled outcome
+                    // row (RemainderImported / re-stated PartiallySpent)
+                    // ends the automation permanently.
+                    append_entry(
+                        &mut journal_file,
+                        &JournalEntry {
+                            token: token.clone(),
+                            outcome: TokenOutcome::Pending,
+                        },
+                    )?;
+                    journal_file.sync_all()?;
+                    match sink.receive_unspent_remainder(&token).await {
+                        Ok(Some(remainder_sat)) => {
+                            tracing::info!(
+                                remainder_sat,
+                                "migration: partially-spent remainder received into the wallet"
+                            );
+                            remainder_recovered_sat += remainder_sat;
+                            partially_spent_unspent_sat =
+                                partially_spent_unspent_sat.saturating_sub(remainder_sat);
+                            append_entry(
+                                &mut journal_file,
+                                &JournalEntry {
+                                    token: token.clone(),
+                                    outcome: TokenOutcome::RemainderImported {
+                                        parent_spent_sat: spent_sat,
+                                        remainder_sat,
+                                    },
+                                },
+                            )?;
+                        }
+                        Ok(None) => {
+                            tracing::warn!(
+                                unspent_sat,
+                                "migration: nothing definitively unspent to recover automatically; manual runbook applies (MIGRATION.md)"
+                            );
+                            append_entry(
+                                &mut journal_file,
+                                &JournalEntry {
+                                    token: token.clone(),
+                                    outcome: TokenOutcome::PartiallySpent {
+                                        spent_sat,
+                                        unspent_sat,
+                                    },
+                                },
+                            )?;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "migration: remainder recovery failed (one-shot; parent stays terminal, manual runbook applies)"
+                            );
+                            append_entry(
+                                &mut journal_file,
+                                &JournalEntry {
+                                    token: token.clone(),
+                                    outcome: TokenOutcome::PartiallySpent {
+                                        spent_sat,
+                                        unspent_sat,
+                                    },
+                                },
+                            )?;
+                        }
+                    }
+                    journal_file.sync_all()?;
+                    continue;
+                }
+                Ok(TokenSpendState::Indeterminate) => {
+                    // A PENDING/RESERVED proof can settle either way; a
+                    // terminal entry now could journal a speculative
+                    // remainder and finalize over still-moving value.
+                    tracing::warn!(
+                        "migration: token has proofs pending at the mint (in-flight operation); deferring to a later run"
+                    );
+                    pending += 1;
+                    continue;
+                }
+                Ok(TokenSpendState::Unspent) => {}
                 Err(e) => {
                     tracing::debug!(error = %e, "migration: NUT-07 pre-check unavailable; proceeding to receive");
                 }
@@ -348,6 +613,9 @@ impl FirstBootMigration {
             pending,
             spent,
             spent_sat,
+            partially_spent,
+            partially_spent_unspent_sat,
+            remainder_recovered_sat,
         })
     }
 
@@ -373,7 +641,7 @@ impl FirstBootMigration {
         };
 
         let marker_body = format!(
-            "state={}\nimported_sat={}\nfailed={}\nskipped_already_imported={}\npending={}\nspent={}\nspent_sat={}\ndate={}\n",
+            "state={}\nimported_sat={}\nfailed={}\nskipped_already_imported={}\npending={}\nspent={}\nspent_sat={}\npartially_spent={}\npartially_spent_unspent_sat={}\nremainder_recovered_sat={}\ndate={}\n",
             if clean { "complete" } else { "partial" },
             summary.imported,
             summary.failed,
@@ -381,6 +649,9 @@ impl FirstBootMigration {
             summary.pending,
             summary.spent,
             summary.spent_sat,
+            summary.partially_spent,
+            summary.partially_spent_unspent_sat,
+            summary.remainder_recovered_sat,
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -430,6 +701,9 @@ pub struct MigrationState {
     pub pending: u64,
     pub spent: u64,
     pub spent_sat: u64,
+    pub partially_spent: u64,
+    pub partially_spent_unspent_sat: u64,
+    pub remainder_recovered_sat: u64,
 }
 
 impl MigrationState {
@@ -449,6 +723,9 @@ pub fn summarize_state(db_dir: &Path) -> MigrationState {
         pending: 0,
         spent: 0,
         spent_sat: 0,
+        partially_spent: 0,
+        partially_spent_unspent_sat: 0,
+        remainder_recovered_sat: 0,
     };
     if let Ok(body) = std::fs::read_to_string(&m.marker) {
         let marker_state = body
@@ -465,6 +742,14 @@ pub fn summarize_state(db_dir: &Path) -> MigrationState {
             TokenOutcome::Spent { amount_sat } => {
                 state.spent += 1;
                 state.spent_sat += amount_sat;
+            }
+            TokenOutcome::PartiallySpent { unspent_sat, .. } => {
+                state.partially_spent += 1;
+                state.partially_spent_unspent_sat += unspent_sat;
+            }
+            TokenOutcome::RemainderImported { remainder_sat, .. } => {
+                state.partially_spent += 1;
+                state.remainder_recovered_sat += remainder_sat;
             }
         }
     }
@@ -671,6 +956,9 @@ mod tests {
                 pending: 0,
                 spent: 0,
                 spent_sat: 0,
+                partially_spent: 0,
+                partially_spent_unspent_sat: 0,
+                remainder_recovered_sat: 0,
             })
             .unwrap();
         assert_eq!(finish, MigrationFinish::Complete);
@@ -692,6 +980,9 @@ mod tests {
                 pending: 1,
                 spent: 0,
                 spent_sat: 0,
+                partially_spent: 0,
+                partially_spent_unspent_sat: 0,
+                remainder_recovered_sat: 0,
             })
             .unwrap();
         assert_eq!(finish, MigrationFinish::Partial);
@@ -746,6 +1037,17 @@ mod tests {
             _token: &str,
         ) -> Result<Option<u64>, crate::wallet::WalletError> {
             Ok(None)
+        }
+
+        async fn check_tokens_spent(
+            &self,
+            tokens: &[String],
+        ) -> std::collections::HashMap<String, Result<TokenSpendState, crate::wallet::WalletError>>
+        {
+            tokens
+                .iter()
+                .map(|t| (t.clone(), Ok(TokenSpendState::Unspent)))
+                .collect()
         }
 
         async fn mint_has_unresolved_receive(

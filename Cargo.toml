@@ -29,8 +29,6 @@ http-body-util = "0.1"
 cdk = { version = "0.18", default-features = false, features = ["wallet"] }
 cdk-sqlite = "0.18"
 
-cashu = "0.18"
-
 # Serde / JSON
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -78,6 +76,7 @@ embedded-portal = ["dep:nftables"]
 [dev-dependencies]
 tempfile = "3"
 serial_test = "3"
+uuid = { version = "1", features = ["v4"] }
 
 # mipsel_24kc has no 64-bit atomics: if a cdk-common release reintroduces
 # AtomicU64, patch it via [patch.crates-io] (Amperstrand/cdk-common carries
