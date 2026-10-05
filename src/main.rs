@@ -316,6 +316,62 @@ async fn main() {
         }
     });
 
+    // Keyset hygiene sweep (R10/#13): every 6h per mint, refresh keysets
+    // and (1) warn when held keysets expire within 30 days, (2) rotate
+    // unspent proofs off keysets the mint retired (same-mint self-swap —
+    // value never leaves the mint). Errors log and retry next sweep.
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(6 * 60 * 60));
+            interval.tick().await; // immediate first tick: run once at boot
+            loop {
+                let cfg = state.config.clone();
+                let mints: Vec<String> = cfg.accepted_mints.iter().map(|m| m.url.clone()).collect();
+                for mint in &mints {
+                    let wallet = state.wallet.read().await;
+                    if let Some(w) = wallet.as_ref() {
+                        match w.keyset_hygiene(mint, 30).await {
+                            Ok(h) => {
+                                if h.proofs_on_inactive_keysets > 0 {
+                                    tracing::warn!(
+                                        mint = %mint,
+                                        proofs = h.proofs_on_inactive_keysets,
+                                        "keyset hygiene: proofs on retired keysets — rotating (same-mint swap)"
+                                    );
+                                    // rotate takes &self (the mint's wallet
+                                    // serializes internally) — keep the READ
+                                    // guard so maintenance never blocks
+                                    // payments or Lightning (Codex P2 on #57).
+                                    match w.rotate_inactive_keyset_proofs(mint).await {
+                                        Ok(n) => {
+                                            tracing::info!(mint = %mint, rotated = n, "keyset hygiene: rotated proofs to active keyset")
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(mint = %mint, error = %e, "keyset rotation failed; retrying next sweep")
+                                        }
+                                    }
+                                    continue;
+                                }
+                                if !h.soonest_expiry_keysets.is_empty() {
+                                    tracing::warn!(
+                                        mint = %mint,
+                                        keysets = ?h.soonest_expiry_keysets,
+                                        "keyset hygiene: held keysets expire within 30 days — plan rotation"
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                tracing::debug!(mint = %mint, error = %e, "keyset hygiene check unavailable (mint unreachable?)")
+                            }
+                        }
+                    }
+                }
+                interval.tick().await;
+            }
+        });
+    }
+
     // Reseller gate: the upstream manager is the only task that moves
     // wallet funds outbound (upstream purchases paid via wallet.send()).
     // `reseller_mode` defaults to false — ordinary installations must
