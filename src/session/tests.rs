@@ -308,3 +308,41 @@ fn cleanup_expired_preserves_active_sessions() {
     assert!(mgr.get_session("aa:bb:cc:dd:ee:05").is_none());
     assert!(mgr.get_session("aa:bb:cc:dd:ee:00").is_some());
 }
+
+#[test]
+fn session_state_tri_state_lifecycle() {
+    let mut mgr = SessionManager::new();
+    assert_eq!(mgr.session_state("aa:bb:cc:00:00:01"), SessionState::None);
+
+    mgr.create_session("aa:bb:cc:00:00:01", 1000, "milliseconds", 3600);
+    assert_eq!(mgr.session_state("aa:bb:cc:00:00:01"), SessionState::Active);
+
+    // Revoke (the monitor's expiry path): record gone, history answers expired.
+    mgr.revoke_session("aa:bb:cc:00:00:01");
+    assert_eq!(mgr.session_state("aa:bb:cc:00:00:01"), SessionState::Expired);
+
+    // Re-payment returns to active.
+    mgr.create_session("aa:bb:cc:00:00:01", 500, "milliseconds", 3600);
+    assert_eq!(mgr.session_state("aa:bb:cc:00:00:01"), SessionState::Active);
+}
+
+#[test]
+fn cleanup_expired_records_history_for_session_state() {
+    let mut mgr = SessionManager::new();
+    let past = now() - 10;
+    mgr.sessions.insert(
+        "aa:bb:cc:00:00:02".into(),
+        CustomerSession {
+            mac: "aa:bb:cc:00:00:02".into(),
+            allotment: 100,
+            used: 0,
+            metric: "milliseconds".into(),
+            expiry: past,
+            granted_at: past - 60,
+            last_grant_id: None,
+        },
+    );
+    assert_eq!(mgr.cleanup_expired(), 1);
+    assert!(!mgr.sessions.contains_key("aa:bb:cc:00:00:02"));
+    assert_eq!(mgr.session_state("aa:bb:cc:00:00:02"), SessionState::Expired);
+}

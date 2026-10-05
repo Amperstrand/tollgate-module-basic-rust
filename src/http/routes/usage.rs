@@ -65,6 +65,48 @@ pub async fn handle_usage(
     }
 }
 
+/// GET /session-state — the machine-readable tri-state (Go #541 parity):
+/// `none` (never had a session), `active`, `expired` (had a session that
+/// ran out; remembered past the record's removal). `/usage`'s `-1/-1`
+/// cannot distinguish a first-time visitor from an expiring customer;
+/// this can, so a portal can offer renewal.
+///
+/// Identity from the socket only (Go parity: the `?mac=` this route once
+/// accepted let one client read another's state). An unidentifiable
+/// client answers `none` with an empty mac field — the portal polls this
+/// while rendering, so it must not error.
+pub async fn handle_session_state(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+) -> impl IntoResponse {
+    let client_ip = get_client_ip(&headers, Some(remote_addr));
+    let (mac, state_str) = match get_mac_address(&client_ip) {
+        Some(mac) => {
+            let sessions = state.sessions.lock().await;
+            let state_str = sessions.session_state(&mac).as_str().to_string();
+            (mac, state_str)
+        }
+        None => {
+            tracing::warn!("MAC lookup failed for /session-state; answering none");
+            (String::new(), "none".to_string())
+        }
+    };
+    let body = serde_json::json!({
+        "status": 1,
+        "mac": mac,
+        "state": state_str,
+    });
+    (
+        StatusCode::OK,
+        [
+            ("content-type", "application/json"),
+            ("access-control-allow-origin", "*"),
+        ],
+        body.to_string(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use crate::session::SessionManager;

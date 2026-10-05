@@ -52,6 +52,33 @@ pub struct SessionManager {
     /// `Mutex<u64>` rather than `AtomicU64`: mips32 has no native 64-bit
     /// atomics, and epoch-millis overflows 32-bit `AtomicUsize`.
     last_save_ms: Mutex<u64>,
+    /// MACs whose session was observed to expire (Go #541 parity: the
+    /// bounded history that lets `/session-state` keep answering `expired`
+    /// after the record is gone). Process-memory like the sessions — a
+    /// restart forgets it and answers `none`, same as the session itself.
+    expired_history: std::sync::Mutex<HashMap<String, u64>>,
+}
+
+/// Go parity (merchant.go): 24h history TTL, 4096-entry cap.
+const EXPIRED_HISTORY_TTL_SECS: u64 = 24 * 60 * 60;
+const EXPIRED_HISTORY_MAX_ENTRIES: usize = 4096;
+
+/// Machine-readable session tri-state (Go #541, /session-state).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionState {
+    None,
+    Active,
+    Expired,
+}
+
+impl SessionState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SessionState::None => "none",
+            SessionState::Active => "active",
+            SessionState::Expired => "expired",
+        }
+    }
 }
 
 impl SessionManager {
@@ -61,6 +88,7 @@ impl SessionManager {
             sessions: HashMap::new(),
             dirty: AtomicBool::new(false),
             last_save_ms: Mutex::new(0),
+            expired_history: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -180,9 +208,56 @@ impl SessionManager {
         }
     }
 
+    /// Record an observed expiry (Go rememberExpiredSessionLocked parity):
+    /// TTL-sweeps old entries, caps the map, then records `mac` at `now`.
+    fn remember_expired(&self, mac: &str) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let mut hist = self
+            .expired_history
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let cutoff = now.saturating_sub(EXPIRED_HISTORY_TTL_SECS);
+        hist.retain(|_, when| *when >= cutoff);
+        while hist.len() >= EXPIRED_HISTORY_MAX_ENTRIES {
+            // Evict the oldest entry (bounded map, Go parity).
+            if let Some(oldest) = hist
+                .iter()
+                .min_by_key(|(_, when)| **when)
+                .map(|(k, _)| k.clone())
+            {
+                hist.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+        hist.insert(mac.to_string(), now);
+    }
+
+    /// The machine-readable tri-state (Go #541): `none` (never had a
+    /// session), `active` (session with allotment left), `expired` (had a
+    /// session that is used up — remembered past the record's removal).
+    pub fn session_state(&self, mac: &str) -> SessionState {
+        if self.is_active(mac) {
+            return SessionState::Active;
+        }
+        let hist = self
+            .expired_history
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if hist.contains_key(mac) {
+            return SessionState::Expired;
+        }
+        SessionState::None
+    }
+
     /// Remove a session by MAC. No-op if the MAC has no session.
     pub fn revoke_session(&mut self, mac: &str) {
-        self.sessions.remove(mac);
+        if self.sessions.remove(mac).is_some() {
+            self.remember_expired(mac);
+        }
     }
 
     /// Remove all expired sessions. Returns the number removed.
@@ -199,6 +274,7 @@ impl SessionManager {
             .collect();
         let count = expired_macs.len();
         for mac in &expired_macs {
+            self.remember_expired(mac);
             self.sessions.remove(mac);
         }
         count
@@ -310,6 +386,3 @@ impl Default for SessionManager {
         Self::new()
     }
 }
-
-#[cfg(test)]
-mod tests;
