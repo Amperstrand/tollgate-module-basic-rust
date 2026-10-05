@@ -333,13 +333,18 @@ pub fn undelivered_tokens(dir: &Path, identity: &str) -> Vec<PayoutEntry> {
         .into_values()
         .filter(|e| {
             e.identity == identity
-                && e.token.is_some()
-                && matches!(
-                    e.phase,
-                    PayoutPhase::TokenCreated
-                        | PayoutPhase::DeliveryAmbiguous
-                        | PayoutPhase::DeliveryFailed { .. }
-                )
+                && (e.token.is_some()
+                    && matches!(
+                        e.phase,
+                        PayoutPhase::TokenCreated
+                            | PayoutPhase::DeliveryAmbiguous
+                            | PayoutPhase::DeliveryFailed { .. }
+                    )
+                    // A send that timed out left no captured token, but the
+                    // saga may still produce one — it blocks repurchase
+                    // until explicitly reconciled (Codex P1 on #52):
+                    // value may already have moved.
+                    || matches!(e.phase, PayoutPhase::Ambiguous))
         })
         .cloned()
         .collect()

@@ -15,9 +15,9 @@ use crate::wallet::TollWallet;
 
 /// Best-effort L3 gateway of a station interface (BusyBox `ip route`).
 fn sta_gateway_ip(sta_interface: Option<&str>) -> Option<String> {
-    let iface = sta_interface?;
+    let iface = resolve_l3_device(sta_interface?)?;
     let out = std::process::Command::new("ip")
-        .args(["route", "show", "dev", iface])
+        .args(["route", "show", "dev", &iface])
         .output()
         .ok()?;
     for line in String::from_utf8_lossy(&out.stdout).lines() {
@@ -27,6 +27,26 @@ fn sta_gateway_ip(sta_interface: Option<&str>) -> Option<String> {
         }
     }
     None
+}
+
+/// A UCI wifi-iface section name (e.g. `wgt0a1b`) is NOT an L3 network
+/// device — `ip route show dev` needs the netifd interface's resolved
+/// `l3_device` (e.g. `wwan0`). Query ubus for it, falling back to the
+/// section name for simple setups where they coincide (Codex P1 on #52).
+fn resolve_l3_device(uci_section: &str) -> Option<String> {
+    let out = std::process::Command::new("ubus")
+        .args(["call", "network.interface.wwan", "status"])
+        .output()
+        .ok()?;
+    let status: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    let l3 = status.get("l3_device")?.as_str()?.to_string();
+    if l3.is_empty() { None } else { Some(l3) }.or_else(|| {
+        tracing::warn!(
+            uci_section,
+            "wwan l3_device unresolved; trying section name"
+        );
+        Some(uci_section.to_string())
+    })
 }
 
 #[derive(Debug, Clone, PartialEq)]

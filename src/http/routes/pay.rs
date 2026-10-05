@@ -576,21 +576,6 @@ pub async fn handle_pay(
     }
     drop(sessions);
 
-    // Terminal journal append AFTER the session is durable AND the gate is
-    // open (Codex P1 on #52): a `received` entry MEANS "session granted AND
-    // usable". A gate failure below rolls the session back — leaving the
-    // journal at intent would strand a spent token, so the rollback path
-    // re-marks the entry ambiguous for reconciliation to re-grant later.
-    let _ = payment_journal::append_entry(
-        &cfg_dir,
-        &payment_journal::PaymentEntry {
-            phase: payment_journal::PaymentPhase::Received {
-                amount_sat: received_amount,
-            },
-            ..intent.clone()
-        },
-    );
-
     // Open the gate to grant network access via ndsctl. Failure rolls the
     // session back (Go: restoreSession) and answers with a session-error
     // notice instead of a success event. The journal re-marks the payment
@@ -634,6 +619,21 @@ pub async fn handle_pay(
             json,
         );
     }
+
+    // Terminal journal append AFTER the gate opens (Codex P1 on #52,
+    // round 2): `received` MEANS "session granted AND gate open". A crash
+    // before this append leaves intent-only → reconciliation re-grants; an
+    // explicit gate failure re-marks ambiguous below → reconciliation
+    // re-grants. No window strands a spent token behind a terminal phase.
+    let _ = payment_journal::append_entry(
+        &cfg_dir,
+        &payment_journal::PaymentEntry {
+            phase: payment_journal::PaymentPhase::Received {
+                amount_sat: received_amount,
+            },
+            ..intent.clone()
+        },
+    );
 
     tracing::info!(
         verified_msat = verified_amount,

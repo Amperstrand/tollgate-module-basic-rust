@@ -201,12 +201,55 @@ async fn handle_wallet_fund(state: &AppState, token: &str) -> CliResponse {
     let Some(wallet) = guard.as_ref() else {
         return CliResponse::error("wallet not initialized");
     };
+    // Same durable-intent discipline as the plain-text handler (#51/#46):
+    // a crash or timeout after the mint accepted must leave a TollGate
+    // record the reconciler can settle (Codex P1 on #52).
+    let cfg_dir = crate::config::config_dir();
+    let entry = crate::payment_journal::PaymentEntry {
+        id: crate::payment_journal::token_id(token),
+        ts: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+        token: token.to_string(),
+        mac: crate::payment_journal::CLI_FUND_MAC.to_string(),
+        mint: String::new(),
+        price_per_step: 1,
+        step_size: 1,
+        metric: "cli".to_string(),
+        phase: crate::payment_journal::PaymentPhase::Intent,
+    };
+    if let Err(e) = crate::payment_journal::append_entry(&cfg_dir, &entry) {
+        tracing::error!(error = %e, "CRITICAL: payment journal unavailable — refusing to move value");
+        return CliResponse::error("payment journal unavailable; fund refused");
+    }
     match wallet.receive(token).await {
-        Ok(amount) => CliResponse::ok(
-            format!("received {amount} sats"),
-            Some(serde_json::json!({ "amount_received": amount })),
-        ),
-        Err(e) => CliResponse::error(format!("wallet receive failed: {e}")),
+        Ok(amount) => {
+            let _ = crate::payment_journal::append_entry(
+                &cfg_dir,
+                &crate::payment_journal::PaymentEntry {
+                    phase: crate::payment_journal::PaymentPhase::Received { amount_sat: amount },
+                    ..entry
+                },
+            );
+            CliResponse::ok(
+                format!("received {amount} sats"),
+                Some(serde_json::json!({ "amount_received": amount })),
+            )
+        }
+        Err(e) => {
+            // Ambiguous, not failed (#43 semantics).
+            let _ = crate::payment_journal::append_entry(
+                &cfg_dir,
+                &crate::payment_journal::PaymentEntry {
+                    phase: crate::payment_journal::PaymentPhase::TimeoutUnknown,
+                    ..entry
+                },
+            );
+            CliResponse::error(format!(
+                "wallet receive failed (outcome journaled; reconciliation will settle it): {e}"
+            ))
+        }
     }
 }
 
@@ -232,8 +275,51 @@ async fn handle_wallet_drain_cashu(state: &AppState) -> CliResponse {
         if *balance == 0 {
             continue;
         }
+        // Durable intent BEFORE the send (Codex P1 on #52): a crash between
+        // send and the token journal must not strand withdrawn value with
+        // no record; ambiguity (timeout) likewise leaves a marker.
+        let cfg_dir = crate::config::config_dir();
+        let op = format!(
+            "drain-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+        );
+        let pj_entry = crate::payout_journal::PayoutEntry {
+            id: crate::payout_journal::entry_id(mint_url, "cli-drain", &op),
+            token: None,
+            ts: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            mint: mint_url.clone(),
+            identity: "cli-drain".to_string(),
+            invoice: op,
+            amount_sat: *balance,
+            literal_invoice: false,
+            phase: crate::payout_journal::PayoutPhase::Intent,
+        };
+        if let Err(e) = crate::payout_journal::append_entry(&cfg_dir, &pj_entry) {
+            tracing::error!(error = %e, mint = %mint_url, "CRITICAL: payout journal unavailable — refusing to drain");
+            errors.push(serde_json::json!({
+                "mint_url": mint_url,
+                "error": "journal unavailable; drain refused",
+            }));
+            continue;
+        }
         match wallet.send(mint_url, *balance, false).await {
             Ok(token) => {
+                // Token durable in the payout journal immediately (the
+                // per-mint drain journal remains the audit ledger).
+                let _ = crate::payout_journal::append_entry(
+                    &cfg_dir,
+                    &crate::payout_journal::PayoutEntry {
+                        token: Some(token.clone()),
+                        phase: crate::payout_journal::PayoutPhase::TokenCreated,
+                        ..pj_entry.clone()
+                    },
+                );
                 if let Err(e) = super::drain_journal::append(mint_url, *balance, &token) {
                     tracing::error!(
                         mint = %mint_url,
@@ -263,6 +349,15 @@ async fn handle_wallet_drain_cashu(state: &AppState) -> CliResponse {
             }
             Err(e) => {
                 tracing::warn!(mint = %mint_url, error = %e, "failed to drain mint");
+                // Ambiguous, not plain-failed: the send may have produced a
+                // token after the caller gave up (Codex P1 on #52).
+                let _ = crate::payout_journal::append_entry(
+                    &cfg_dir,
+                    &crate::payout_journal::PayoutEntry {
+                        phase: crate::payout_journal::PayoutPhase::Ambiguous,
+                        ..pj_entry.clone()
+                    },
+                );
                 errors.push(serde_json::json!({
                     "mint_url": mint_url,
                     "error": e.to_string(),

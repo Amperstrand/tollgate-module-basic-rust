@@ -48,8 +48,10 @@ fi
 GONUTS_EXPORT_DIR="$REPO_DIR/tools/gonuts-export"
 GONUTS_EXPORT="$SCRIPT_DIR/.gonuts-export-$ARCH"
 echo "--- Building gonuts-export ($GOARCH, static) ---"
-( cd "$GONUTS_EXPORT_DIR" && CGO_ENABLED=0 GOOS=linux GOARCH="$GOARCH" ${GOARM:+GOARM="$GOARM"} \
-    go build -trimpath -ldflags="-s -w" -o "$GONUTS_EXPORT" ./ )
+# env(1) carries GOARM: a ${VAR:+...} expansion in assignment-prefix
+# position is NOT treated as an assignment by the shell — without env,
+# `GOARM=7` becomes a package argument to `go build` (Codex P2 on #52).
+( cd "$GONUTS_EXPORT_DIR" && env CGO_ENABLED=0 GOOS=linux GOARCH="$GOARCH" ${GOARM:+GOARM="$GOARM"} go build -trimpath -ldflags="-s -w" -o "$GONUTS_EXPORT" ./ )
 
 # Step 2: Create staging directory
 STAGE=$(mktemp -d)
