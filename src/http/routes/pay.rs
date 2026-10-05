@@ -472,31 +472,56 @@ pub async fn handle_pay(
         .map(|m| m.min_purchase_steps.max(1))
         .unwrap_or(1);
     if steps < min_steps {
-        let msg = format!(
-            "payment rejected: {steps} step(s) at {price_per_step} sat/step is below the minimum purchase of {min_steps} step(s) after swap fees"
-        );
+        // The value has MOVED — a post-receive rejection here is the exact
+        // AGENTS.md L58-63 defect ("do not add new validations after value
+        // moves"): the customer's token is consumed and a 400 says
+        // "rejected". The pre-receive precheck already enforced the face
+        // value; only fees can bring the NET below the minimum. Grant what
+        // was paid when it buys at least one step; otherwise journal
+        // durable credit (reconciled like any undecided payment) and tell
+        // the customer the truth.
         tracing::warn!(
             received_sat = received_amount,
-            "post-fee amount below minimum"
+            steps,
+            min_steps,
+            "post-fee amount below minimum — never rejecting after value moved"
         );
-        let event = nostr_event::create_event(
-            21023,
-            vec![
-                vec!["level".to_string(), "error".to_string()],
-                vec!["code".to_string(), "session-error".to_string()],
-            ],
-            &msg,
-            &state.identity.secret_key,
-        );
-        let json = serde_json::to_string(&event).unwrap_or_default();
-        return (
-            StatusCode::BAD_REQUEST,
-            [
-                ("content-type", "application/json"),
-                ("access-control-allow-origin", "*"),
-            ],
-            json,
-        );
+        if steps == 0 {
+            let _ = payment_journal::append_entry(
+                &cfg_dir,
+                &payment_journal::PaymentEntry {
+                    phase: payment_journal::PaymentPhase::ReconcileZeroSteps {
+                        amount_sat: received_amount,
+                    },
+                    ..intent.clone()
+                },
+            );
+            let msg = format!(
+                "payment received but consumed by swap fees ({received_amount} sats net): recorded as credit for this device — no session granted"
+            );
+            let event = nostr_event::create_event(
+                21023,
+                vec![
+                    vec!["level".to_string(), "error".to_string()],
+                    vec![
+                        "code".to_string(),
+                        "payment-below-minimum-credited".to_string(),
+                    ],
+                ],
+                &msg,
+                &state.identity.secret_key,
+            );
+            let json = serde_json::to_string(&event).unwrap_or_default();
+            return (
+                StatusCode::OK,
+                [
+                    ("content-type", "application/json"),
+                    ("access-control-allow-origin", "*"),
+                ],
+                json,
+            );
+        }
+        // 1..min_steps: fall through and grant the steps actually paid for.
     }
 
     let step_size = state.config.step_size;
@@ -551,10 +576,11 @@ pub async fn handle_pay(
     }
     drop(sessions);
 
-    // Terminal journal append AFTER the session is durable: a `received`
-    // entry MEANS "session durably granted". A crash before this append
-    // leaves intent-only, which reconciliation re-decides (spent →
-    // re-grant; same-MAC overwrite is idempotent).
+    // Terminal journal append AFTER the session is durable AND the gate is
+    // open (Codex P1 on #52): a `received` entry MEANS "session granted AND
+    // usable". A gate failure below rolls the session back — leaving the
+    // journal at intent would strand a spent token, so the rollback path
+    // re-marks the entry ambiguous for reconciliation to re-grant later.
     let _ = payment_journal::append_entry(
         &cfg_dir,
         &payment_journal::PaymentEntry {
@@ -567,9 +593,19 @@ pub async fn handle_pay(
 
     // Open the gate to grant network access via ndsctl. Failure rolls the
     // session back (Go: restoreSession) and answers with a session-error
-    // notice instead of a success event.
+    // notice instead of a success event. The journal re-marks the payment
+    // ambiguous (Codex P1 on #52): the token is spent, the session is
+    // rolled back, and reconciliation re-grants on a later attempt/boot
+    // instead of stranding it behind a terminal `received`.
     if let Err(e) = state.portal.grant_access(&mac).await {
         tracing::warn!(mac = %mac, error = %e, "failed to open gate; rolling session back");
+        let _ = payment_journal::append_entry(
+            &cfg_dir,
+            &payment_journal::PaymentEntry {
+                phase: payment_journal::PaymentPhase::TimeoutUnknown,
+                ..intent.clone()
+            },
+        );
         let mut sessions = state.sessions.lock().await;
         sessions.rollback_session(&mac, snapshot);
         sessions

@@ -1,3 +1,8 @@
+// clippy 1.99's double_must_use fires on every #[async_trait] trait
+// (the macro pins boxed must_use futures; the lint is a toolchain-roll
+// artifact, not a code defect). Remove if the lint learns async_trait.
+#![allow(clippy::double_must_use)]
+
 //! Library root for tollgate-module-basic-rust.
 
 pub mod cli;

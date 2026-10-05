@@ -55,7 +55,7 @@ impl Connector {
     }
 
     /// Connect to a gateway by configuring a STA interface.
-    pub fn connect(&self, gateway: &Gateway, password: &str) -> Result<(), WirelessError> {
+    pub fn connect(&self, gateway: &Gateway, password: &str) -> Result<String, WirelessError> {
         let sta = self.find_available_sta_interface()?;
 
         self.disable_other_sta_interfaces(&sta)?;
@@ -81,7 +81,7 @@ impl Connector {
         Self::execute_uci(&["commit", "network"])?;
         Self::reload_wifi()?;
 
-        Ok(())
+        Ok(sta)
     }
 
     /// Disconnect by disabling all STA interfaces.

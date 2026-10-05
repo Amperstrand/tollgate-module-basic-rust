@@ -205,17 +205,26 @@ impl UpstreamManager {
         match wallet.send(mint_url, amount_sat, false).await {
             Ok(token) => {
                 // THE fund-safety record: the bearer token is durable
-                // BEFORE any delivery attempt — a crash here loses nothing.
-                let _ = pj::append_entry(
+                // BEFORE any delivery attempt — a crash here loses nothing
+                // (Codex P1 on #52: if this append FAILS, delivery must be
+                // refused — proceeding would create withdrawable value
+                // with no recoverable token record).
+                if let Err(e) = pj::append_entry(
                     &cfg_dir,
                     &pj::PayoutEntry {
                         token: Some(token.clone()),
                         phase: pj::PayoutPhase::TokenCreated,
                         ..intent.clone()
                     },
-                );
+                ) {
+                    tracing::error!(error = %e, "CRITICAL: send succeeded but the token could not be made durable — refusing delivery; the wallet's send saga is the recovery record; do not re-purchase until reconciled");
+                    return None;
+                }
                 let client = reqwest::Client::new();
                 let result = session.send_payment(&token, &client).await;
+                // Every post-send phase carries the token (Codex P1 on
+                // #52): last-write-wins must never hide the recovery
+                // surface from undelivered_tokens.
                 let phase = if result.success {
                     pj::PayoutPhase::Delivered
                 } else {
@@ -235,6 +244,7 @@ impl UpstreamManager {
                 let _ = pj::append_entry(
                     &cfg_dir,
                     &pj::PayoutEntry {
+                        token: Some(token),
                         phase,
                         ..intent.clone()
                     },
@@ -351,10 +361,34 @@ impl UpstreamManager {
         .await;
 
         match connect_outcome {
-            Ok(Ok(())) => {
+            Ok(Ok(sta_iface)) => {
                 tracing::info!(ssid = %gateway.ssid, signal = gateway.signal, "connected to gateway");
 
-                let mut session = UpstreamSession::new("gateway", &gateway.radio);
+                // Codex P1 on #52: capture the STA interface the connector
+                // actually used — pricing route lookups depend on it and it
+                // was previously never assigned (None → every purchase
+                // silently skipped).
+                self.sta_interface = Some(sta_iface);
+
+                // Codex P1 on #52: the gateway IP must come from the STA
+                // route, not the literal host "gateway" (no DNS on normal
+                // OpenWrt networks — delivery would always fail).
+                let gateway_ip = sta_gateway_ip(self.sta_interface.as_deref());
+                let mut session = match gateway_ip {
+                    Some(ip) => UpstreamSession::new(&ip, &gateway.radio),
+                    None => {
+                        // No route yet (DHCP still settling) — treat like a
+                        // failed probe: retry next tick, never pay a guess.
+                        tracing::warn!(
+                            "no default route on STA after connect — deferring purchase"
+                        );
+                        self.current_session = Some(UpstreamSession::new("", &gateway.radio));
+                        self.current_gateway = Some(gateway.clone());
+                        self.consecutive_failures = 0;
+                        self.state = ManagerState::Connected;
+                        return ManagerAction::NoAction;
+                    }
+                };
                 if let Some(wallet_ref) = wallet {
                     // #38: price, then purchase + deliver under the durable
                     // contract (intent → token-created(token durable) →
