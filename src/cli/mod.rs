@@ -736,6 +736,7 @@ mod tests {
         assert!(v.contains("openwrt"));
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn status_returns_running() {
         let state = make_test_state();
@@ -750,6 +751,7 @@ mod tests {
         assert_eq!(json["migration"]["pending"], 0);
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn wallet_balance_returns_zero_for_empty_wallet() {
         let state = make_test_state();
@@ -760,6 +762,7 @@ mod tests {
         assert_eq!(json["message"], "0");
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn wallet_info_returns_json() {
         let state = make_test_state();
@@ -805,6 +808,7 @@ mod tests {
         assert!(json["message"].is_string());
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn unknown_command_returns_error() {
         let state = make_test_state();
@@ -814,6 +818,7 @@ mod tests {
         assert!(json["error"].as_str().unwrap().contains("unknown command"));
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn migrate_nonexistent_file_returns_error() {
         let state = make_test_state();
@@ -859,6 +864,7 @@ mod tests {
         assert_eq!(report["failed"], 2);
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn test_health_command_returns_status() {
         let state = make_test_state();
@@ -872,6 +878,7 @@ mod tests {
         assert!(health["mints_reachable"].as_u64().is_some());
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn test_config_get_returns_value() {
         let state = make_test_state();
@@ -901,6 +908,7 @@ mod tests {
         std::env::remove_var("TOLLGATE_TEST_CONFIG_DIR");
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn test_unknown_subcommand_under_wallet_returns_error() {
         let state = make_test_state();
