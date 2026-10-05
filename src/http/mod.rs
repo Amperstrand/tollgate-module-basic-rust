@@ -47,6 +47,10 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route("/usage", axum::routing::get(routes::usage::handle_usage))
         .route(
+            "/session-state",
+            axum::routing::get(routes::usage::handle_session_state),
+        )
+        .route(
             "/balance",
             axum::routing::get(routes::balance::handle_balance),
         )
