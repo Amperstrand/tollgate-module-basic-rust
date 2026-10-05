@@ -246,7 +246,7 @@ impl PayoutRoutine {
 
         let balance: u64 = balances
             .iter()
-            .find(|(url, _)| url.trim_end_matches('/') == config.mint_url.trim_end_matches('/'))
+            .find(|(url, _)| crate::mint_url::mint_urls_equal(url, &config.mint_url))
             .map(|(_, bal)| *bal)
             .unwrap_or(0);
 

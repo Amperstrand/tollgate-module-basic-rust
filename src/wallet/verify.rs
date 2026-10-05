@@ -30,7 +30,7 @@ impl TokenVerifier {
         Self {
             accepted_mints: mint_urls
                 .into_iter()
-                .map(|u| u.trim_end_matches('/').to_string())
+                .map(|u| crate::mint_url::canonicalize_mint_url(&u))
                 .collect(),
             client: build_http_client(),
         }
@@ -46,12 +46,9 @@ impl TokenVerifier {
             .mint_url()
             .map_err(|e| VerifyError::NoMintUrl(e.to_string()))?;
         let mint_url_str = mint_url.to_string();
-        let mint_base = mint_url_str.trim_end_matches('/').to_string();
+        let mint_base = crate::mint_url::canonicalize_mint_url(&mint_url_str);
 
-        if !self.accepted_mints.is_empty()
-            && !self.accepted_mints.contains(&mint_base)
-            && !self.accepted_mints.contains(&mint_url_str)
-        {
+        if !self.accepted_mints.is_empty() && !self.accepted_mints.contains(&mint_base) {
             return Err(VerifyError::MintNotAccepted(mint_url_str));
         }
 

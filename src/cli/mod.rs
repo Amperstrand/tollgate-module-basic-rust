@@ -12,6 +12,12 @@ use tokio::net::UnixListener;
 use crate::config;
 use crate::http::AppState;
 
+pub mod client;
+pub mod drain_journal;
+pub mod jsonproto;
+pub mod ssl;
+pub mod x509;
+
 /// Socket path — honors TOLLGATE_TEST_CONFIG_DIR for tests.
 pub fn socket_path() -> PathBuf {
     std::env::var("TOLLGATE_TEST_CONFIG_DIR")
@@ -85,7 +91,11 @@ async fn handle_connection(stream: tokio::net::UnixStream, state: Arc<AppState>)
             Ok(0) => break, // EOF
             Ok(_) => {
                 let cmd = line.trim();
-                let response = handle_command(cmd, &state).await;
+                let response = if cmd.starts_with('{') {
+                    jsonproto::handle_json_line(cmd, &state).await
+                } else {
+                    handle_command(cmd, &state).await
+                };
                 if let Err(e) = writer.write_all(response.as_bytes()).await {
                     tracing::warn!(error = %e, "write failed on CLI socket");
                     break;
@@ -678,16 +688,11 @@ mod tests {
     use crate::session::SessionManager;
     use crate::wallet::TollWallet;
     use serial_test::serial;
-    use std::sync::Once;
-
-    static INIT: Once = Once::new();
 
     fn make_test_state() -> Arc<AppState> {
-        INIT.call_once(|| {
-            let dir = std::env::temp_dir().join("tollgate-cli-tests");
-            std::fs::create_dir_all(&dir).ok();
-            std::env::set_var("TOLLGATE_TEST_CONFIG_DIR", &dir);
-        });
+        // No env mutation here: handle_command never reads
+        // TOLLGATE_TEST_CONFIG_DIR, and a Once-set global would clobber the
+        // value installed by serialized tests in other cli modules.
         let config = Arc::new(Config::new_default());
 
         let secp = secp256k1::Secp256k1::new();

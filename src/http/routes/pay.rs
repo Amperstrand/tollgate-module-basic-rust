@@ -101,10 +101,9 @@ pub(crate) fn precheck_payment(
     token_mint_url: &str,
     accepted_mints: &[crate::config::MintConfig],
 ) -> Result<PaymentPrecheck, PrecheckError> {
-    let mint_config = accepted_mints.iter().find(|m| {
-        let cfg_url = m.url.trim_end_matches('/');
-        cfg_url == token_mint_url || m.url == token_mint_url
-    });
+    let mint_config = accepted_mints
+        .iter()
+        .find(|m| crate::mint_url::mint_urls_equal(&m.url, token_mint_url));
 
     let mint_config = match mint_config {
         Some(m) => m,
@@ -451,33 +450,98 @@ pub async fn handle_pay(
     };
     drop(wallet_guard);
 
-    // Step 3: create session — allotment in the metric's unit (bytes or ms)
+    // Step 3 (Go grantSessionAccess parity): snapshot → extend-or-create →
+    // gate open with rollback on failure. A failed gate must roll the
+    // session back and answer with a session-error notice — never a 200
+    // claiming a grant that did not happen.
     let duration_secs = 3600u64;
     let price_per_step = precheck.price_per_step;
 
     // The mint may have charged swap fees, so the received amount can be
     // lower than the verified face value. Allotment follows the value that
-    // actually arrived; a received amount too small to buy a step after
-    // fees is logged (and shortchanges the customer by at most one step's
-    // price) — it must never reject after value moved.
+    // actually arrived. If the fee-reduced amount no longer buys the
+    // configured minimum, Go rejects with a session-error notice; parity
+    // does the same (the value is in the wallet; the discrepancy is
+    // reconciled operationally via the wallet balance).
     let steps = received_amount / price_per_step;
-    if steps == 0 {
+    let min_steps = state
+        .config
+        .accepted_mints
+        .iter()
+        .find(|m| crate::mint_url::mint_urls_equal(&m.url, &token_mint_url))
+        .map(|m| m.min_purchase_steps.max(1))
+        .unwrap_or(1);
+    if steps < min_steps {
+        // The value has MOVED — a post-receive rejection here is the exact
+        // AGENTS.md L58-63 defect ("do not add new validations after value
+        // moves"): the customer's token is consumed and a 400 says
+        // "rejected". The pre-receive precheck already enforced the face
+        // value; only fees can bring the NET below the minimum. Grant what
+        // was paid when it buys at least one step; otherwise journal
+        // durable credit (reconciled like any undecided payment) and tell
+        // the customer the truth.
         tracing::warn!(
             received_sat = received_amount,
-            price_per_step,
-            "received amount bought zero steps after swap fees; granting empty session is impossible — reconcile via payment record (issue #5)"
+            steps,
+            min_steps,
+            "post-fee amount below minimum — never rejecting after value moved"
         );
+        if steps == 0 {
+            let _ = payment_journal::append_entry(
+                &cfg_dir,
+                &payment_journal::PaymentEntry {
+                    phase: payment_journal::PaymentPhase::ReconcileZeroSteps {
+                        amount_sat: received_amount,
+                    },
+                    ..intent.clone()
+                },
+            );
+            let msg = format!(
+                "payment received but consumed by swap fees ({received_amount} sats net): recorded as credit for this device — no session granted"
+            );
+            let event = nostr_event::create_event(
+                21023,
+                vec![
+                    vec!["level".to_string(), "error".to_string()],
+                    vec![
+                        "code".to_string(),
+                        "payment-below-minimum-credited".to_string(),
+                    ],
+                ],
+                &msg,
+                &state.identity.secret_key,
+            );
+            let json = serde_json::to_string(&event).unwrap_or_default();
+            return (
+                StatusCode::OK,
+                [
+                    ("content-type", "application/json"),
+                    ("access-control-allow-origin", "*"),
+                ],
+                json,
+            );
+        }
+        // 1..min_steps: fall through and grant the steps actually paid for.
     }
 
     let step_size = state.config.step_size;
     let allotment = steps * step_size;
 
     let mut sessions = state.sessions.lock().await;
-    let _session = sessions.create_session(&mac, allotment, &state.config.metric, duration_secs);
-    // save_now (NOT the debounced save_to_disk): a debounced Ok(()) writes
-    // nothing, and the terminal journal append below must not advance
-    // until the session is DURABLY recoverable (Codex P1 on #43; the
-    // session module's save_now docs mandate exactly this ordering).
+    let snapshot = sessions.snapshot_session(&mac);
+    let extended =
+        sessions.add_allotment(&mac, &state.config.metric, allotment, duration_secs, None);
+    // The event reports the session's accumulated total (Go parity), not
+    // just this payment's delta.
+    let total_allotment = sessions
+        .get_session(&mac)
+        .map(|s| s.allotment)
+        .unwrap_or(allotment);
+    // Payment-grant durability + journal ordering (#43, Codex P1 there):
+    // save_now (NOT the debounced save_to_disk — a debounced Ok(()) writes
+    // nothing), and the terminal journal append must not advance until the
+    // session is DURABLY recoverable. A save failure after value moved
+    // answers outcome-unknown; reconciliation re-grants later.
     if let Err(e) = sessions.save_now(&crate::config::config_dir()) {
         tracing::error!(error = %e, "CRITICAL: session not durable after receive — answering outcome-unknown; reconciliation will re-grant");
         drop(sessions);
@@ -512,11 +576,55 @@ pub async fn handle_pay(
     }
     drop(sessions);
 
-    // Terminal journal append AFTER the session is durable (Codex P1 on
-    // #43): a `received` entry then MEANS "session durably granted". A
-    // crash before this append leaves intent-only, which startup
-    // reconciliation re-decides (spent → re-grant; same-MAC overwrite is
-    // idempotent) instead of stranding a settled-but-sessionless payment.
+    // Open the gate to grant network access via ndsctl. Failure rolls the
+    // session back (Go: restoreSession) and answers with a session-error
+    // notice instead of a success event. The journal re-marks the payment
+    // ambiguous (Codex P1 on #52): the token is spent, the session is
+    // rolled back, and reconciliation re-grants on a later attempt/boot
+    // instead of stranding it behind a terminal `received`.
+    if let Err(e) = state.portal.grant_access(&mac).await {
+        tracing::warn!(mac = %mac, error = %e, "failed to open gate; rolling session back");
+        let _ = payment_journal::append_entry(
+            &cfg_dir,
+            &payment_journal::PaymentEntry {
+                phase: payment_journal::PaymentPhase::TimeoutUnknown,
+                ..intent.clone()
+            },
+        );
+        let mut sessions = state.sessions.lock().await;
+        sessions.rollback_session(&mac, snapshot);
+        sessions
+            .save_now(&crate::config::config_dir())
+            .unwrap_or_else(|err| {
+                tracing::error!(error = %err, "failed to persist session rollback");
+            });
+        drop(sessions);
+        let msg = format!("failed to open gate: {e}");
+        let event = nostr_event::create_event(
+            21023,
+            vec![
+                vec!["level".to_string(), "error".to_string()],
+                vec!["code".to_string(), "session-error".to_string()],
+            ],
+            &msg,
+            &state.identity.secret_key,
+        );
+        let json = serde_json::to_string(&event).unwrap_or_default();
+        return (
+            StatusCode::BAD_REQUEST,
+            [
+                ("content-type", "application/json"),
+                ("access-control-allow-origin", "*"),
+            ],
+            json,
+        );
+    }
+
+    // Terminal journal append AFTER the gate opens (Codex P1 on #52,
+    // round 2): `received` MEANS "session granted AND gate open". A crash
+    // before this append leaves intent-only → reconciliation re-grants; an
+    // explicit gate failure re-marks ambiguous below → reconciliation
+    // re-grants. No window strands a spent token behind a terminal phase.
     let _ = payment_journal::append_entry(
         &cfg_dir,
         &payment_journal::PaymentEntry {
@@ -527,21 +635,19 @@ pub async fn handle_pay(
         },
     );
 
-    // Open the gate to grant network access via ndsctl.
-    if let Err(e) = state.portal.grant_access(&mac).await {
-        tracing::warn!(mac = %mac, error = %e, "failed to open gate");
-        // Continue anyway — session is created, gate may be opened manually.
-    }
-
     tracing::info!(
         verified_msat = verified_amount,
         received_sat = received_amount,
         allotment = allotment,
+        extended,
         "session granted"
     );
 
-    // Step 4: return kind 1022 session-granted event
-    session_granted_event(&state, &mac, allotment)
+    // Step 4: return kind 1022 session-granted event (start-time always
+    // present — observed Go behavior renews StartTime on AddAllotment; the
+    // event reports the accumulated total, Go parity).
+    let _ = extended;
+    session_granted_event(&state, &mac, total_allotment)
 }
 
 fn session_granted_event(

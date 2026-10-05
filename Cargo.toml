@@ -45,11 +45,20 @@ secp256k1 = { version = "0.29", features = ["rand", "global-context", "serde"] }
 rand = "0.8"
 # Same crate + version CDK itself uses for mnemonic handling (cdk dev-deps):
 # BIP39 phrase -> 64-byte seed is the ecosystem's NUT-13 recovery convention.
-bip39 = { version = "2.0", features = ["rand"] }
+# Version "2.2" per the identity-derivation lane; rand feature per #37's
+# mnemonic generation.
+bip39 = { version = "2.2", features = ["rand"] }
 
 # Hex / hashing for Nostr event IDs
 hex = "0.4"
 sha2 = "0.10"
+
+# Identity derivation (Go src/identity parity): NIP-06 mnemonic -> key
+# (bip39 seed + hand-rolled BIP32 path), bech32 npub, HKDF domain hashes.
+# bip39 is declared above (#37 mnemonic lane); bech32 sits in the tree via
+# cdk, hmac is new but tiny.
+bech32 = "0.11"
+hmac = "0.12"
 
 # Error derive macro
 thiserror = "1"

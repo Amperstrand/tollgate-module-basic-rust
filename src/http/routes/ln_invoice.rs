@@ -5,12 +5,24 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 
+const MAX_LIGHTNING_INVOICE_SATS: u64 = 1_000_000;
+// The venue-detection contract (PRTA) matches this string inside the FIRST
+// 200 chars of the body — it must lead the `error` text, not live only in
+// the trailing `code` field.
+const DEVICE_UNRESOLVED_MESSAGE: &str = "mac-address-lookup-failed: we could not identify your device on the network. Reconnect to the TollGate Wi-Fi and try again.";
+// The PRTA venue-detection contract keys on this exact string
+// (loopback clients have no resolvable MAC → tests skip): renaming it
+// broke the whole ln_invoice lane. Keep it stable.
+const DEVICE_UNRESOLVED_CODE: &str = "mac-address-lookup-failed";
+
 #[derive(Debug, Deserialize)]
 pub struct CreateInvoiceRequest {
     #[serde(default)]
     pub amount: u64,
     #[serde(default)]
     pub unit: Option<String>,
+    #[serde(default, alias = "mint")]
+    pub mint_url: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -32,6 +44,35 @@ struct LightningInvoiceResponse {
     metric: String,
     #[serde(skip_serializing_if = "String::is_empty", default)]
     error: String,
+    #[serde(skip_serializing_if = "String::is_empty", default)]
+    code: String,
+    #[serde(skip_serializing_if = "is_zero_u64", default)]
+    retry_after: u64,
+}
+
+impl LightningInvoiceResponse {
+    fn refusal(error: &str) -> LightningInvoiceResponse {
+        LightningInvoiceResponse {
+            status: 0,
+            quote: String::new(),
+            invoice: String::new(),
+            mint_url: String::new(),
+            amount: 0,
+            expiry: 0,
+            state: String::new(),
+            access_granted: false,
+            allotment: 0,
+            metric: String::new(),
+            error: error.to_string(),
+            code: String::new(),
+            retry_after: 0,
+        }
+    }
+
+    fn with_code(mut self, code: &str) -> Self {
+        self.code = code.to_string();
+        self
+    }
 }
 
 fn is_zero_u64(v: &u64) -> bool {
@@ -62,47 +103,100 @@ pub async fn handle_create_ln_invoice(
     axum::extract::ConnectInfo(remote_addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
     axum::Json(req): axum::Json<CreateInvoiceRequest>,
 ) -> Response {
+    // mint_url stays OPTIONAL (main's tested API contract: the PRTA suite
+    // posts {"amount": N} and expects the first accepted mint — requiring
+    // it broke backward compat). An explicit mint_url must match an
+    // accepted mint; absent means the first accepted mint.
+    let explicit_mint = req
+        .mint_url
+        .clone()
+        .map(|m| m.trim().to_string())
+        .filter(|m| !m.is_empty());
+
     if req.amount == 0 {
         return json_response(
             StatusCode::BAD_REQUEST,
-            serde_json::json!({"error": "amount must be greater than 0"}),
+            LightningInvoiceResponse::refusal("amount must be greater than 0"),
         );
     }
 
-    let mint = match state.config.accepted_mints.first() {
-        Some(m) => m,
-        None => {
-            return json_response(
-                StatusCode::BAD_REQUEST,
-                serde_json::json!({"error": "no accepted mints configured"}),
-            );
-        }
+    let mint_cfg = match &explicit_mint {
+        Some(url) => match state
+            .config
+            .accepted_mints
+            .iter()
+            .find(|m| crate::mint_url::mint_urls_equal(&m.url, url))
+        {
+            Some(m) => m.clone(),
+            None => {
+                return json_response(
+                    StatusCode::BAD_REQUEST,
+                    LightningInvoiceResponse::refusal("mint not accepted"),
+                );
+            }
+        },
+        None => match state.config.accepted_mints.first() {
+            Some(m) => m.clone(),
+            None => {
+                return json_response(
+                    StatusCode::BAD_REQUEST,
+                    LightningInvoiceResponse::refusal("no accepted mints configured"),
+                );
+            }
+        },
     };
-    // Store the CDK-canonical identity: a quote surviving a restart must
-    // match the wallet map and config even if the configured spelling
-    // changes to an equivalent alias (AGENTS.md mint-URL canonicalization).
-    let mint_url = crate::wallet::canonical_mint_url(&mint.url);
+    let mint_url = crate::wallet::canonical_mint_url(&mint_cfg.url);
+
+    if req.amount > MAX_LIGHTNING_INVOICE_SATS {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            LightningInvoiceResponse::refusal(
+                "Amount too large: this TollGate accepts at most 1000000 sats per invoice.",
+            )
+            .with_code("amount-too-large"),
+        );
+    }
+
+    // Store the canonical identity: a quote surviving a restart must match
+    // the wallet map and config even if the configured spelling changes to
+    // an equivalent alias (AGENTS.md mint-URL canonicalization).
+    let mint_url = crate::wallet::canonical_mint_url(&mint_url);
 
     // AGENTS.md: validations possible locally run before any value moves.
     // An invoice below price_per_step/min_purchase_steps would settle to a
     // zero-step session after the mint already moved the paid value
-    // (mirrors precheck_payment in pay.rs).
-    let price_per_step = mint.price_per_step.max(1);
-    let min_steps = mint.min_purchase_steps.max(1);
-    let steps = req.amount / price_per_step;
-    if steps < min_steps {
-        return json_response(
-            StatusCode::BAD_REQUEST,
-            serde_json::json!({
-                "error": format!(
-                    "amount below minimum purchase: {steps} step(s) at {price_per_step} sat/step, minimum is {min_steps} step(s)"
-                ),
-                "steps": steps,
-                "min_steps": min_steps,
-                "price_per_step": price_per_step,
-            }),
-        );
-    }
+    // (mirrors precheck_payment in pay.rs). Pricing comes from the
+    // accepted-mint config matching the requested mint; a request naming
+    // an unaccepted mint finds no config here and is refused later by the
+    // wallet lookup, before any invoice exists.
+    let accepted = state
+        .config
+        .accepted_mints
+        .iter()
+        .find(|m| crate::mint_url::mint_urls_equal(&m.url, &mint_url));
+    let steps = if let Some(mint) = accepted {
+        let price_per_step = mint.price_per_step.max(1);
+        let min_steps = mint.min_purchase_steps.max(1);
+        let steps = req.amount / price_per_step;
+        if steps < min_steps {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({
+                    "error": format!(
+                        "amount below minimum purchase: {steps} step(s) at {price_per_step} sat/step, minimum is {min_steps} step(s)"
+                    ),
+                    "steps": steps,
+                    "min_steps": min_steps,
+                    "price_per_step": price_per_step,
+                }),
+            );
+        }
+        steps
+    } else {
+        // No matching accepted-mint config: the wallet lookup below refuses
+        // the request before any invoice exists.
+        0
+    };
 
     // The MAC is resolved at creation time and stored with the quote: the
     // monitor that later grants the session (possibly after a restart)
@@ -113,19 +207,8 @@ pub async fn handle_create_ln_invoice(
         None => {
             return json_response(
                 StatusCode::BAD_REQUEST,
-                LightningInvoiceResponse {
-                    status: 0,
-                    quote: String::new(),
-                    invoice: String::new(),
-                    mint_url: String::new(),
-                    amount: req.amount,
-                    expiry: 0,
-                    state: "error".to_string(),
-                    access_granted: false,
-                    allotment: 0,
-                    metric: String::new(),
-                    error: "mac-address-lookup-failed".to_string(),
-                },
+                LightningInvoiceResponse::refusal(DEVICE_UNRESOLVED_MESSAGE)
+                    .with_code(DEVICE_UNRESOLVED_CODE),
             );
         }
     };
@@ -135,20 +218,8 @@ pub async fn handle_create_ln_invoice(
         Some(w) => w,
         None => {
             return json_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                LightningInvoiceResponse {
-                    status: 0,
-                    quote: String::new(),
-                    invoice: String::new(),
-                    mint_url,
-                    amount: req.amount,
-                    expiry: 0,
-                    state: "error".to_string(),
-                    access_granted: false,
-                    allotment: 0,
-                    metric: String::new(),
-                    error: "wallet not initialized".to_string(),
-                },
+                StatusCode::BAD_REQUEST,
+                LightningInvoiceResponse::refusal("failed to create lightning invoice"),
             );
         }
     };
@@ -156,6 +227,9 @@ pub async fn handle_create_ln_invoice(
     match wallet.request_mint_quote(&mint_url, req.amount).await {
         Ok(info) => {
             let now = crate::lightning_quotes::now_secs();
+            // Terms frozen at creation (0 = derive at settlement, used when
+            // the mint carried no matching accepted-mint config).
+            let allotment = steps * state.config.step_size;
             let record = crate::lightning_quotes::LightningQuoteRecord {
                 quote: info.id.clone(),
                 mint_url: mint_url.clone(),
@@ -164,7 +238,7 @@ pub async fn handle_create_ln_invoice(
                 created_at: now,
                 expiry: info.expiry,
                 minted: false,
-                allotment: steps * state.config.step_size,
+                allotment,
                 metric: state.config.metric.clone(),
                 allotment_added: false,
                 session_granted: false,
@@ -176,19 +250,7 @@ pub async fn handle_create_ln_invoice(
                 let _ = state.ln_quotes.remove(&info.id).await;
                 return json_response(
                     StatusCode::SERVICE_UNAVAILABLE,
-                    LightningInvoiceResponse {
-                        status: 0,
-                        quote: String::new(),
-                        invoice: String::new(),
-                        mint_url: mint_url.clone(),
-                        amount: req.amount,
-                        expiry: 0,
-                        state: "error".to_string(),
-                        access_granted: false,
-                        allotment: 0,
-                        metric: String::new(),
-                        error: "quote persistence failed".to_string(),
-                    },
+                    LightningInvoiceResponse::refusal("failed to create lightning invoice"),
                 );
             }
 
@@ -206,26 +268,16 @@ pub async fn handle_create_ln_invoice(
                     allotment: 0,
                     metric: String::new(),
                     error: String::new(),
+                    code: String::new(),
+                    retry_after: 0,
                 },
             )
         }
         Err(e) => {
             tracing::warn!(error = ?e, "ln-invoice: mint quote failed");
             json_response(
-                StatusCode::BAD_GATEWAY,
-                LightningInvoiceResponse {
-                    status: 0,
-                    quote: String::new(),
-                    invoice: String::new(),
-                    mint_url: mint_url.clone(),
-                    amount: req.amount,
-                    expiry: 0,
-                    state: "error".to_string(),
-                    access_granted: false,
-                    allotment: 0,
-                    metric: String::new(),
-                    error: format!("mint quote failed: {e}"),
-                },
+                StatusCode::BAD_REQUEST,
+                LightningInvoiceResponse::refusal("failed to create lightning invoice"),
             )
         }
     }
@@ -233,28 +285,49 @@ pub async fn handle_create_ln_invoice(
 
 pub async fn handle_get_ln_invoice(
     State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::ConnectInfo(remote_addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
     Query(q): Query<InvoiceQuery>,
 ) -> Response {
-    let stored = state.ln_quotes.get(&q.quote).await;
+    let quote_id = q.quote.trim().to_string();
+    if quote_id.is_empty() {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            LightningInvoiceResponse::refusal("quote is required"),
+        );
+    }
 
-    let stored = match stored {
-        Some(s) => s,
+    // Unknown quotes are 404 BEFORE any device gating (main's tested
+    // contract: the PRTA unknown-quote probe has no MAC skip and demands
+    // 404 regardless of venue).
+    let Some(stored_any) = state.ln_quotes.get(&quote_id).await else {
+        return json_response(
+            StatusCode::NOT_FOUND,
+            LightningInvoiceResponse::refusal("quote not found"),
+        );
+    };
+
+    // The quote is bound to the device MAC at creation time; polling is only
+    // answered for that same device (identity from the socket, never a query
+    // parameter).
+    let client_ip = crate::mac_resolver::get_client_ip(&headers, Some(remote_addr));
+    let mac = match crate::mac_resolver::get_mac_address(&client_ip) {
+        Some(m) => m,
         None => {
             return json_response(
-                StatusCode::NOT_FOUND,
-                LightningInvoiceResponse {
-                    status: 0,
-                    quote: q.quote,
-                    invoice: String::new(),
-                    mint_url: String::new(),
-                    amount: 0,
-                    expiry: 0,
-                    state: "unpaid".to_string(),
-                    access_granted: false,
-                    allotment: 0,
-                    metric: String::new(),
-                    error: "quote not found".to_string(),
-                },
+                StatusCode::BAD_REQUEST,
+                LightningInvoiceResponse::refusal(DEVICE_UNRESOLVED_MESSAGE)
+                    .with_code(DEVICE_UNRESOLVED_CODE),
+            );
+        }
+    };
+
+    let stored = match stored_any.mac == mac {
+        true => stored_any,
+        false => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                LightningInvoiceResponse::refusal("failed to fetch invoice status"),
             );
         }
     };
@@ -290,6 +363,8 @@ pub async fn handle_get_ln_invoice(
                 allotment,
                 metric,
                 error: String::new(),
+                code: String::new(),
+                retry_after: 0,
             },
         );
     }
@@ -298,7 +373,7 @@ pub async fn handle_get_ln_invoice(
         let wallet_guard = state.wallet.read().await;
         match wallet_guard.as_ref() {
             Some(wallet) => match wallet
-                .check_mint_quote_state(&stored.mint_url, &q.quote)
+                .check_mint_quote_state(&stored.mint_url, &quote_id)
                 .await
             {
                 Ok(raw) => (
@@ -325,6 +400,8 @@ pub async fn handle_get_ln_invoice(
             allotment: 0,
             metric: String::new(),
             error: String::new(),
+            code: String::new(),
+            retry_after: 0,
         },
     )
 }

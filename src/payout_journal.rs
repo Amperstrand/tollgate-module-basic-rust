@@ -42,6 +42,19 @@ pub enum PayoutPhase {
     Ambiguous,
     /// Definitive melt failure (mint rejected, LNURL fetch failed, ...).
     Failed { reason: String },
+    /// SEND op (reseller upstream, #38): wallet.send succeeded and the
+    /// bearer token is durably recorded in `entry.token` BEFORE any
+    /// delivery attempt — a crash here can never lose created value.
+    TokenCreated,
+    /// The recorded token was accepted by the upstream gateway.
+    Delivered,
+    /// Delivery failed definitively (upstream rejected). The token is
+    /// still recorded and spendable by the operator.
+    DeliveryFailed { reason: String },
+    /// Delivery outcome unknown (transport reset after send). The token
+    /// is recorded; re-delivering the SAME token is safe — bearer value
+    /// is consumed at most once at the upstream's mint.
+    DeliveryAmbiguous,
     /// An ambiguous melt whose saga has since settled; paid-vs-compensated
     /// is not distinguishable at journal level (the wallet balance is the
     /// operator's signal). Terminal; never re-melted.
@@ -200,6 +213,15 @@ pub fn decide(
             }
         }
         Some(PayoutPhase::Failed { .. }) => (MeltDecision::Proceed, None),
+        // SEND-op phases (#38) never flow through the melt decision; they
+        // are terminal for this table's purposes (the reseller purchase
+        // path consults undelivered_tokens instead).
+        Some(
+            PayoutPhase::TokenCreated
+            | PayoutPhase::Delivered
+            | PayoutPhase::DeliveryFailed { .. }
+            | PayoutPhase::DeliveryAmbiguous,
+        ) => (MeltDecision::SkipDone, None),
         Some(PayoutPhase::Ambiguous) => {
             if mint_has_unresolved_melt_saga {
                 (MeltDecision::SkipSurface, None)
@@ -300,6 +322,32 @@ pub fn summarize(dir: &Path) -> PayoutsSummary {
         }
     }
     s
+}
+
+/// Reseller-upstream consult (#38): tokens created but not provably
+/// delivered — the journal's recovery surface for the purchase path. A
+/// duplicate purchase attempt must surface/re-deliver these instead of
+/// minting fresh value.
+pub fn undelivered_tokens(dir: &Path, identity: &str) -> Vec<PayoutEntry> {
+    fold_last(&read_journal(dir))
+        .into_values()
+        .filter(|e| {
+            e.identity == identity
+                && (e.token.is_some()
+                    && matches!(
+                        e.phase,
+                        PayoutPhase::TokenCreated
+                            | PayoutPhase::DeliveryAmbiguous
+                            | PayoutPhase::DeliveryFailed { .. }
+                    )
+                    // A send that timed out left no captured token, but the
+                    // saga may still produce one — it blocks repurchase
+                    // until explicitly reconciled (Codex P1 on #52):
+                    // value may already have moved.
+                    || matches!(e.phase, PayoutPhase::Ambiguous))
+        })
+        .cloned()
+        .collect()
 }
 
 /// The last phase recorded for a specific melt identity key, if any.

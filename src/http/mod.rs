@@ -37,6 +37,14 @@ pub fn create_router(state: AppState) -> Router {
             axum::routing::get(routes::discovery::handle_discovery).post(routes::pay::handle_pay),
         )
         .route("/whoami", axum::routing::get(routes::whoami::handle_whoami))
+        .route(
+            "/identity",
+            axum::routing::get(routes::identity::handle_get_identity),
+        )
+        .route(
+            "/identity/reveal-seed",
+            axum::routing::post(routes::identity::handle_reveal_seed),
+        )
         .route("/usage", axum::routing::get(routes::usage::handle_usage))
         .route(
             "/balance",

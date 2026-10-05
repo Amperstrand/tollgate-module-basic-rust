@@ -173,11 +173,10 @@ pub(crate) fn find_mint_config<'a>(
     config: &'a crate::config::Config,
     mint_url: &str,
 ) -> Option<&'a crate::config::MintConfig> {
-    let canonical = crate::wallet::canonical_mint_url(mint_url);
     config
         .accepted_mints
         .iter()
-        .find(|m| crate::wallet::canonical_mint_url(&m.url) == canonical)
+        .find(|m| crate::mint_url::mint_urls_equal(&m.url, mint_url))
 }
 
 /// Settlement outcome for one monitored quote, returned for tests and

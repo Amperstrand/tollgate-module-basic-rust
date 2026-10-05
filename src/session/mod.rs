@@ -92,9 +92,13 @@ impl SessionManager {
 
     /// Add allotment to an existing session, or create a new one if none
     /// exists. Returns `true` if an existing session was extended, `false`
-    /// if a new session was created. Extending resets `used` to 0 and
-    /// refreshes `granted_at` / `expiry`. `grant_id`, when set, is the
-    /// durable idempotency key checked by `has_grant`.
+    /// Add allotment to an existing session, or create a new one if none
+    /// exists. Returns `true` if an existing session was extended, `false`
+    /// if a new session was created. Go parity (`AddAllotment`): the
+    /// existing `used` counter is preserved — only the allotment grows and
+    /// `granted_at`/`expiry` refresh (the monitor re-syncs `used` from the
+    /// gate's own counters). `grant_id`, when set, is the durable
+    /// idempotency key checked by `has_grant`.
     pub fn add_allotment(
         &mut self,
         mac: &str,
@@ -111,7 +115,6 @@ impl SessionManager {
             Some(session) => {
                 session.allotment += amount;
                 session.granted_at = now;
-                session.used = 0;
                 session.expiry = now + duration_secs;
                 if let Some(id) = grant_id {
                     session.last_grant_id = Some(id.to_string());
@@ -138,6 +141,25 @@ impl SessionManager {
             .get(mac)
             .and_then(|s| s.last_grant_id.as_deref())
             .is_some_and(|id| id == grant_id)
+    }
+
+    /// Restore a previously snapshotted session for `mac` (gate-open
+    /// rollback), or remove the session when the snapshot says there was
+    /// none.
+    pub fn rollback_session(&mut self, mac: &str, snapshot: Option<CustomerSession>) {
+        match snapshot {
+            Some(prev) => {
+                self.sessions.insert(mac.to_string(), prev);
+            }
+            None => {
+                self.sessions.remove(mac);
+            }
+        }
+    }
+
+    /// Snapshot a session for a later [`rollback_session`].
+    pub fn snapshot_session(&self, mac: &str) -> Option<CustomerSession> {
+        self.sessions.get(mac).cloned()
     }
 
     /// Look up a session by MAC address.

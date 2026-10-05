@@ -146,7 +146,13 @@ pub fn resolve_all_ips_from_mac(mac: &str) -> Vec<IpAddr> {
 /// We replicate that guard: forwarding headers are consulted iff
 /// `remote_addr` is a loopback address.
 pub fn get_client_ip(headers: &HeaderMap, remote_addr: Option<SocketAddr>) -> String {
-    let is_local = remote_addr.map(|sa| sa.ip().is_loopback()).unwrap_or(false);
+    // to_canonical(): on a dual-stack listener (Go's ":2121" parity) an IPv4
+    // peer arrives as ::ffff:a.b.c.d; Go's net package reports those as plain
+    // IPv4, and every downstream consumer (lease/ARP lookups, session keys)
+    // compares the plain form.
+    let is_local = remote_addr
+        .map(|sa| sa.ip().to_canonical().is_loopback())
+        .unwrap_or(false);
 
     if is_local {
         if let Some(real_ip) = headers.get(HeaderName::from_static("x-real-ip")) {
@@ -172,7 +178,7 @@ pub fn get_client_ip(headers: &HeaderMap, remote_addr: Option<SocketAddr>) -> St
     // Fallback: socket remote address (host part only, matches Go's
     // net.SplitHostPort → host).
     if let Some(sa) = remote_addr {
-        return sa.ip().to_string();
+        return sa.ip().to_canonical().to_string();
     }
     String::new()
 }
@@ -269,6 +275,22 @@ mod tests {
         let headers = HeaderMap::new();
         let ip = get_client_ip(&headers, Some(make_v4("127.0.0.1", 12345)));
         assert_eq!(ip, "127.0.0.1");
+    }
+
+    #[test]
+    fn client_ip_canonicalizes_ipv4_mapped_remote_on_dual_stack() {
+        // Dual-stack listener (Go ":2121" parity): IPv4 peers arrive as
+        // ::ffff:a.b.c.d and must surface as the plain IPv4 form — lease/ARP
+        // lookups and session keys all compare the plain string.
+        let headers = HeaderMap::new();
+        let sa: SocketAddr = "[::ffff:10.99.99.100]:54321".parse().unwrap();
+        assert_eq!(get_client_ip(&headers, Some(sa)), "10.99.99.100");
+
+        // Mapped loopback counts as loopback for header trust (Go parity).
+        let mut headers = HeaderMap::new();
+        headers.insert("x-real-ip", "10.99.99.100".parse().unwrap());
+        let sa: SocketAddr = "[::ffff:127.0.0.1]:54321".parse().unwrap();
+        assert_eq!(get_client_ip(&headers, Some(sa)), "10.99.99.100");
     }
 
     #[test]

@@ -73,16 +73,13 @@ const RECOVERY_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub use crate::error::WalletError;
 
-/// One canonical mint identity for every persisted/compared URL
-/// (AGENTS.md: route mint URLs through CDK's `MintUrl` form — lowercase
-/// scheme/host, trailing slash trimmed — or alias spellings fork wallet
-/// map keys, quote records, and DB filenames).
+/// One canonical mint identity for every persisted/compared URL.
+/// Delegates to [`crate::mint_url::canonicalize_mint_url`] (Go
+/// `NormalizeMintURL` parity) so the whole crate compares and persists
+/// through a single canonical form — alias spellings must not fork wallet
+/// map keys, quote records, and DB filenames.
 pub fn canonical_mint_url(url: &str) -> String {
-    use std::str::FromStr;
-    let trimmed = url.trim_end_matches('/');
-    cdk::mint_url::MintUrl::from_str(trimmed)
-        .map(|u| u.to_string())
-        .unwrap_or_else(|_| trimmed.to_string())
+    crate::mint_url::canonicalize_mint_url(url)
 }
 
 /// Pure NUT-07 classification of one token from per-proof mint states.
@@ -181,7 +178,7 @@ impl TollWallet {
             || self
                 .accepted_mints
                 .iter()
-                .any(|m| canonical_mint_url(m) == canonical_mint_url(mint_url))
+                .any(|m| crate::mint_url::mint_urls_equal(m, mint_url))
     }
 
     /// Register a mint and open a CDK wallet for it.
@@ -191,8 +188,8 @@ impl TollWallet {
             return Err(WalletError::MintNotAccepted(mint_url.to_string()));
         }
 
-        let normalized = canonical_mint_url(mint_url);
-        if self.wallets.contains_key(normalized.as_str()) {
+        let normalized = crate::mint_url::canonicalize_mint_url(mint_url);
+        if self.wallets.contains_key(&normalized) {
             return Ok(());
         }
 
@@ -310,11 +307,11 @@ impl TollWallet {
             .mint_url()
             .map_err(|e| WalletError::TokenParse(format!("{e}")))?
             .to_string();
-        let normalized = canonical_mint_url(&mint_url);
+        let normalized = crate::mint_url::canonicalize_mint_url(&mint_url);
 
         let wallet = self
             .wallets
-            .get(normalized.as_str())
+            .get(&normalized)
             .ok_or_else(|| WalletError::WalletNotFound(normalized.to_string()))?
             .clone();
 
@@ -379,7 +376,7 @@ impl TollWallet {
             .mint_url()
             .map_err(|e| WalletError::TokenParse(format!("{e}")))?
             .to_string();
-        let normalized = canonical_mint_url(&mint_url);
+        let normalized = crate::mint_url::canonicalize_mint_url(&mint_url);
         let amount_sat: u64 = token.value().map(|a| a.into()).unwrap_or(0);
 
         let wallet = self
@@ -620,7 +617,7 @@ impl TollWallet {
             .mint_url()
             .map_err(|e| WalletError::TokenParse(format!("{e}")))?
             .to_string();
-        let normalized = canonical_mint_url(&mint_url);
+        let normalized = crate::mint_url::canonicalize_mint_url(&mint_url);
 
         let wallet = match self.wallets.get(normalized.as_str()) {
             Some(w) => w.clone(),
@@ -766,10 +763,10 @@ impl TollWallet {
         amount_sat: u64,
         include_fee: bool,
     ) -> Result<String, WalletError> {
-        let normalized = canonical_mint_url(mint_url);
+        let normalized = crate::mint_url::canonicalize_mint_url(mint_url);
         let wallet = self
             .wallets
-            .get(normalized.as_str())
+            .get(&normalized)
             .ok_or_else(|| WalletError::WalletNotFound(normalized.to_string()))?
             .clone();
 
@@ -828,10 +825,10 @@ impl TollWallet {
         mint_url: &str,
         amount_sat: u64,
     ) -> Result<MintQuoteInfo, WalletError> {
-        let normalized = canonical_mint_url(mint_url);
+        let normalized = crate::mint_url::canonicalize_mint_url(mint_url);
         let wallet = self
             .wallets
-            .get(normalized.as_str())
+            .get(&normalized)
             .ok_or_else(|| WalletError::WalletNotFound(normalized.to_string()))?
             .clone();
 
@@ -870,10 +867,10 @@ impl TollWallet {
         mint_url: &str,
         quote_id: &str,
     ) -> Result<MintQuoteState, WalletError> {
-        let normalized = canonical_mint_url(mint_url);
+        let normalized = crate::mint_url::canonicalize_mint_url(mint_url);
         let wallet = self
             .wallets
-            .get(normalized.as_str())
+            .get(&normalized)
             .ok_or_else(|| WalletError::WalletNotFound(normalized.to_string()))?
             .clone();
 
@@ -893,10 +890,10 @@ impl TollWallet {
     /// Mint tokens from a paid quote (NUT-04, maps gonuts `MintTokens`).
     /// CDK API: `wallet.mint(quote_id, SplitTarget, Option<SpendingConditions>)`.
     pub async fn mint_tokens(&self, mint_url: &str, quote_id: &str) -> Result<u64, WalletError> {
-        let normalized = canonical_mint_url(mint_url);
+        let normalized = crate::mint_url::canonicalize_mint_url(mint_url);
         let wallet = self
             .wallets
-            .get(normalized.as_str())
+            .get(&normalized)
             .ok_or_else(|| WalletError::WalletNotFound(normalized.to_string()))?
             .clone();
 
@@ -925,10 +922,10 @@ impl TollWallet {
     /// Request a melt quote + prepare melt (NUT-05, maps gonuts `RequestMeltQuote` + `Melt`).
     /// CDK flow: `melt_quote(BOLT11, invoice)` → `prepare_melt(quote_id, meta)` → `confirm()`.
     pub async fn melt(&self, mint_url: &str, invoice: &str) -> Result<MeltQuoteInfo, WalletError> {
-        let normalized = canonical_mint_url(mint_url);
+        let normalized = crate::mint_url::canonicalize_mint_url(mint_url);
         let wallet = self
             .wallets
-            .get(normalized.as_str())
+            .get(&normalized)
             .ok_or_else(|| WalletError::WalletNotFound(normalized.to_string()))?
             .clone();
 
