@@ -233,3 +233,108 @@ fn drain_token_field_round_trips() {
     assert_eq!(last.token.as_deref(), Some("cashuAdelivered"));
     assert_eq!(last.phase, PayoutPhase::Paid);
 }
+
+// ── #38: reseller-upstream durable-record contract ───────────────────
+
+use tollgate_module_basic_rust::payout_journal::undelivered_tokens;
+
+fn reseller_entry(phase: PayoutPhase, token: Option<String>) -> PayoutEntry {
+    PayoutEntry {
+        id: entry_id(
+            "https://gw-mint.example",
+            "reseller-upstream",
+            "upstream-op-1",
+        ),
+        token,
+        ts: 1,
+        mint: "https://gw-mint.example".into(),
+        identity: "reseller-upstream".into(),
+        invoice: "upstream-op-1".into(),
+        amount_sat: 4,
+        literal_invoice: false,
+        phase,
+    }
+}
+
+#[test]
+fn token_created_before_delivery_is_the_recovery_surface() {
+    let dir = tempfile::tempdir().unwrap();
+    // Crash window: send succeeded, delivery never attempted/happened.
+    append_entry(dir.path(), &reseller_entry(PayoutPhase::Intent, None)).unwrap();
+    append_entry(
+        dir.path(),
+        &reseller_entry(PayoutPhase::TokenCreated, Some("cashuAundelivered".into())),
+    )
+    .unwrap();
+
+    let undelivered = undelivered_tokens(dir.path(), "reseller-upstream");
+    assert_eq!(undelivered.len(), 1);
+    assert_eq!(undelivered[0].token.as_deref(), Some("cashuAundelivered"));
+
+    // The duplicate-attempt consult: this non-empty list is what blocks
+    // minting fresh value in journalled_purchase.
+}
+
+#[test]
+fn delivered_tokens_leave_the_recovery_surface() {
+    let dir = tempfile::tempdir().unwrap();
+    append_entry(
+        dir.path(),
+        &reseller_entry(PayoutPhase::TokenCreated, Some("cashuAtok".into())),
+    )
+    .unwrap();
+    append_entry(
+        dir.path(),
+        &reseller_entry(PayoutPhase::Delivered, Some("cashuAtok".into())),
+    )
+    .unwrap();
+    assert!(undelivered_tokens(dir.path(), "reseller-upstream").is_empty());
+}
+
+#[test]
+fn delivery_ambiguous_and_failed_stay_recoverable() {
+    let dir = tempfile::tempdir().unwrap();
+    append_entry(
+        dir.path(),
+        &reseller_entry(PayoutPhase::DeliveryAmbiguous, Some("cashuAamb".into())),
+    )
+    .unwrap();
+    append_entry(
+        dir.path(),
+        &PayoutEntry {
+            id: entry_id(
+                "https://gw-mint.example",
+                "reseller-upstream",
+                "upstream-op-2",
+            ),
+            invoice: "upstream-op-2".into(),
+            phase: PayoutPhase::DeliveryFailed {
+                reason: "HTTP 400".into(),
+            },
+            token: Some("cashuArej".into()),
+            ..reseller_entry(
+                PayoutPhase::DeliveryFailed {
+                    reason: String::new(),
+                },
+                None,
+            )
+        },
+    )
+    .unwrap();
+    let undelivered = undelivered_tokens(dir.path(), "reseller-upstream");
+    assert_eq!(undelivered.len(), 2, "both remain recoverable surfaces");
+}
+
+#[test]
+fn send_op_phases_are_terminal_for_the_melt_decision_table() {
+    // Belt-and-suspenders: the send phases must never fall into an
+    // uncovered arm of decide() (compile-exhaustive, but pinned anyway).
+    assert_eq!(
+        decide(Some(&PayoutPhase::TokenCreated), false, false).0,
+        MeltDecision::SkipDone
+    );
+    assert_eq!(
+        decide(Some(&PayoutPhase::Delivered), false, false).0,
+        MeltDecision::SkipDone
+    );
+}

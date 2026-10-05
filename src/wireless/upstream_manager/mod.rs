@@ -9,7 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use super::connector::Connector;
 use super::scanner::Scanner;
 use super::types::{Gateway, NetworkInfo, UpstreamWifiConfig};
-use crate::reseller::upstream_session::UpstreamSession;
+use crate::reseller::upstream_session::{UpstreamPaymentResult, UpstreamSession};
 use crate::upstream_detector::gateway_prober::GatewayProber;
 use crate::wallet::TollWallet;
 
@@ -139,16 +139,139 @@ impl UpstreamManager {
         }
     }
 
-    /// Create an outbound Cashu token sized for one purchase from the
-    /// gateway. Pricing comes from the gateway's live advertisement (kind
-    /// 10021); renewal sizes the new purchase like the session it replaces
-    /// (Go uses a configured preferred increment — approximation documented
-    /// in PARITY.md). Returns None when the wallet cannot pay.
+    /// #38 durable-record contract for the reseller purchase path
+    /// (mint_payment_token → wallet.send → send_payment → apply_payment).
+    ///
+    /// Crash-window table:
+    /// | death point | durable journal | consequence |
+    /// |---|---|---|
+    /// | before send | intent | nothing moved |
+    /// | after send, before delivery | `token-created` + TOKEN STRING | value recoverable — re-deliver or operator redeems; NEVER re-mint |
+    /// | during delivery | `token-created` (or delivery-ambiguous) | re-deliver SAME token (bearer value consumed once upstream) |
+    /// | after delivery, before apply | `delivered` | session lost but paid-once; next cycle is a NEW purchase |
+    ///
+    /// Duplicate attempts consult the journal first: an undelivered token
+    /// for this identity blocks minting fresh value.
+    async fn journalled_purchase(
+        wallet: &TollWallet,
+        mint_url: &str,
+        amount_sat: u64,
+        session: &mut UpstreamSession,
+    ) -> Option<UpstreamPaymentResult> {
+        use crate::payout_journal as pj;
+
+        let cfg_dir = crate::config::config_dir();
+        const IDENTITY: &str = "reseller-upstream";
+
+        // Duplicate-attempt gate (#38): never mint fresh value while an
+        // earlier purchase's token is undelivered — surface instead.
+        let undelivered = pj::undelivered_tokens(&cfg_dir, IDENTITY);
+        if !undelivered.is_empty() {
+            tracing::error!(
+                count = undelivered.len(),
+                total_sat = undelivered.iter().map(|e| e.amount_sat).sum::<u64>(),
+                "reseller purchase BLOCKED: undelivered payment token(s) from an earlier attempt exist in {} — recover them (re-deliver or redeem) before purchasing again",
+                pj::journal_path(&cfg_dir).display()
+            );
+            return None;
+        }
+
+        let op = format!(
+            "upstream-{mint_url}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+        );
+        let intent = pj::PayoutEntry {
+            id: pj::entry_id(mint_url, IDENTITY, &op),
+            ts: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            token: None,
+            mint: String::new(),
+            identity: IDENTITY.to_string(),
+            invoice: op,
+            amount_sat,
+            literal_invoice: false,
+            phase: pj::PayoutPhase::Intent,
+        };
+        if let Err(e) = pj::append_entry(&cfg_dir, &intent) {
+            tracing::error!(error = %e, "CRITICAL: payout journal unavailable — refusing to mint payment value with no recovery record");
+            return None;
+        }
+
+        match wallet.send(mint_url, amount_sat, false).await {
+            Ok(token) => {
+                // THE fund-safety record: the bearer token is durable
+                // BEFORE any delivery attempt — a crash here loses nothing.
+                let _ = pj::append_entry(
+                    &cfg_dir,
+                    &pj::PayoutEntry {
+                        token: Some(token.clone()),
+                        phase: pj::PayoutPhase::TokenCreated,
+                        ..intent.clone()
+                    },
+                );
+                let client = reqwest::Client::new();
+                let result = session.send_payment(&token, &client).await;
+                let phase = if result.success {
+                    pj::PayoutPhase::Delivered
+                } else {
+                    let ambiguous = result
+                        .error
+                        .as_deref()
+                        .map(|e| e.contains("request failed"))
+                        .unwrap_or(false);
+                    if ambiguous {
+                        pj::PayoutPhase::DeliveryAmbiguous
+                    } else {
+                        pj::PayoutPhase::DeliveryFailed {
+                            reason: result.error.clone().unwrap_or_default(),
+                        }
+                    }
+                };
+                let _ = pj::append_entry(
+                    &cfg_dir,
+                    &pj::PayoutEntry {
+                        phase,
+                        ..intent.clone()
+                    },
+                );
+                Some(result)
+            }
+            Err(e) => {
+                // Ambiguous (the token may exist undelivered): journal it
+                // — but we have no token string, so it surfaces via the
+                // saga + the warning below rather than as a recoverable token.
+                tracing::error!(
+                    error = %e,
+                    "upstream wallet.send errored — outcome ambiguous; the send saga reconciles at next recovery; no token string was captured"
+                );
+                let _ = pj::append_entry(
+                    &cfg_dir,
+                    &pj::PayoutEntry {
+                        phase: pj::PayoutPhase::Ambiguous,
+                        ..intent.clone()
+                    },
+                );
+                None
+            }
+        }
+    }
+
+    /// Price an upstream purchase from the gateway's live advertisement
+    /// (kind 10021); renewal sizes the new purchase like the session it
+    /// replaces (Go uses a configured preferred increment — approximation
+    /// documented in PARITY.md). Returns (mint_url, amount_sat), or None
+    /// when pricing is impossible. The wallet.send + delivery live in
+    /// journalled_purchase (#38).
     async fn mint_payment_token(
         &self,
         wallet: Option<&TollWallet>,
         renew_sizing: Option<(u64, u64)>,
-    ) -> Option<String> {
+    ) -> Option<(String, u64)> {
         let wallet = wallet?;
 
         // No guessed gateway: pricing and paying whatever answers at an
@@ -180,26 +303,16 @@ impl UpstreamManager {
         };
         let amount_sat = steps.saturating_mul(info.price_per_step.max(1));
 
-        match wallet.send(&info.mint_url, amount_sat, false).await {
-            Ok(token) => {
-                tracing::info!(
-                    mint = %info.mint_url,
-                    amount_sat,
-                    steps,
-                    "created upstream payment token"
-                );
-                Some(token)
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    mint = %info.mint_url,
-                    amount_sat,
-                    "cannot create upstream payment token"
-                );
-                None
-            }
-        }
+        // The send itself lives in journalled_purchase (#38 durable
+        // contract); this fn only prices.
+        let _ = wallet;
+        tracing::debug!(
+            mint = %info.mint_url,
+            amount_sat,
+            steps,
+            "priced upstream purchase"
+        );
+        Some((info.mint_url, amount_sat))
     }
 
     async fn do_scan_and_connect(&mut self, wallet: Option<&TollWallet>) -> ManagerAction {
@@ -242,21 +355,47 @@ impl UpstreamManager {
                 tracing::info!(ssid = %gateway.ssid, signal = gateway.signal, "connected to gateway");
 
                 let mut session = UpstreamSession::new("gateway", &gateway.radio);
-                if let Some(token) = self.mint_payment_token(wallet, None).await {
-                    let client = reqwest::Client::new();
-                    let result = session.send_payment(&token, &client).await;
-                    if result.success {
-                        session.apply_payment(&result);
-                        tracing::info!(
-                            allotment = session.allotment,
-                            metric = %session.metric,
-                            "payment successful, session active"
-                        );
-                    } else {
-                        tracing::warn!(error = ?result.error, "payment failed");
-                        self.blacklist_gateway(&gateway.bssid);
-                        self.state = ManagerState::Idle;
-                        return ManagerAction::PaymentFailed(result.error.unwrap_or_default());
+                if let Some(wallet_ref) = wallet {
+                    // #38: price, then purchase + deliver under the durable
+                    // contract (intent → token-created(token durable) →
+                    // delivered/failed/ambiguous; duplicates consult the
+                    // journal and never re-mint over undelivered value).
+                    if let Some((mint_url, amount_sat)) =
+                        self.mint_payment_token(wallet, None).await
+                    {
+                        match Self::journalled_purchase(
+                            wallet_ref,
+                            &mint_url,
+                            amount_sat,
+                            &mut session,
+                        )
+                        .await
+                        {
+                            Some(result) if result.success => {
+                                session.apply_payment(&result);
+                                tracing::info!(
+                                    allotment = session.allotment,
+                                    metric = %session.metric,
+                                    "payment successful, session active"
+                                );
+                            }
+                            Some(result) => {
+                                tracing::warn!(error = ?result.error, "payment failed");
+                                self.blacklist_gateway(&gateway.bssid);
+                                self.state = ManagerState::Idle;
+                                return ManagerAction::PaymentFailed(
+                                    result.error.unwrap_or_default(),
+                                );
+                            }
+                            None => {
+                                // Undelivered earlier token or journal/send
+                                // failure — surfaced by journalled_purchase.
+                                self.state = ManagerState::Idle;
+                                return ManagerAction::PaymentFailed(
+                                    "purchase blocked or errored (see logs)".to_string(),
+                                );
+                            }
+                        }
                     }
                 }
 
@@ -337,11 +476,24 @@ impl UpstreamManager {
             .filter(|s| s.needs_renewal())
             .map(|s| (s.step_size, s.allotment));
         if let Some(sizing) = renewal {
-            if let Some(token) = self.mint_payment_token(wallet, Some(sizing)).await {
-                let client = reqwest::Client::new();
-                let result = match self.current_session.as_mut() {
-                    Some(session) => session.send_payment(&token, &client).await,
-                    None => return ManagerAction::NoAction,
+            if let Some((mint_url, amount_sat)) =
+                self.mint_payment_token(wallet, Some(sizing)).await
+            {
+                let result = {
+                    let wallet_ref = match wallet {
+                        Some(w) => w,
+                        None => return ManagerAction::NoAction,
+                    };
+                    let session = match self.current_session.as_mut() {
+                        Some(s) => s,
+                        None => return ManagerAction::NoAction,
+                    };
+                    match Self::journalled_purchase(wallet_ref, &mint_url, amount_sat, session)
+                        .await
+                    {
+                        Some(r) => r,
+                        None => return ManagerAction::NoAction,
+                    }
                 };
                 if result.success {
                     if let Some(session) = self.current_session.as_mut() {
