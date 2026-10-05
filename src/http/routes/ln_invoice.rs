@@ -6,7 +6,10 @@ use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 
 const MAX_LIGHTNING_INVOICE_SATS: u64 = 1_000_000;
-const DEVICE_UNRESOLVED_MESSAGE: &str = "We could not identify your device on the network. Reconnect to the TollGate Wi-Fi and try again.";
+// The venue-detection contract (PRTA) matches this string inside the FIRST
+// 200 chars of the body — it must lead the `error` text, not live only in
+// the trailing `code` field.
+const DEVICE_UNRESOLVED_MESSAGE: &str = "mac-address-lookup-failed: we could not identify your device on the network. Reconnect to the TollGate Wi-Fi and try again.";
 // The PRTA venue-detection contract keys on this exact string
 // (loopback clients have no resolvable MAC → tests skip): renaming it
 // broke the whole ln_invoice lane. Keep it stable.
