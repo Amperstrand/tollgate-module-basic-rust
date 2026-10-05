@@ -97,14 +97,49 @@ pub async fn handle_create_ln_invoice(
     axum::extract::ConnectInfo(remote_addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
     axum::Json(req): axum::Json<CreateInvoiceRequest>,
 ) -> Response {
-    let mint_url = req.mint_url.clone().unwrap_or_default().trim().to_string();
+    // mint_url stays OPTIONAL (main's tested API contract: the PRTA suite
+    // posts {"amount": N} and expects the first accepted mint — requiring
+    // it broke backward compat). An explicit mint_url must match an
+    // accepted mint; absent means the first accepted mint.
+    let explicit_mint = req
+        .mint_url
+        .clone()
+        .map(|m| m.trim().to_string())
+        .filter(|m| !m.is_empty());
 
-    if req.amount == 0 || mint_url.is_empty() {
+    if req.amount == 0 {
         return json_response(
             StatusCode::BAD_REQUEST,
-            LightningInvoiceResponse::refusal("amount and mint_url are required"),
+            LightningInvoiceResponse::refusal("amount must be greater than 0"),
         );
     }
+
+    let mint_cfg = match &explicit_mint {
+        Some(url) => match state
+            .config
+            .accepted_mints
+            .iter()
+            .find(|m| crate::mint_url::mint_urls_equal(&m.url, url))
+        {
+            Some(m) => m.clone(),
+            None => {
+                return json_response(
+                    StatusCode::BAD_REQUEST,
+                    LightningInvoiceResponse::refusal("mint not accepted"),
+                );
+            }
+        },
+        None => match state.config.accepted_mints.first() {
+            Some(m) => m.clone(),
+            None => {
+                return json_response(
+                    StatusCode::BAD_REQUEST,
+                    LightningInvoiceResponse::refusal("no accepted mints configured"),
+                );
+            }
+        },
+    };
+    let mint_url = crate::wallet::canonical_mint_url(&mint_cfg.url);
 
     if req.amount > MAX_LIGHTNING_INVOICE_SATS {
         return json_response(
