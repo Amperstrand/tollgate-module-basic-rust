@@ -339,16 +339,16 @@ async fn main() {
                                         proofs = h.proofs_on_inactive_keysets,
                                         "keyset hygiene: proofs on retired keysets — rotating (same-mint swap)"
                                     );
-                                    drop(wallet);
-                                    let mut wr = state.wallet.write().await;
-                                    if let Some(wm) = wr.as_mut() {
-                                        match wm.rotate_inactive_keyset_proofs(mint).await {
-                                            Ok(n) => {
-                                                tracing::info!(mint = %mint, rotated = n, "keyset hygiene: rotated proofs to active keyset")
-                                            }
-                                            Err(e) => {
-                                                tracing::warn!(mint = %mint, error = %e, "keyset rotation failed; retrying next sweep")
-                                            }
+                                    // rotate takes &self (the mint's wallet
+                                    // serializes internally) — keep the READ
+                                    // guard so maintenance never blocks
+                                    // payments or Lightning (Codex P2 on #57).
+                                    match w.rotate_inactive_keyset_proofs(mint).await {
+                                        Ok(n) => {
+                                            tracing::info!(mint = %mint, rotated = n, "keyset hygiene: rotated proofs to active keyset")
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(mint = %mint, error = %e, "keyset rotation failed; retrying next sweep")
                                         }
                                     }
                                     continue;

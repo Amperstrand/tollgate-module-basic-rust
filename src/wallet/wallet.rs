@@ -657,6 +657,7 @@ impl TollWallet {
             None => return Ok(0),
         };
 
+        let normalized_for_recovery = normalized.clone();
         let result = timeout(RECOVERY_TIMEOUT, async {
             let w = wallet.lock().await;
             let keysets = w.keysets(KeysetLoadPolicy::default()).await?;
@@ -686,8 +687,21 @@ impl TollWallet {
 
         match result {
             Ok(Ok(n)) => Ok(n),
-            Ok(Err(e)) => Err(WalletError::Cdk(e)),
-            Err(_) => Err(WalletError::Timeout(RECOVERY_TIMEOUT)),
+            Ok(Err(e)) => {
+                // A swap error may have left an incomplete saga with the
+                // stale inputs reserved — recover now, not at next boot
+                // (Codex P1 on #57: the hygiene sweep reads only unspent
+                // proofs, so reserved inputs would otherwise be invisible
+                // to it until restart).
+                self.spawn_saga_recovery(&normalized_for_recovery);
+                Err(WalletError::Cdk(e))
+            }
+            Err(_) => {
+                // Timeout cancels the swap mid-saga (AGENTS.md L141-144):
+                // same recovery story as every other money-moving wrapper.
+                self.spawn_saga_recovery(&normalized_for_recovery);
+                Err(WalletError::Timeout(RECOVERY_TIMEOUT))
+            }
         }
     }
 
