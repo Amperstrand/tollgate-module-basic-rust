@@ -297,6 +297,16 @@ pub async fn handle_get_ln_invoice(
         );
     }
 
+    // Unknown quotes are 404 BEFORE any device gating (main's tested
+    // contract: the PRTA unknown-quote probe has no MAC skip and demands
+    // 404 regardless of venue).
+    let Some(stored_any) = state.ln_quotes.get(&quote_id).await else {
+        return json_response(
+            StatusCode::NOT_FOUND,
+            LightningInvoiceResponse::refusal("quote not found"),
+        );
+    };
+
     // The quote is bound to the device MAC at creation time; polling is only
     // answered for that same device (identity from the socket, never a query
     // parameter).
@@ -312,9 +322,9 @@ pub async fn handle_get_ln_invoice(
         }
     };
 
-    let stored = match state.ln_quotes.get(&quote_id).await {
-        Some(s) if s.mac == mac => s,
-        _ => {
+    let stored = match stored_any.mac == mac {
+        true => stored_any,
+        false => {
             return json_response(
                 StatusCode::BAD_REQUEST,
                 LightningInvoiceResponse::refusal("failed to fetch invoice status"),
