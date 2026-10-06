@@ -1238,10 +1238,19 @@ impl TollWallet {
         }
 
         tokio::fs::rename(&tmp, path).await?;
+        // The rename's durability must be proven before the seed is used:
+        // an open/sync failure propagates so first boot fails loudly
+        // instead of running on an identity a power loss can strand
+        // (Codex P1 on #37). Bare relative filenames have parent ""
+        // (not openable) — normalize to ".".
         if let Some(parent) = path.parent() {
-            if let Ok(dir) = std::fs::File::open(parent) {
-                let _ = dir.sync_all();
-            }
+            let parent = if parent.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                parent
+            };
+            let dir = std::fs::File::open(parent)?;
+            dir.sync_all()?;
         }
         Ok(())
     }
@@ -1714,6 +1723,34 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("wrong size"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn identity_dir_sync_failure_propagates() {
+        // Codex P1 on #37: a write+rename that succeeds while the parent
+        // directory cannot be opened for fsync is NOT a known-durable
+        // identity write — the error must surface, not be discarded. A
+        // 0o333 directory (write+execute, no read) admits file
+        // create/rename but refuses directory open, isolating exactly the
+        // discarded branch.
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("ids");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o333)).unwrap();
+
+        // Root bypasses permission bits; the branch under test cannot
+        // fire there, so the red-proof does not apply in that context.
+        if std::fs::File::open(&dir).is_ok() {
+            eprintln!("skipping: directory permission bits not enforced (root?)");
+            return;
+        }
+
+        let result = TollWallet::write_file_private(&dir.join("wallet_seed.bin"), &[7u8; 64]).await;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(result.is_err(), "unproven durability must fail loudly");
     }
 
     #[test]
