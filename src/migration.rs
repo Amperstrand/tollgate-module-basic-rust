@@ -657,10 +657,35 @@ impl FirstBootMigration {
                 .unwrap_or_default()
                 .as_secs(),
         );
-        let mut f = File::create(&self.marker).map_err(MigrationError::Io)?;
-        f.write_all(marker_body.as_bytes())
-            .map_err(MigrationError::Io)?;
-        f.sync_all().map_err(MigrationError::Io)?;
+        // Atomic marker write (Codex P1 on #29): an in-place
+        // `File::create` truncates the marker before the new body is
+        // durable, so a crash mid-write leaves an empty file — which
+        // `marker_is_complete` honors as the operator's manual `touch`
+        // and the migration is skipped forever. Write the body to a tmp
+        // file, fsync, rename, then fsync the directory: a crash leaves
+        // either the previous marker or the new complete one, never a
+        // torn empty one.
+        let marker_tmp = self.marker.with_extension("tmp");
+        {
+            let mut f = File::create(&marker_tmp).map_err(MigrationError::Io)?;
+            f.write_all(marker_body.as_bytes())
+                .map_err(MigrationError::Io)?;
+            f.sync_all().map_err(MigrationError::Io)?;
+        }
+        std::fs::rename(&marker_tmp, &self.marker).map_err(MigrationError::Io)?;
+        // Best-effort (unlike the wallet-identity write): the marker is
+        // atomically in place and the journal converges a lost rename on
+        // the next re-run, so a dir-sync failure after the rename is
+        // logged, not fatal.
+        if let Some(parent) = self.marker.parent() {
+            match std::fs::File::open(parent).and_then(|dir| dir.sync_all()) {
+                Ok(()) => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, "migration: marker dir fsync failed (marker is atomically in place)"
+                    );
+                }
+            }
+        }
 
         Ok(finish)
     }
@@ -980,6 +1005,42 @@ mod tests {
         assert!(!m.old_db.exists(), "old db renamed away on clean finish");
         assert!(m.old_db.with_file_name(OLD_DB_BACKUP_NAME).exists());
         assert!(!m.should_run(), "complete marker must block further runs");
+    }
+
+    #[test]
+    fn finish_replaces_marker_atomically_never_in_place() {
+        // Codex P1 on #29: a crash between an in-place marker truncation
+        // and its body write leaves an empty marker, which
+        // `marker_is_complete` reads as the operator's manual `touch` —
+        // the migration is then skipped forever. Contract: the new body
+        // must be fully written + fsynced at a tmp path and only then
+        // renamed over the marker. A tmp path that cannot be created (a
+        // directory stands in for any pre-rename failure) proves the
+        // ordering: the existing marker survives the failed attempt.
+        let dir = tempfile::tempdir().unwrap();
+        let m = setup(dir.path(), &["cashuAtoken1"], &[]);
+        let prior = "state=partial\nfailed=1\n";
+        std::fs::write(&m.marker, prior).unwrap();
+        std::fs::create_dir(m.marker.with_extension("tmp")).unwrap();
+
+        let result = m.finish(MigrationSummary {
+            imported: 0,
+            failed: 1,
+            skipped_already_imported: 0,
+            pending: 0,
+            spent: 0,
+            spent_sat: 0,
+            partially_spent: 0,
+            partially_spent_unspent_sat: 0,
+            remainder_recovered_sat: 0,
+        });
+
+        assert!(result.is_err(), "an unwritable tmp must abort the finish");
+        assert_eq!(
+            std::fs::read_to_string(&m.marker).unwrap(),
+            prior,
+            "the existing marker must not be touched before its replacement is durable"
+        );
     }
 
     #[test]
