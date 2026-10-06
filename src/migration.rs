@@ -732,6 +732,21 @@ pub fn summarize_state(db_dir: &Path) -> MigrationState {
             .lines()
             .find_map(|l| l.trim().strip_prefix("state="))
             .map(str::to_string);
+        // Codex P2 on #37: a legacy marker (no `state=` line) with
+        // `failed=N` describes an incomplete migration — startup's
+        // `marker_is_complete` retries it — but its failures predate the
+        // journal, so journal-only counts would report settled. Fold the
+        // marker's count in; it disappears once the converging re-run
+        // finishes and writes a `state=` marker.
+        if marker_state.is_none() {
+            if let Some(failed) = body
+                .lines()
+                .find_map(|l| l.trim().strip_prefix("failed="))
+                .and_then(|v| v.parse::<u64>().ok())
+            {
+                state.failed += failed;
+            }
+        }
         state.marker = Some(marker_state.unwrap_or_else(|| "legacy".into()));
     }
     for outcome in fold_last_outcomes(&read_journal(&m.journal)).into_values() {
@@ -1019,6 +1034,55 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let m = FirstBootMigration::new(dir.path());
         assert!(!m.should_run());
+    }
+
+    #[test]
+    fn legacy_marker_failure_counts_keep_state_unsettled() {
+        // Codex P2 on #37: the legacy format (`failed=N`, no `state=`)
+        // predates the journal — its failures must surface in the status
+        // surface, which otherwise reports `settled: true` while startup
+        // still treats the migration as incomplete and retries it.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(MARKER_NAME),
+            "imported=10\nfailed=2\ndate=1759000000\n",
+        )
+        .unwrap();
+
+        let state = summarize_state(dir.path());
+        assert_eq!(state.marker.as_deref(), Some("legacy"));
+        assert_eq!(state.failed, 2);
+        assert!(!state.is_settled());
+    }
+
+    #[test]
+    fn current_marker_failures_are_not_double_counted() {
+        // Journal-backed failures plus a CURRENT marker (has `state=`):
+        // the marker's counts are a snapshot of the same journal, so only
+        // the journal is counted.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(MARKER_NAME),
+            "state=partial\nfailed=1\npending=0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join(JOURNAL_NAME),
+            format!(
+                "{}\n",
+                serde_json::to_string(&JournalEntry {
+                    token: "t1".to_string(),
+                    outcome: TokenOutcome::Failed { reason: "x".into() },
+                })
+                .unwrap()
+            ),
+        )
+        .unwrap();
+
+        let state = summarize_state(dir.path());
+        assert_eq!(state.marker.as_deref(), Some("partial"));
+        assert_eq!(state.failed, 1);
+        assert!(!state.is_settled());
     }
 
     /// Fakes the mint side and records, at the moment `receive` runs,
