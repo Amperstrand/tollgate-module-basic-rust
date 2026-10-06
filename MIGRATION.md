@@ -533,11 +533,25 @@ keep whichever file matches the wallet that holds the funds.
 
 ### Recover the wallet on new hardware
 
-1. Install the package and write the mnemonic to
-   `/etc/tollgate/wallet_mnemonic.txt` (mode 0600). Do **not** create
-   `wallet_seed.bin` — it is re-derived from the phrase automatically.
-2. Configure `accepted_mints` with every mint the wallet used.
-3. Start the service, then run the NUT-13 restore (batched NUT-09 restore
+1. Install the package. **Caution:** the post-install hook enables and
+   starts the service immediately (openwrt/Makefile), and that first
+   start generates a *fresh* wallet identity (`wallet_seed.bin` +
+   `wallet_mnemonic.txt`). That generated identity is not the one being
+   recovered — stop the service and delete it before proceeding:
+
+   ```
+   /etc/init.d/tollgate-wrt stop
+   rm -f /etc/tollgate/wallet_seed.bin /etc/tollgate/wallet_mnemonic.txt
+   rm -f /etc/tollgate/*.sqlite   # only if a config with mints was present
+   ```
+
+   Leaving the generated seed in place makes the next start fail with a
+   seed/mnemonic mismatch instead of performing recovery.
+2. Write the recovery mnemonic to `/etc/tollgate/wallet_mnemonic.txt`
+   (mode 0600). Do **not** create `wallet_seed.bin` — it is re-derived
+   from the phrase automatically.
+3. Configure `accepted_mints` with every mint the wallet used.
+4. Start the service, then run the NUT-13 restore (batched NUT-09 restore
    with NUT-07 pruning, per mint):
 
 ```
