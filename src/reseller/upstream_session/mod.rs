@@ -3,6 +3,11 @@
 use serde::Deserialize;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+/// Derived expiry for grants that carry no `expiry` tag and whose metric
+/// is not time-metered — mirrors the 3600s duration this repo's own
+/// payment handler grants (pay.rs create_session).
+const NO_EXPIRY_GRANT_DEFAULT_SECS: u64 = 3600;
+
 /// Response from the upstream TollGate after a successful payment.
 #[derive(Debug, Clone, Deserialize)]
 struct SessionGrantEvent {
@@ -180,6 +185,7 @@ impl UpstreamSession {
             expiry: 0,
             error: None,
         };
+        let mut start_time: Option<u64> = None;
 
         for tag in &event.tags {
             if tag.len() < 2 {
@@ -190,6 +196,7 @@ impl UpstreamSession {
                 "metric" => result.metric = tag[1].clone(),
                 "step_size" => result.step_size = tag[1].parse().unwrap_or(0),
                 "expiry" => result.expiry = tag[1].parse().unwrap_or(0),
+                "start-time" => start_time = tag[1].parse().ok(),
                 _ => {}
             }
         }
@@ -197,6 +204,25 @@ impl UpstreamSession {
         if result.allotment == 0 {
             result.success = false;
             result.error = Some("no allotment in session grant".to_string());
+        }
+
+        // Codex P1 on #55: Go's kind-1022 carries no `expiry` tag (wire
+        // parity verified against OpenTollGate/tollgate-module-basic-go),
+        // so a grant without one must DERIVE an expiry here — left at
+        // zero, the monitor's is_expired() (0 ⇒ expired) discards the
+        // paid session on its first tick and forces a re-purchase.
+        if result.success && result.expiry == 0 {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let start = start_time.unwrap_or(now);
+            result.expiry = if result.metric == "milliseconds" {
+                // Time-metered: the allotment IS the duration in ms.
+                start.saturating_add((result.allotment / 1000).max(1))
+            } else {
+                start.saturating_add(NO_EXPIRY_GRANT_DEFAULT_SECS)
+            };
         }
 
         result

@@ -87,3 +87,65 @@ fn parse_garbage_der_errors() {
     assert!(parse_certificate(b"").is_err());
     assert!(parse_certificate(&[0x30, 0x02, 0x00, 0x00]).is_err());
 }
+
+const EC_CERT: &str = include_str!("../../../tests/fixtures/ssl/ec-p256.crt");
+const EC_KEY_PKCS8: &str = include_str!("../../../tests/fixtures/ssl/ec-p256.key");
+const EC_KEY_SEC1: &str = include_str!("../../../tests/fixtures/ssl/ec-p256-sec1.key");
+const EC_KEY_OTHER: &str = include_str!("../../../tests/fixtures/ssl/ec-p256-other.key");
+const NOSAN_KEY: &str = include_str!("../../../tests/fixtures/ssl/nosan.key");
+
+fn der_of(pem: &str, block_type: &str) -> Vec<u8> {
+    pem_decode(pem, block_type).expect("fixture must decode")
+}
+
+#[test]
+fn key_pair_check_accepts_matching_rsa_pair() {
+    let cert = der_of(GOOD_CERT, "CERTIFICATE");
+    let key = der_of(GOOD_KEY, "PRIVATE KEY");
+    private_key_matches_certificate(&cert, &key).expect("RSA pair must match");
+}
+
+#[test]
+fn key_pair_check_accepts_matching_ec_pair_in_pkcs8_and_sec1() {
+    let cert = der_of(EC_CERT, "CERTIFICATE");
+    let pkcs8 = der_of(EC_KEY_PKCS8, "PRIVATE KEY");
+    let sec1 = der_of(EC_KEY_SEC1, "EC PRIVATE KEY");
+    private_key_matches_certificate(&cert, &pkcs8).expect("EC PKCS#8 pair must match");
+    private_key_matches_certificate(&cert, &sec1).expect("EC SEC1 pair must match");
+}
+
+#[test]
+fn key_pair_check_rejects_mismatched_pairs() {
+    let rsa_cert = der_of(GOOD_CERT, "CERTIFICATE");
+    assert!(matches!(
+        private_key_matches_certificate(&rsa_cert, &der_of(NOSAN_KEY, "PRIVATE KEY")),
+        Err(KeyPairError::Mismatch)
+    ));
+    assert!(matches!(
+        private_key_matches_certificate(&rsa_cert, &der_of(EC_KEY_PKCS8, "PRIVATE KEY")),
+        Err(KeyPairError::AlgorithmMismatch)
+    ));
+
+    let ec_cert = der_of(EC_CERT, "CERTIFICATE");
+    assert!(matches!(
+        private_key_matches_certificate(&ec_cert, &der_of(EC_KEY_OTHER, "PRIVATE KEY")),
+        Err(KeyPairError::Mismatch)
+    ));
+    assert!(matches!(
+        private_key_matches_certificate(&ec_cert, &der_of(GOOD_KEY, "PRIVATE KEY")),
+        Err(KeyPairError::AlgorithmMismatch)
+    ));
+}
+
+#[test]
+fn key_pair_check_rejects_garbage_keys() {
+    let cert = der_of(GOOD_CERT, "CERTIFICATE");
+    assert!(matches!(
+        private_key_matches_certificate(&cert, b""),
+        Err(KeyPairError::Key(_))
+    ));
+    assert!(matches!(
+        private_key_matches_certificate(&cert, &[0x30, 0x03, 0x02, 0x01, 0x00]),
+        Err(KeyPairError::Key(_))
+    ));
+}
