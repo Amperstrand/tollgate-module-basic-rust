@@ -346,3 +346,33 @@ fn cleanup_expired_records_history_for_session_state() {
     assert!(!mgr.sessions.contains_key("aa:bb:cc:00:00:02"));
     assert_eq!(mgr.session_state("aa:bb:cc:00:00:02"), SessionState::Expired);
 }
+
+/// Codex P2 on #54: the 24h expired-history TTL must hold even when no
+/// later expiry re-runs the sweep — a stale `expired` answer is wrong
+/// days after the fact. The manager takes no clock, so the entry's
+/// timestamp is backdated directly.
+#[test]
+fn session_state_respects_history_ttl_without_later_expiry() {
+    let mgr = SessionManager::new();
+    let stale = now() - EXPIRED_HISTORY_TTL_SECS - 1;
+    let fresh = now() - 60;
+    *mgr.expired_history
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = [
+        ("aa:bb:cc:00:00:aa".into(), stale),
+        ("aa:bb:cc:00:00:bb".into(), fresh),
+    ]
+    .into_iter()
+    .collect();
+
+    assert_eq!(
+        mgr.session_state("aa:bb:cc:00:00:aa"),
+        SessionState::None,
+        "entry older than the 24h TTL must not answer expired"
+    );
+    assert_eq!(
+        mgr.session_state("aa:bb:cc:00:00:bb"),
+        SessionState::Expired,
+        "entry inside the TTL still answers expired"
+    );
+}
