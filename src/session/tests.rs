@@ -319,7 +319,10 @@ fn session_state_tri_state_lifecycle() {
 
     // Revoke (the monitor's expiry path): record gone, history answers expired.
     mgr.revoke_session("aa:bb:cc:00:00:01");
-    assert_eq!(mgr.session_state("aa:bb:cc:00:00:01"), SessionState::Expired);
+    assert_eq!(
+        mgr.session_state("aa:bb:cc:00:00:01"),
+        SessionState::Expired
+    );
 
     // Re-payment returns to active.
     mgr.create_session("aa:bb:cc:00:00:01", 500, "milliseconds", 3600);
@@ -344,7 +347,10 @@ fn cleanup_expired_records_history_for_session_state() {
     );
     assert_eq!(mgr.cleanup_expired(), 1);
     assert!(!mgr.sessions.contains_key("aa:bb:cc:00:00:02"));
-    assert_eq!(mgr.session_state("aa:bb:cc:00:00:02"), SessionState::Expired);
+    assert_eq!(
+        mgr.session_state("aa:bb:cc:00:00:02"),
+        SessionState::Expired
+    );
 }
 
 /// Codex P2 on #54: the 24h expired-history TTL must hold even when no
