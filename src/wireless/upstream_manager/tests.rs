@@ -185,3 +185,44 @@ fn emergency_penalty_extends_blacklist() {
         "emergency blacklist should be longer than {normal_ttl}s, got {ttl}s"
     );
 }
+
+/// Codex P2 on #54 / P1 on #55: a DEFINITIVE wallet.send failure (mint's
+/// wallet not registered — fails before CDK, no saga, no value moved) must
+/// not journal the blocking Ambiguous phase: no token exists to recover,
+/// and one such entry wedges every future reseller purchase behind
+/// undelivered_tokens forever.
+#[tokio::test]
+#[serial_test::serial]
+async fn definitive_send_failure_does_not_block_repurchase() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    std::env::set_var("TOLLGATE_TEST_CONFIG_DIR", tmp.path());
+    let cfg_dir = tmp.path().to_path_buf();
+
+    // No mint registered: wallet.send fails with WalletNotFound without
+    // touching the network or creating any saga.
+    let mut seed = [0u8; 64];
+    use rand::RngCore;
+    rand::thread_rng().fill_bytes(&mut seed);
+    let wallet = TollWallet::new(seed, vec![], tmp.path().join("db"));
+    let mut session = UpstreamSession::new("10.0.0.1", "wlan0");
+
+    let first =
+        UpstreamManager::journalled_purchase(&wallet, "http://127.0.0.1:1", 1000, &mut session)
+            .await;
+    assert!(first.is_none(), "send must fail (wallet not registered)");
+
+    use crate::payout_journal as pj;
+    let undelivered = pj::undelivered_tokens(&cfg_dir, "reseller-upstream");
+    assert!(
+        undelivered.is_empty(),
+        "a definitive failure has no token to recover and must not block: {undelivered:?}"
+    );
+
+    // And the duplicate-attempt gate lets a second purchase attempt run
+    // (it fails the same way, but is not BLOCKED by the first failure).
+    let second =
+        UpstreamManager::journalled_purchase(&wallet, "http://127.0.0.1:1", 1000, &mut session)
+            .await;
+    assert!(second.is_none());
+    std::env::remove_var("TOLLGATE_TEST_CONFIG_DIR");
+}
