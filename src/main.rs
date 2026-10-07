@@ -14,6 +14,43 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// periodic re-check.
 async fn reconcile_payments_once(state: &Arc<http::AppState>) {
     let cfg_dir = config::config_dir();
+    // Codex P1 on #43 (thread 4141963797): `ensure_mint` can fail at boot
+    // (e.g. saga recovery contacts an unavailable mint), leaving no wallet
+    // registered for the mint — undecided payments for it would then hit
+    // `WalletNotFound` on every pass and stay undecided forever. The 30s
+    // mint-retry loop only covers mints in the CURRENT config and only
+    // while some configured mint is failing; retry wallet init here for
+    // every undecided entry's PERSISTED mint before its proofs are queried
+    // (bounded: one attempt per pass — `ensure_mint` is idempotent and a
+    // map lookup once registered).
+    {
+        let mut undecided_mints: Vec<String> =
+            payment_journal::fold_last(&payment_journal::read_journal(&cfg_dir))
+                .values()
+                .filter(|e| e.phase.needs_reconciliation())
+                .map(|e| e.mint.clone())
+                .collect();
+        undecided_mints.sort();
+        undecided_mints.dedup();
+        if !undecided_mints.is_empty() {
+            let mut w = state.wallet.write().await;
+            if let Some(wallet) = w.as_mut() {
+                for mint in &undecided_mints {
+                    // Failure logs and leaves the entries undecided — the
+                    // next pass retries. MintNotAccepted (the entry's mint
+                    // left the config after intent time) surfaces here
+                    // loudly: that payment needs an operator decision.
+                    if let Err(e) = wallet.ensure_mint(mint).await {
+                        tracing::warn!(
+                            mint,
+                            error = %e,
+                            "payment reconciliation: wallet init retry failed for an undecided entry's mint"
+                        );
+                    }
+                }
+            }
+        }
+    }
     let (report, grants) = {
         let w = state.wallet.read().await;
         let Some(wallet) = w.as_ref() else { return };
@@ -537,4 +574,117 @@ async fn main() {
     #[cfg(feature = "embedded-portal")]
     watchdog_handle.abort();
     tracing::info!("shutdown complete");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    /// Offline gate double: counts grant_access calls, never fails.
+    struct FakePortal {
+        grants: std::sync::Mutex<u32>,
+    }
+
+    #[async_trait::async_trait]
+    impl portal::CaptivePortal for FakePortal {
+        async fn grant_access(
+            &self,
+            _mac: &str,
+        ) -> Result<(), tollgate_module_basic_rust::error::AppError> {
+            *self.grants.lock().unwrap() += 1;
+            Ok(())
+        }
+        async fn revoke_access(
+            &self,
+            _mac: &str,
+        ) -> Result<(), tollgate_module_basic_rust::error::AppError> {
+            Ok(())
+        }
+        async fn poll_usage(
+            &self,
+            _mac: &str,
+        ) -> Result<(u64, u64), tollgate_module_basic_rust::error::AppError> {
+            Ok((0, 0))
+        }
+        async fn is_authenticated(&self, _mac: &str) -> bool {
+            true
+        }
+    }
+
+    fn test_state(
+        dir: &Path,
+        wallet: Option<wallet::TollWallet>,
+    ) -> (Arc<http::AppState>, Arc<FakePortal>) {
+        let portal = Arc::new(FakePortal {
+            grants: std::sync::Mutex::new(0),
+        });
+        let identity =
+            Arc::new(identity::MerchantIdentity::from_privkey_hex(&"01".repeat(32)).unwrap());
+        let state = Arc::new(http::AppState {
+            config: Arc::new(config::Config::new_default()),
+            identity,
+            wallet: Arc::new(tokio::sync::RwLock::new(wallet)),
+            sessions: Arc::new(tokio::sync::Mutex::new(session::SessionManager::new())),
+            portal: portal.clone(),
+            verifier: Arc::new(wallet::verify::TokenVerifier::new(vec![])),
+            rate_limiter: Arc::new(tollgate_module_basic_rust::rate_limiter::RateLimiter::new(
+                1000,
+            )),
+            ln_quotes: Arc::new(lightning_quotes::QuoteStore::load(dir)),
+        });
+        (state, portal)
+    }
+
+    fn undecided_entry(
+        id: &str,
+        phase: payment_journal::PaymentPhase,
+    ) -> payment_journal::PaymentEntry {
+        payment_journal::PaymentEntry {
+            id: id.to_string(),
+            ts: 1,
+            token: "not-a-cashu-token".to_string(),
+            mac: "aa:bb:cc:dd:ee:ff".to_string(),
+            mint: "https://test-mint.example".to_string(),
+            price_per_step: 1,
+            step_size: 1000,
+            metric: "bytes".to_string(),
+            phase,
+        }
+    }
+
+    /// Codex P1 on #43 (thread 4141963797): when boot's `ensure_mint`
+    /// failed for an undecided payment's mint, the reconciliation pass
+    /// must retry wallet init for that persisted mint instead of hitting
+    /// `WalletNotFound` forever. The unparseable token keeps the entry
+    /// undecided via a LOCAL parse error (no network), so the wallet
+    /// registration is the pass's only assertable effect.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn reconcile_pass_registers_wallet_for_undecided_entries_mints() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        std::env::set_var("TOLLGATE_TEST_CONFIG_DIR", &dir);
+        let w = wallet::TollWallet::new(
+            [7u8; 64],
+            vec!["https://test-mint.example".to_string()],
+            dir.clone(),
+        );
+        let (state, _portal) = test_state(&dir, Some(w));
+        payment_journal::append_entry(
+            &dir,
+            &undecided_entry("reg-retry-test", payment_journal::PaymentPhase::Intent),
+        )
+        .unwrap();
+
+        reconcile_payments_once(&state).await;
+
+        let guard = state.wallet.read().await;
+        let registered = guard.as_ref().unwrap().get_balance_by_mint().await.unwrap();
+        std::env::remove_var("TOLLGATE_TEST_CONFIG_DIR");
+        assert!(
+            registered.iter().any(|(m, _)| m == "https://test-mint.example"),
+            "reconciler must (re-)initialize the wallet for an undecided entry's persisted mint, got {registered:?}"
+        );
+    }
 }
