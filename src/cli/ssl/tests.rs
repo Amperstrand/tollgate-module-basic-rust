@@ -7,6 +7,7 @@ use super::*;
 const GOOD_CERT_PEM: &str = include_str!("../../../tests/fixtures/ssl/good.crt");
 const GOOD_KEY_PEM: &str = include_str!("../../../tests/fixtures/ssl/good.key");
 const NOSAN_CERT_PEM: &str = include_str!("../../../tests/fixtures/ssl/nosan.crt");
+const NOSAN_KEY_PEM: &str = include_str!("../../../tests/fixtures/ssl/nosan.key");
 
 fn uci_available() -> bool {
     std::process::Command::new("which")
@@ -301,4 +302,78 @@ async fn status_not_configured_reports_uhttpd_cert() {
     std::env::remove_var("UCI_STATE");
     std::env::remove_var("UCI_LOG");
     std::env::remove_var("TOLLGATE_TEST_CONFIG_DIR");
+}
+
+/// Codex P2 on #54: `ssl apply <cert> <key>` must reject an unparseable or
+/// mismatched pair BEFORE installing anything or touching uhttpd — a pair
+/// uhttpd cannot start with leaves HTTPS dead (silently with --no-restart).
+#[tokio::test]
+#[serial_test::serial]
+async fn apply_real_cert_rejects_mismatched_pair_before_install() {
+    if !uci_available() {
+        return;
+    }
+    let tmp = tempfile::TempDir::new().unwrap();
+    let cfg_dir = tmp.path().join("cfg");
+    let state = tmp.path().join("state");
+    std::fs::create_dir_all(&cfg_dir).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    std::env::set_var("TOLLGATE_TEST_CONFIG_DIR", &cfg_dir);
+    std::env::set_var("UCI_STATE", &state);
+    std::env::set_var("UCI_LOG", tmp.path().join("uci.log"));
+    std::fs::write(state.join("network.lan.ipaddr"), "192.0.2.10").unwrap();
+    std::fs::write(state.join("system.@system[0].hostname"), "tollgate-test").unwrap();
+
+    let cert_path = tmp.path().join("server.crt");
+    std::fs::write(&cert_path, GOOD_CERT_PEM).unwrap();
+    // nosan.key is a valid RSA key for a DIFFERENT certificate.
+    let key_path = tmp.path().join("other.key");
+    std::fs::write(&key_path, NOSAN_KEY_PEM).unwrap();
+    let garbage_key = tmp.path().join("garbage.key");
+    std::fs::write(&garbage_key, "not a pem key at all").unwrap();
+
+    let stub = StubEnv::with_uci();
+
+    let err = apply(
+        &[
+            cert_path.to_string_lossy().into(),
+            key_path.to_string_lossy().into(),
+        ],
+        true,
+        true,
+    )
+    .await
+    .expect_err("mismatched pair must be rejected");
+    assert!(
+        err.contains("certificate/key pair check failed"),
+        "expected the pairing error, got: {err}"
+    );
+
+    let err = apply(
+        &[
+            cert_path.to_string_lossy().into(),
+            garbage_key.to_string_lossy().into(),
+        ],
+        true,
+        true,
+    )
+    .await
+    .expect_err("garbage key must be rejected");
+    assert!(
+        err.contains("not a valid PEM private key"),
+        "expected the PEM error, got: {err}"
+    );
+
+    assert!(
+        !cfg_dir.join("ssl/server.crt").exists(),
+        "nothing may be installed for a rejected pair"
+    );
+    assert!(
+        !cfg_dir.join("ssl/server.key").exists(),
+        "nothing may be installed for a rejected pair"
+    );
+
+    drop(stub);
+    std::env::remove_var("UCI_STATE");
+    std::env::remove_var("UCI_LOG");
 }

@@ -494,6 +494,20 @@ async fn apply_real_cert(
     let cert =
         x509::parse_certificate(&der).map_err(|e| format!("failed to parse certificate: {e}"))?;
 
+    // Codex P2 on #54: reject an unparseable or mismatched key pair
+    // BEFORE any file or UCI mutation — uhttpd would otherwise be left
+    // pointing at a pair it cannot start with (especially with
+    // --no-restart, where nothing surfaces the breakage).
+    let key_pem = tokio::fs::read_to_string(&key_file)
+        .await
+        .map_err(|e| format!("cannot read key file: {e}"))?;
+    let key_der = ["PRIVATE KEY", "EC PRIVATE KEY", "RSA PRIVATE KEY"]
+        .iter()
+        .find_map(|t| x509::pem_decode(&key_pem, t))
+        .ok_or_else(|| format!("not a valid PEM private key: {}", key_file.display()))?;
+    x509::private_key_matches_certificate(&der, &key_der)
+        .map_err(|e| format!("certificate/key pair check failed: {e}"))?;
+
     if epoch_now() > cert.not_after {
         println!("WARNING: certificate has expired!");
         println!(

@@ -73,12 +73,34 @@ const TAG_SEQUENCE: u8 = 0x30;
 const TAG_OID: u8 = 0x06;
 const TAG_BOOL: u8 = 0x01;
 const TAG_OCTET_STRING: u8 = 0x04;
+const TAG_BIT_STRING: u8 = 0x03;
+const TAG_INTEGER: u8 = 0x02;
 const TAG_CONTEXT_3: u8 = 0xA3;
+const TAG_CONTEXT_1: u8 = 0xA1;
 const TAG_UTCTIME: u8 = 0x17;
 const TAG_GENERALIZEDTIME: u8 = 0x18;
 
 const OID_SUBJECT_ALT_NAME: [u8; 3] = [0x55, 0x1D, 0x11];
 const OID_COMMON_NAME: [u8; 3] = [0x55, 0x04, 0x03];
+const OID_RSA_ENCRYPTION: [u8; 9] = [0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01];
+const OID_EC_PUBLIC_KEY: [u8; 7] = [0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01];
+
+/// Read one DER TLV, keeping the raw encoded bytes (tag + header +
+/// content) so key components can be compared byte-for-byte.
+fn read_tlv_raw(buf: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+    let (tag, content, total) = read_tlv(buf)?;
+    Some((tag, content, &buf[..total]))
+}
+
+fn children_raw(content: &[u8]) -> Vec<(u8, &[u8], &[u8])> {
+    let mut out = Vec::new();
+    let mut rest = content;
+    while let Some((tag, inner, raw)) = read_tlv_raw(rest) {
+        out.push((tag, inner, raw));
+        rest = &rest[raw.len()..];
+    }
+    out
+}
 
 fn parse_asn1_time(tag: u8, body: &[u8]) -> Result<i64, X509Error> {
     let s = std::str::from_utf8(body).map_err(|_| X509Error::BadTimeString)?;
@@ -265,6 +287,213 @@ pub fn parse_certificate(der: &[u8]) -> Result<CertSummary, X509Error> {
     }
 
     Ok(summary)
+}
+
+/// Errors from validating that a TLS private key is parseable and pairs
+/// with a certificate (Codex P2 on #54: `ssl apply` must reject a broken
+/// or mismatched pair before touching uhttpd or installing files).
+#[derive(Debug, thiserror::Error)]
+pub enum KeyPairError {
+    #[error("certificate is malformed: {0}")]
+    Cert(String),
+    #[error("private key is malformed: {0}")]
+    Key(String),
+    #[error("private key algorithm does not match the certificate's")]
+    AlgorithmMismatch,
+    #[error("private key does not match the certificate")]
+    Mismatch,
+}
+
+/// The public-key material of a certificate's SubjectPublicKeyInfo,
+/// in directly comparable form.
+enum CertPublicKey<'a> {
+    /// Uncompressed EC point, as carried in both the SPKI BIT STRING and
+    /// the SEC1/PKCS#8 [1] publicKey field.
+    EcPoint(&'a [u8]),
+    /// Raw DER TLVs of the RSAPublicKey's modulus and exponent INTEGERs.
+    RsaNAndE(&'a [u8], &'a [u8]),
+}
+
+fn cert_public_key(cert_der: &[u8]) -> Result<CertPublicKey<'_>, KeyPairError> {
+    let err = |m: String| KeyPairError::Cert(m);
+    let (_, cert_body, _) = read_tlv(cert_der).ok_or_else(|| err("truncated".into()))?;
+    if cert_body.first() != Some(&TAG_SEQUENCE) {
+        return Err(err("not a certificate SEQUENCE".into()));
+    }
+    let (_, tbs_body, _) = read_tlv(cert_body).ok_or_else(|| err("truncated TBS".into()))?;
+    let mut ordered = children(tbs_body);
+    if ordered.first().is_some_and(|(t, _)| *t == 0xA0) {
+        ordered.remove(0);
+    }
+    // [serial] signature issuer validity subject spki
+    let spki = ordered
+        .get(5)
+        .ok_or_else(|| err("missing SubjectPublicKeyInfo".into()))?;
+    let spki_parts = children(spki.1);
+    let alg_children = spki_parts
+        .first()
+        .filter(|(t, _)| *t == TAG_SEQUENCE)
+        .map(|(_, alg_seq)| children(alg_seq))
+        .ok_or_else(|| err("missing SPKI algorithm".into()))?;
+    let alg = alg_children
+        .first()
+        .filter(|(t, _)| *t == TAG_OID)
+        .map(|(_, oid)| *oid)
+        .ok_or_else(|| err("missing SPKI algorithm OID".into()))?;
+    let pk = spki_parts
+        .get(1)
+        .filter(|(t, _)| *t == TAG_BIT_STRING)
+        .map(|(_, content)| content)
+        .ok_or_else(|| err("missing SubjectPublicKey BIT STRING".into()))?;
+    // BIT STRING: first content byte is the unused-bit count (0 for keys).
+    let pk = pk
+        .get(1..)
+        .ok_or_else(|| err("empty SubjectPublicKey".into()))?;
+
+    if alg == OID_EC_PUBLIC_KEY {
+        Ok(CertPublicKey::EcPoint(pk))
+    } else if alg == OID_RSA_ENCRYPTION {
+        let (seq_tag, seq_content, _) =
+            read_tlv_raw(pk).ok_or_else(|| err("bad RSAPublicKey".into()))?;
+        if seq_tag != TAG_SEQUENCE {
+            return Err(err("bad RSAPublicKey".into()));
+        }
+        let ints = children_raw(seq_content);
+        let (_, _, n) = ints
+            .first()
+            .filter(|(t, _, _)| *t == TAG_INTEGER)
+            .ok_or_else(|| err("missing RSA modulus".into()))?;
+        let (_, _, e) = ints
+            .get(1)
+            .filter(|(t, _, _)| *t == TAG_INTEGER)
+            .ok_or_else(|| err("missing RSA exponent".into()))?;
+        Ok(CertPublicKey::RsaNAndE(n, e))
+    } else {
+        Err(err(format!(
+            "unsupported public-key algorithm OID {}",
+            alg.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        )))
+    }
+}
+
+/// Compare a DER private key (PKCS#8, SEC1 EC, or PKCS#1 RSA) against the
+/// certificate's public key. Structural comparison only — no bignum or
+/// curve math, no new dependencies (musl-safe, binary-size parity with
+/// the module's hand-rolled DER approach).
+pub fn private_key_matches_certificate(
+    cert_der: &[u8],
+    key_der: &[u8],
+) -> Result<(), KeyPairError> {
+    let cert_pk = cert_public_key(cert_der)?;
+    let key_public = key_public_material(key_der)?;
+
+    match (&cert_pk, &key_public) {
+        (CertPublicKey::EcPoint(cert_point), KeyPublicMaterial::EcPoint(key_point)) => {
+            if cert_point == key_point {
+                Ok(())
+            } else {
+                Err(KeyPairError::Mismatch)
+            }
+        }
+        (CertPublicKey::RsaNAndE(cert_n, cert_e), KeyPublicMaterial::RsaNAndE(key_n, key_e)) => {
+            if cert_n == key_n && cert_e == key_e {
+                Ok(())
+            } else {
+                Err(KeyPairError::Mismatch)
+            }
+        }
+        _ => Err(KeyPairError::AlgorithmMismatch),
+    }
+}
+
+enum KeyPublicMaterial<'a> {
+    EcPoint(&'a [u8]),
+    RsaNAndE(&'a [u8], &'a [u8]),
+}
+
+fn key_public_material(key_der: &[u8]) -> Result<KeyPublicMaterial<'_>, KeyPairError> {
+    let err = |m: &str| KeyPairError::Key(m.to_string());
+    let (tag, body, _) = read_tlv(key_der).ok_or_else(|| err("truncated"))?;
+    if tag != TAG_SEQUENCE {
+        return Err(err("not a key SEQUENCE"));
+    }
+    let parts = children_raw(body);
+    let first_tag = parts.first().map(|(t, _, _)| *t);
+
+    // PKCS#8 PrivateKeyInfo: SEQUENCE { version INTEGER 0, algorithm,
+    // privateKey OCTET STRING }
+    if first_tag == Some(TAG_INTEGER) && parts.len() >= 3 {
+        let is_pkcs8 = parts[1].0 == TAG_SEQUENCE && parts[2].0 == TAG_OCTET_STRING;
+        if is_pkcs8 {
+            let alg_oid = children(parts[1].1)
+                .first()
+                .filter(|(t, _)| *t == TAG_OID)
+                .map(|(_, oid)| oid.to_vec())
+                .ok_or_else(|| err("missing PKCS#8 algorithm OID"))?;
+            let inner = parts[2].1;
+            if alg_oid == OID_EC_PUBLIC_KEY {
+                return sec1_public_key(inner);
+            }
+            if alg_oid == OID_RSA_ENCRYPTION {
+                return rsa_public_key(inner);
+            }
+            return Err(err("unsupported PKCS#8 key algorithm"));
+        }
+    }
+
+    // SEC1 ECPrivateKey: SEQUENCE { version INTEGER 1, privateKey OCTET
+    // STRING, [0] parameters?, [1] publicKey BIT STRING }
+    if first_tag == Some(TAG_INTEGER) && parts.len() >= 2 && parts[1].0 == TAG_OCTET_STRING {
+        return sec1_public_key(key_der);
+    }
+
+    // PKCS#1 RSAPrivateKey: SEQUENCE { version INTEGER 0, n, e, d, ... }
+    if first_tag == Some(TAG_INTEGER) && parts.len() >= 3 && parts[1].0 == TAG_INTEGER {
+        return rsa_public_key(key_der);
+    }
+
+    Err(err("unrecognized private key structure"))
+}
+
+/// Extract the [1] publicKey point from a SEC1 ECPrivateKey DER.
+fn sec1_public_key(sec1_der: &[u8]) -> Result<KeyPublicMaterial<'_>, KeyPairError> {
+    let err = |m: &str| KeyPairError::Key(m.to_string());
+    let (tag, body, _) = read_tlv(sec1_der).ok_or_else(|| err("truncated EC key"))?;
+    if tag != TAG_SEQUENCE {
+        return Err(err("not an EC key SEQUENCE"));
+    }
+    let parts = children_raw(body);
+    // Go's x509.ParseECPrivateKey requires the embedded public key; a key
+    // without it cannot be paired against a certificate here either.
+    let (_, bit_content, _) = parts
+        .iter()
+        .find(|(t, _, _)| *t == TAG_CONTEXT_1)
+        .and_then(|(_, _, raw)| read_tlv_raw(&raw[2..]))
+        .filter(|(t, _, _)| *t == TAG_BIT_STRING)
+        .ok_or_else(|| err("EC key carries no embedded public point"))?;
+    bit_content
+        .get(1..)
+        .map(KeyPublicMaterial::EcPoint)
+        .ok_or_else(|| err("empty EC public point"))
+}
+
+/// Extract the modulus and exponent TLVs from a PKCS#1 RSAPrivateKey DER.
+fn rsa_public_key(rsa_der: &[u8]) -> Result<KeyPublicMaterial<'_>, KeyPairError> {
+    let err = |m: &str| KeyPairError::Key(m.to_string());
+    let (tag, body, _) = read_tlv(rsa_der).ok_or_else(|| err("truncated RSA key"))?;
+    if tag != TAG_SEQUENCE {
+        return Err(err("not an RSA key SEQUENCE"));
+    }
+    let parts = children_raw(body);
+    let (_, _, n) = parts
+        .get(1)
+        .filter(|(t, _, _)| *t == TAG_INTEGER)
+        .ok_or_else(|| err("missing RSA modulus"))?;
+    let (_, _, e) = parts
+        .get(2)
+        .filter(|(t, _, _)| *t == TAG_INTEGER)
+        .ok_or_else(|| err("missing RSA exponent"))?;
+    Ok(KeyPublicMaterial::RsaNAndE(n, e))
 }
 
 /// Go `x509.Certificate.VerifyHostname` semantics, restricted to what the
