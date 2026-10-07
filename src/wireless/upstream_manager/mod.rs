@@ -75,6 +75,10 @@ pub struct UpstreamManager {
     consecutive_failures: u32,
     last_switch: Option<Instant>,
     sta_interface: Option<String>,
+    /// The netifd L3 device (e.g. `wwan0`) resolved from `sta_interface`
+    /// for signal polling — cached after the first successful resolution
+    /// (`l3_device` is stable per boot).
+    sta_device: Option<String>,
 }
 
 impl UpstreamManager {
@@ -88,6 +92,7 @@ impl UpstreamManager {
             consecutive_failures: 0,
             last_switch: None,
             sta_interface: None,
+            sta_device: None,
         }
     }
 
@@ -517,7 +522,16 @@ impl UpstreamManager {
             }
         };
 
-        let iface = self.sta_interface.as_deref().unwrap_or("wlan0").to_string();
+        // Codex P2 on #54: `sta_interface` is a UCI wifi-iface section
+        // name, not a kernel device — `iw dev <section> link` always
+        // fails on normal OpenWrt, killing signal polling. Resolve the
+        // netifd l3_device (same helper the gateway-IP path uses) and
+        // cache it; fall back to the section name when ubus is absent.
+        let sta = self.sta_interface.as_deref().unwrap_or("wlan0");
+        if self.sta_device.is_none() {
+            self.sta_device = resolve_l3_device(sta);
+        }
+        let iface = self.sta_device.clone().unwrap_or_else(|| sta.to_string());
         let signal = tokio::task::spawn_blocking(move || Connector::get_signal(&iface))
             .await
             .unwrap_or(None);

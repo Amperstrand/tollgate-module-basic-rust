@@ -226,3 +226,58 @@ async fn definitive_send_failure_does_not_block_repurchase() {
     assert!(second.is_none());
     std::env::remove_var("TOLLGATE_TEST_CONFIG_DIR");
 }
+
+/// Codex P2 on #54: `sta_interface` holds the UCI wifi-iface SECTION name
+/// — polling `iw dev <section> link` always fails on normal OpenWrt, so
+/// signal monitoring is dead. do_monitor must resolve the netifd
+/// l3_device (ubus) and pass THAT to `iw`. Verified end-to-end with
+/// PATH-stubbed `ubus` + `iw` binaries.
+#[tokio::test]
+#[serial_test::serial]
+async fn monitor_polls_signal_on_the_resolved_l3_device() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bin = tmp.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+
+    // ubus advertises the wwan netifd interface's l3_device.
+    let ubus = bin.join("ubus");
+    std::fs::write(&ubus, "#!/bin/sh\nprintf '{\"l3_device\":\"wwan0\"}'\n").unwrap();
+
+    // iw records the device it was asked about.
+    let log = tmp.path().join("iw.log");
+    let iw = bin.join("iw");
+    std::fs::write(
+        &iw,
+        format!("#!/bin/sh\nprintf '%s ' \"$@\" >> {}\n", log.display()),
+    )
+    .unwrap();
+    make_executable(ubus);
+    make_executable(iw);
+
+    let old_path = std::env::var("PATH").unwrap_or_default();
+    std::env::set_var("PATH", format!("{}:{}", bin.display(), old_path));
+
+    let mut manager = UpstreamManager::new(test_config());
+    // What Connector::connect actually returns: a UCI section name.
+    manager.sta_interface = Some("wgt0a1b".to_string());
+    manager.current_gateway = Some(test_network("AA:BB:CC:DD:EE:01", "AP", -50).into());
+
+    let _ = manager.do_monitor(None).await;
+
+    let polled = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        polled.contains("dev wwan0 link"),
+        "signal poll must target the resolved l3_device, got: {polled:?}"
+    );
+    assert!(
+        !polled.contains("wgt0a1b"),
+        "the UCI section name is not a kernel device"
+    );
+
+    std::env::set_var("PATH", old_path);
+}
+
+fn make_executable(path: std::path::PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755));
+}
