@@ -618,10 +618,18 @@ impl TollWallet {
                 .unwrap_or_default()
                 .as_secs()
                 + expiry_warn_days * 24 * 60 * 60;
+            // Codex P2 on #57: only keysets we actually HOLD unspent
+            // proofs on belong in the expiry warning — mints advertise
+            // historical keysets we never used, and warning about those
+            // every sweep is permanent noise that obscures the fund-risk
+            // signal.
+            let held: std::collections::HashSet<cdk::nuts::nut02::Id> =
+                unspent.iter().map(|p| p.keyset_id).collect();
             let soonest: Vec<String> = keysets
                 .iter()
                 .filter_map(|ks| {
                     ks.final_expiry
+                        .filter(|_| held.contains(&ks.id))
                         .filter(|e| *e < warn_cutoff)
                         .map(|_| ks.id.to_string())
                 })
@@ -1627,6 +1635,133 @@ mod tests {
         let mut seed = [0u8; 64];
         rand::thread_rng().fill(&mut seed);
         TollWallet::new(seed, accepted_mints, dir.to_path_buf())
+    }
+
+    /// Codex P2 on #57: the expiry warning must only name keysets the
+    /// wallet actually holds unspent proofs on. A mint advertising an
+    /// unused near-expiry keyset must NOT appear in
+    /// `soonest_expiry_keysets` — that is permanent warning noise
+    /// obscuring the fund-risk signal.
+    #[tokio::test]
+    async fn expiry_warning_only_names_keysets_with_held_proofs() {
+        use cdk::dhke::hash_to_curve;
+        use cdk::nuts::{nut07::State, Proof};
+        use cdk::wallet::types::ProofInfo;
+        use std::str::FromStr;
+
+        let tmp = TempDir::new().unwrap();
+        let mut wallet = make_test_wallet(tmp.path(), vec![]);
+        let mint = "http://127.0.0.1:1";
+        wallet.ensure_mint(mint).await.unwrap();
+        let mint_url = cdk::mint_url::MintUrl::from_str(mint).unwrap();
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let soon = now + 3600;
+
+        // Two distinct valid secp256k1 points (generator G and 2G) so the
+        // two keysets derive distinct, self-consistent v1 keyset IDs
+        // (add_keys verifies id ↔ keys).
+        let g = cdk::nuts::PublicKey::from_str(
+            "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+        )
+        .unwrap();
+        let g2 = cdk::nuts::PublicKey::from_str(
+            "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+        )
+        .unwrap();
+
+        let keyset_for = |key: cdk::nuts::PublicKey, expiry| -> cdk::nuts::nut02::KeySet {
+            let mut keys = std::collections::BTreeMap::new();
+            keys.insert(cdk::Amount::from(1), key);
+            let keys = cdk::nuts::Keys::new(keys);
+            cdk::nuts::nut02::KeySet {
+                id: cdk::nuts::nut02::Id::v1_from_keys(&keys),
+                unit: cdk::nuts::CurrencyUnit::Sat,
+                active: Some(true),
+                keys,
+                input_fee_ppk: 0,
+                final_expiry: expiry,
+            }
+        };
+        let held_ks = keyset_for(g, Some(soon));
+        let unused_ks = keyset_for(g2, Some(soon));
+        let held_id = held_ks.id;
+        let unused_id = unused_ks.id;
+        assert_ne!(held_id, unused_id, "plant sanity: distinct keysets");
+
+        {
+            let w = wallet.wallets.get(mint).unwrap().clone();
+            let guard = w.lock().await;
+            guard
+                .localstore
+                .add_mint(mint_url.clone(), None)
+                .await
+                .unwrap();
+            guard
+                .localstore
+                .add_mint_keysets(
+                    mint_url.clone(),
+                    vec![
+                        cdk::nuts::nut02::KeySetInfo {
+                            id: held_id,
+                            unit: cdk::nuts::CurrencyUnit::Sat,
+                            active: true,
+                            input_fee_ppk: 0,
+                            final_expiry: Some(soon),
+                        },
+                        cdk::nuts::nut02::KeySetInfo {
+                            id: unused_id,
+                            unit: cdk::nuts::CurrencyUnit::Sat,
+                            active: true,
+                            input_fee_ppk: 0,
+                            final_expiry: Some(soon),
+                        },
+                    ],
+                )
+                .await
+                .unwrap();
+            for ks in [held_ks, unused_ks] {
+                guard.localstore.add_keys(ks).await.unwrap();
+            }
+
+            // One unspent proof on held_id — nothing on unused_id.
+            let proof = Proof::new(
+                cdk::Amount::from(1),
+                held_id,
+                cdk::secret::Secret::new("expiry-warning-held-proof"),
+                g,
+            );
+            let y = hash_to_curve(proof.secret.as_bytes()).unwrap();
+            guard
+                .localstore
+                .update_proofs(
+                    vec![ProofInfo {
+                        proof,
+                        y,
+                        mint_url: mint_url.clone(),
+                        state: State::Unspent,
+                        spending_condition: None,
+                        unit: cdk::nuts::CurrencyUnit::Sat,
+                        derivation_index: None,
+                        used_by_operation: None,
+                        created_by_operation: None,
+                    }],
+                    vec![],
+                )
+                .await
+                .unwrap();
+        }
+
+        let h = wallet.keyset_hygiene(mint, 30).await.unwrap();
+        assert_eq!(h.unspent_proofs, 1, "plant sanity: one held proof");
+        assert_eq!(
+            h.soonest_expiry_keysets,
+            vec![held_id.to_string()],
+            "only the keyset with held proofs may be flagged as expiring"
+        );
     }
 
     #[test]
