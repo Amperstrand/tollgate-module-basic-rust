@@ -388,6 +388,14 @@ pub fn private_key_matches_certificate(
     let key_public = key_public_material(key_der)?;
 
     match (&cert_pk, &key_public) {
+        // KNOWN LIMITATION (Codex P2 on #58): the EC arm trusts the
+        // OPTIONAL public point embedded in the SEC1 structure instead of
+        // deriving it from the private scalar — a crafted/damaged key can
+        // keep the certificate's point while carrying a different scalar,
+        // and a valid SEC1 key that omits the point is rejected. Deriving
+        // requires curve math (a new dependency or hand-rolled scalar
+        // multiplication — both out of scope for this module); tracked in
+        // the follow-up issue linked from the PR thread.
         (CertPublicKey::EcPoint(cert_point), KeyPublicMaterial::EcPoint(key_point)) => {
             if cert_point == key_point {
                 Ok(())

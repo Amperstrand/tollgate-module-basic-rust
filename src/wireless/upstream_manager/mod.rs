@@ -423,6 +423,12 @@ impl UpstreamManager {
                 // was previously never assigned (None → every purchase
                 // silently skipped).
                 self.sta_interface = Some(sta_iface);
+                // Codex P2 on #58: the cached l3_device belongs to the
+                // PREVIOUS STA section — do_scan_and_connect can select a
+                // different UCI section (multi-radio routers), and netifd
+                // then binds a different l3_device to network.interface.wwan.
+                // Invalidate so the next monitor tick re-resolves.
+                self.sta_device = None;
 
                 // Codex P1 on #52: the gateway IP must come from the STA
                 // route, not the literal host "gateway" (no DNS on normal

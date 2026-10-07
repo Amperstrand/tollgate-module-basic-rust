@@ -277,6 +277,73 @@ async fn monitor_polls_signal_on_the_resolved_l3_device() {
     std::env::set_var("PATH", old_path);
 }
 
+/// Codex P2 on #58: the l3_device cache must not outlive the STA section
+/// it was resolved for. Multi-radio routers can switch sections on
+/// reconnect; netifd then binds a different l3_device, and a stale cache
+/// would poll a dead device forever.
+#[tokio::test]
+async fn monitor_re_resolves_device_after_sta_section_switch() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bin = tmp.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+
+    // resolve_l3_device always queries `network.interface.wwan` — what
+    // changes on a section switch is netifd's ANSWER (it rebinds the
+    // l3_device). The stub is therefore stateful: first call answers
+    // wwan0 (radio0's binding), every later call wlan1 (radio1's).
+    let counter = tmp.path().join("ubus.calls");
+    let ubus = bin.join("ubus");
+    std::fs::write(
+        &ubus,
+        format!(
+            "#!/bin/sh\nn=$(cat {c} 2>/dev/null || echo 0)\nn=$((n+1))\n\
+             echo $n > {c}\n\
+             if [ $n -le 1 ]; then printf '{{\"l3_device\":\"wwan0\"}}'\n\
+             else printf '{{\"l3_device\":\"wlan1\"}}'\nfi\n",
+            c = counter.display()
+        ),
+    )
+    .unwrap();
+
+    let log = tmp.path().join("iw.log");
+    let iw = bin.join("iw");
+    std::fs::write(
+        &iw,
+        format!("#!/bin/sh\nprintf '%s ' \"$@\" >> {}\n", log.display()),
+    )
+    .unwrap();
+    make_executable(ubus);
+    make_executable(iw);
+
+    let old_path = std::env::var("PATH").unwrap_or_default();
+    std::env::set_var("PATH", format!("{}:{}", bin.display(), old_path));
+
+    let mut manager = UpstreamManager::new(test_config());
+    manager.sta_interface = Some("wgt0a1b".to_string());
+    manager.current_gateway = Some(test_network("AA:BB:CC:DD:EE:01", "AP", -50).into());
+    let _ = manager.do_monitor(None).await;
+    assert!(
+        std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .contains("dev wwan0 link"),
+        "first poll resolves radio0's l3_device"
+    );
+
+    // Reconnect selects radio1's section — the cache must invalidate
+    // (production does this in do_scan_and_connect; simulated directly).
+    manager.sta_interface = Some("wgt1a1b".to_string());
+    manager.sta_device = None;
+    let _ = manager.do_monitor(None).await;
+    assert!(
+        std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .contains("dev wlan1 link"),
+        "after a section switch the poll must target the NEW l3_device"
+    );
+
+    std::env::set_var("PATH", old_path);
+}
+
 fn make_executable(path: std::path::PathBuf) {
     use std::os::unix::fs::PermissionsExt;
     let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755));
