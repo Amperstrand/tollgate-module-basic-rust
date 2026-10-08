@@ -484,6 +484,9 @@ async fn tombstoned_quote_settles_without_reopening_the_gate() {
     rec.minted = true;
     rec.allotment = 500;
     rec.metric = "bytes".to_string();
+    // DELIVERED shape: the gate opened once (session_granted was already
+    // true when the settle retried after the session expired).
+    rec.session_granted = true;
     store.upsert(rec).await.unwrap();
 
     // The quote's grant was once applied; the session then EXPIRED and
@@ -525,4 +528,69 @@ async fn tombstoned_quote_settles_without_reopening_the_gate() {
     );
     let settled = store.get("tomb-ln").await.unwrap();
     assert!(settled.session_granted, "the quote still terminalizes");
+}
+
+/// Codex P1 on #68 (round 12): UNDELIVERED credit — the allotment was
+/// applied but the gate never opened (grant_access failures outlived
+/// the session). Terminalizing would eat the paid credit: the grant
+/// must be RECREATED (fresh session) and the gate opened for it.
+#[tokio::test]
+async fn undelivered_tombstoned_quote_recreates_the_grant() {
+    use tollgate_module_basic_rust::lightning_quotes::{settle_quote, SettleOutcome};
+    use tollgate_module_basic_rust::session::SessionManager;
+
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let store = std::sync::Arc::new(QuoteStore::load(dir.path()));
+
+    let mut rec = quote_record("undelivered-ln");
+    rec.minted = true;
+    rec.allotment = 500;
+    rec.metric = "bytes".to_string();
+    // session_granted stays FALSE — the gate never opened.
+    store.upsert(rec).await.unwrap();
+
+    {
+        let mut sm = SessionManager::new();
+        sm.apply_grant_once("aa:bb:cc:dd:ee:ff", 500, "bytes", 3600, "ln:undelivered-ln");
+        if let Some(s) = sm.sessions.get_mut("aa:bb:cc:dd:ee:ff") {
+            s.expiry = 1;
+        }
+        sm.save_now(cfg_dir.path()).unwrap();
+    }
+    let sessions = tokio::sync::Mutex::new(SessionManager::load_from_disk(cfg_dir.path()));
+    let portal = FakePortal {
+        granted: std::sync::Mutex::new(vec![]),
+    };
+
+    let config = tollgate_module_basic_rust::config::Config::default();
+    let wallet = tollgate_module_basic_rust::wallet::TollWallet::new(
+        [0u8; 64],
+        vec![],
+        dir.path().to_path_buf(),
+    );
+    let outcome = settle_quote(
+        store.clone(),
+        &wallet,
+        &sessions,
+        &portal,
+        &config,
+        cfg_dir.path(),
+        store.get("undelivered-ln").await.unwrap(),
+    )
+    .await;
+
+    assert_eq!(outcome, SettleOutcome::Granted { allotment: 500 });
+    assert_eq!(
+        portal.granted.lock().unwrap().as_slice(),
+        ["aa:bb:cc:dd:ee:ff"],
+        "the recreated grant opens the gate"
+    );
+    {
+        let sm = sessions.lock().await;
+        assert!(
+            sm.is_active("aa:bb:cc:dd:ee:ff"),
+            "the paid credit is a live session again"
+        );
+    }
 }

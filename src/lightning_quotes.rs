@@ -355,18 +355,38 @@ pub async fn settle_quote(
     if !sessions.lock().await.is_active(&record.mac) {
         let quote_id = record.quote.clone();
         let mac = record.mac.clone();
-        record.session_granted = true;
         let grant_id = format!("ln:{}", quote_id);
-        if let Err(e) = store.upsert(record).await {
-            return SettleOutcome::Failed(format!("quote persist failed: {e}"));
+        if record.session_granted {
+            // Delivered, then consumed/expired: terminalize WITHOUT
+            // reopening the gate (an open gate with no session is
+            // indefinite free access — round 10).
+            record.session_granted = true;
+            if let Err(e) = store.upsert(record).await {
+                return SettleOutcome::Failed(format!("quote persist failed: {e}"));
+            }
+            let mut sm = sessions.lock().await;
+            sm.forget_grants([grant_id]);
+            if let Err(e) = sm.save_now(sessions_dir) {
+                tracing::warn!(error = %e, "session save after ln-grant cleanup failed; debounced save will retry");
+            }
+            tracing::info!(quote = %quote_id, mac = %mac, "lightning quote settled against an expired session — terminalized without reopening the gate");
+            return SettleOutcome::Granted { allotment };
         }
+        // UNDELIVERED credit (round 12): the allotment was applied but
+        // the gate never opened (grant_access kept failing) and the
+        // session expired unused — terminalizing would eat the paid
+        // credit. Recreate the grant instead: forget the tombstone,
+        // re-apply the allotment fresh, and let the normal path below
+        // open the gate for it.
+        tracing::info!(quote = %quote_id, mac = %mac, "lightning quote undelivered (gate failures outlived the session) — recreating the grant");
         let mut sm = sessions.lock().await;
-        sm.forget_grants([grant_id]);
+        sm.forget_grants([grant_id.clone()]);
+        sm.add_allotment(&mac, &metric, allotment, 3600, Some(&grant_id));
         if let Err(e) = sm.save_now(sessions_dir) {
-            tracing::warn!(error = %e, "session save after ln-grant cleanup failed; debounced save will retry");
+            tracing::warn!(error = %e, "session save after ln-grant recreation failed; retrying next tick");
+            drop(sm);
+            return SettleOutcome::GrantFailed;
         }
-        tracing::info!(quote = %quote_id, mac = %mac, "lightning quote settled against an expired session — terminalized without reopening the gate");
-        return SettleOutcome::Granted { allotment };
     }
 
     if let Err(e) = portal.grant_access(&record.mac).await {

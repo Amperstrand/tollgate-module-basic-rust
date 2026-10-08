@@ -230,16 +230,23 @@ impl SessionManager {
             .grant_tombstones
             .lock()
             .unwrap_or_else(|p| p.into_inner());
+        // Invalidate the persisted cache only when the set actually
+        // changed — no-op retirements (ids already tombstoned, or none
+        // outstanding) must not trigger flash rewrites (Codex P2 on
+        // #68, round 12).
+        let mut changed = false;
         for id in &session.applied_grants {
-            tombs.insert(id.clone());
+            changed |= tombs.insert(id.clone());
         }
         if let Some(id) = &session.last_grant_id {
-            tombs.insert(id.clone());
+            changed |= tombs.insert(id.clone());
         }
-        *self
-            .tombstones_persisted
-            .lock()
-            .unwrap_or_else(|p| p.into_inner()) = None;
+        if changed {
+            *self
+                .tombstones_persisted
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = None;
+        }
     }
 
     /// Drop every trace of ids whose journal entries have terminalized —

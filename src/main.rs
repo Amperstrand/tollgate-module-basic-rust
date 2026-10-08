@@ -24,12 +24,31 @@ async fn reconcile_payments_once(state: &Arc<http::AppState>) {
     // (bounded: one attempt per pass — `ensure_mint` is idempotent and a
     // map lookup once registered).
     {
-        let mut undecided_mints: Vec<String> =
-            payment_journal::fold_last(&payment_journal::read_journal(&cfg_dir))
-                .values()
-                .filter(|e| e.phase.needs_reconciliation())
-                .map(|e| e.mint.clone())
-                .collect();
+        let journal = payment_journal::read_journal(&cfg_dir);
+        let folded = payment_journal::fold_last(&journal);
+        // Sweep grant ids whose journal entries are already TERMINAL
+        // (Codex P2 on #68, round 12): a crash between the terminal
+        // append and the forget/save sequence left the id in
+        // sessions.json with nothing ever reconciling it again — it
+        // would resurrect as a permanent tombstone when its session
+        // goes. The pass is idempotent and cheap (no-op once clean).
+        let terminal_ids: Vec<String> = folded
+            .values()
+            .filter(|e| !e.phase.needs_reconciliation())
+            .map(|e| e.id.clone())
+            .collect();
+        if !terminal_ids.is_empty() {
+            let mut sessions = state.sessions.lock().await;
+            sessions.forget_grants(terminal_ids);
+            if let Err(e) = sessions.save_now(&cfg_dir) {
+                tracing::warn!(error = %e, "grant-cleanup sweep save failed; debounced save will retry");
+            }
+        }
+        let mut undecided_mints: Vec<String> = folded
+            .values()
+            .filter(|e| e.phase.needs_reconciliation())
+            .map(|e| e.mint.clone())
+            .collect();
         undecided_mints.sort();
         undecided_mints.dedup();
         if !undecided_mints.is_empty() {
@@ -1262,5 +1281,64 @@ mod tests {
             folded["expired-live-test"].phase,
             payment_journal::PaymentPhase::ReconcileSpent { .. }
         ));
+    }
+    /// Codex P2 on #68 (round 12): ids of TERMINAL journal entries are
+    /// swept by every reconciliation pass — a crash between the terminal
+    /// append and the forget/save leaves the id in sessions.json with
+    /// nothing reconciling it again; without the sweep it resurrects as
+    /// a permanent tombstone when its session goes.
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn reconciliation_sweeps_grant_ids_of_terminal_entries() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let (state, _portal) = test_state(&dir, None);
+        // reconcile_payments_once reads config::config_dir() — point it
+        // at the test dir for this test (restored on drop).
+        let _guard = TestConfigDir::new(&dir);
+
+        // A terminal entry in the journal...
+        let entry = undecided_entry("sweep-test", payment_journal::PaymentPhase::TimeoutUnknown);
+        let mut terminal = entry.clone();
+        terminal.phase = payment_journal::PaymentPhase::ReconcileSpent { amount_sat: 5 };
+        payment_journal::append_entry(&dir, &entry).unwrap();
+        payment_journal::append_entry(&dir, &terminal).unwrap();
+        // ...whose grant id still sits on a live session (the crash shape).
+        {
+            let mut sessions = state.sessions.lock().await;
+            sessions.apply_grant_once("aa:bb:cc:dd:ee:ff", 100, "bytes", 3600, "sweep-test");
+            sessions.save_now(&dir).unwrap();
+            assert!(sessions.has_grant("aa:bb:cc:dd:ee:ff", "sweep-test"));
+        }
+
+        reconcile_payments_once(&state).await;
+
+        let sessions = state.sessions.lock().await;
+        assert!(
+            !sessions.has_grant("aa:bb:cc:dd:ee:ff", "sweep-test"),
+            "a terminal entry's grant id must be swept"
+        );
+    }
+    /// Scoped TOLLGATE_TEST_CONFIG_DIR for tests that exercise code
+    /// reading config::config_dir() directly.
+    struct TestConfigDir {
+        prior: Option<String>,
+    }
+
+    impl TestConfigDir {
+        fn new(dir: &Path) -> Self {
+            let prior = std::env::var("TOLLGATE_TEST_CONFIG_DIR").ok();
+            std::env::set_var("TOLLGATE_TEST_CONFIG_DIR", dir);
+            Self { prior }
+        }
+    }
+
+    impl Drop for TestConfigDir {
+        fn drop(&mut self) {
+            match &self.prior {
+                Some(v) => std::env::set_var("TOLLGATE_TEST_CONFIG_DIR", v),
+                None => std::env::remove_var("TOLLGATE_TEST_CONFIG_DIR"),
+            }
+        }
     }
 }
