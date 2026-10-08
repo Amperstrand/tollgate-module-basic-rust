@@ -342,6 +342,7 @@ fn cleanup_expired_records_history_for_session_state() {
             metric: "milliseconds".into(),
             expiry: past,
             granted_at: past - 60,
+            applied_grants: std::collections::HashSet::new(),
             last_grant_id: None,
         },
     );

@@ -728,6 +728,14 @@ mod tests {
         dir: &Path,
         wallet: Option<wallet::TollWallet>,
     ) -> (Arc<http::AppState>, Arc<FakePortal>) {
+        test_state_with_sessions(dir, wallet, session::SessionManager::new())
+    }
+
+    fn test_state_with_sessions(
+        dir: &Path,
+        wallet: Option<wallet::TollWallet>,
+        sessions: session::SessionManager,
+    ) -> (Arc<http::AppState>, Arc<FakePortal>) {
         let portal = Arc::new(FakePortal::counting());
         let identity =
             Arc::new(identity::MerchantIdentity::from_privkey_hex(&"01".repeat(32)).unwrap());
@@ -735,7 +743,7 @@ mod tests {
             config: Arc::new(config::Config::new_default()),
             identity,
             wallet: Arc::new(tokio::sync::RwLock::new(wallet)),
-            sessions: Arc::new(tokio::sync::Mutex::new(session::SessionManager::new())),
+            sessions: Arc::new(tokio::sync::Mutex::new(sessions)),
             portal: portal.clone(),
             verifier: Arc::new(wallet::verify::TokenVerifier::new(vec![])),
             rate_limiter: Arc::new(tollgate_module_basic_rust::rate_limiter::RateLimiter::new(
@@ -885,8 +893,17 @@ mod tests {
         }
         assert_eq!(*portal.grants.lock().unwrap(), 1);
 
-        // "Restart": the process-lifetime set is gone; the journal is
-        // still failing. The durable grant id must answer.
+        // Make the usage bump durable, then RESTART for real: fresh
+        // AppState with a SessionManager LOADED FROM sessions.json and a
+        // fresh process-lifetime set — the journal is still failing, so
+        // the durable grant id must answer from disk, not memory
+        // (Codex P1 on #68, round 5).
+        {
+            let sessions = state.sessions.lock().await;
+            sessions.save_now(&dir).unwrap();
+        }
+        let (state, portal) =
+            test_state_with_sessions(&dir, None, session::SessionManager::load_from_disk(&dir));
         let fresh_pending_after_restart = std::sync::Mutex::new(std::collections::HashSet::new());
         apply_reconciled_grant(&state, &dir, &entry, 5, &fresh_pending_after_restart).await;
         {
@@ -903,10 +920,9 @@ mod tests {
         }
         assert_eq!(
             *portal.grants.lock().unwrap(),
-            2,
-            "the session is preserved but the gate is idempotently RE-OPENED \
-             after a restart (portal state died with the old process — \
-             Codex P1 on #68)"
+            1,
+            "the reloaded session is preserved but the gate is idempotently \
+             RE-OPENED (portal state died with the old process)"
         );
 
         // Heal: the append lands and terminalizes.
@@ -1022,5 +1038,56 @@ mod tests {
             folded["gate-retry-test"].phase,
             payment_journal::PaymentPhase::ReconcileSpent { .. }
         ));
+    }
+    /// Codex P1 on #68 (round 5): two payments for one MAC — the second
+    /// grant must not erase the first's durable id. After a reload, BOTH
+    /// grants are recognized; the first payment's re-reconcile does not
+    /// re-grant. (Allotment ADDITIVITY for same-MAC payments remains the
+    /// #63 design; this pins the idempotency-key storage.)
+    #[tokio::test]
+    async fn second_grant_does_not_erase_the_firsts_durable_id() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let (state, _portal) = test_state(&dir, None);
+        let entry_a = undecided_entry("pay-a", payment_journal::PaymentPhase::TimeoutUnknown);
+        let entry_b = undecided_entry("pay-b", payment_journal::PaymentPhase::TimeoutUnknown);
+        payment_journal::append_entry(&dir, &entry_a).unwrap();
+        payment_journal::append_entry(&dir, &entry_b).unwrap();
+        let pending = std::sync::Mutex::new(std::collections::HashSet::new());
+
+        apply_reconciled_grant(&state, &dir, &entry_a, 5, &pending).await;
+        apply_reconciled_grant(&state, &dir, &entry_b, 5, &pending).await;
+        {
+            let mut sessions = state.sessions.lock().await;
+            sessions.update_usage("aa:bb:cc:dd:ee:ff", 250);
+            sessions.save_now(&dir).unwrap();
+        }
+
+        // Reload from disk: BOTH grant ids must be recognized.
+        let (state, portal) =
+            test_state_with_sessions(&dir, None, session::SessionManager::load_from_disk(&dir));
+        {
+            let sessions = state.sessions.lock().await;
+            assert!(
+                sessions.has_grant("aa:bb:cc:dd:ee:ff", "pay-a")
+                    && sessions.has_grant("aa:bb:cc:dd:ee:ff", "pay-b"),
+                "both grants' ids survive the reload"
+            );
+        }
+        let pending = std::sync::Mutex::new(std::collections::HashSet::new());
+        apply_reconciled_grant(&state, &dir, &entry_a, 5, &pending).await;
+        assert_eq!(
+            *portal.grants.lock().unwrap(),
+            1,
+            "the FIRST payment's re-reconcile after a restart must not re-grant"
+        );
+        {
+            let sessions = state.sessions.lock().await;
+            assert_eq!(
+                sessions.get_session("aa:bb:cc:dd:ee:ff").unwrap().used,
+                250,
+                "usage survives the first payment's re-reconcile"
+            );
+        }
     }
 }

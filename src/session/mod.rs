@@ -40,12 +40,19 @@ pub struct CustomerSession {
     pub expiry: u64,
     /// Unix timestamp when the session was granted.
     pub granted_at: u64,
-    /// Durable idempotency key for the last quoted grant applied to this
-    /// session (e.g. `ln:<quote-id>`). Lets settlement prove an allotment
-    /// already reached `sessions.json` after a crash between the session
-    /// flush and the quote-marker write — the two files cannot be written
-    /// atomically together, so the key lives in the session record.
-    /// Absent on non-Lightning sessions (identical bytes to before).
+    /// Durable idempotency keys for every grant applied to this session
+    /// (e.g. `ln:<quote-id>`): lets settlement/reconciliation prove an
+    /// allotment already reached `sessions.json` after a crash between
+    /// the session flush and the marker write — the two files cannot be
+    /// written atomically together, so the keys live in the session
+    /// record. (Codex P1 on #68, round 5: the previous single slot let a
+    /// second payment's id erase the first, so a restart re-granted the
+    /// first payment.) Older files without the set load empty and have
+    /// their slot id seeded into it.
+    #[serde(default, skip_serializing_if = "std::collections::HashSet::is_empty")]
+    pub applied_grants: std::collections::HashSet<String>,
+    /// The most recent grant id — a single-slot mirror of the set, kept
+    /// serialized for binaries that predate it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_grant_id: Option<String>,
 }
@@ -117,6 +124,7 @@ impl SessionManager {
             metric: metric.to_string(),
             expiry: now + duration_secs,
             granted_at: now,
+            applied_grants: std::collections::HashSet::new(),
             last_grant_id: None,
         };
         self.sessions.insert(mac.to_string(), session.clone());
@@ -150,6 +158,7 @@ impl SessionManager {
                 session.granted_at = now;
                 session.expiry = now + duration_secs;
                 if let Some(id) = grant_id {
+                    session.applied_grants.insert(id.to_string());
                     session.last_grant_id = Some(id.to_string());
                 }
                 true
@@ -158,6 +167,7 @@ impl SessionManager {
                 self.create_session(mac, amount, metric, duration_secs);
                 if let Some(id) = grant_id {
                     if let Some(session) = self.sessions.get_mut(mac) {
+                        session.applied_grants.insert(id.to_string());
                         session.last_grant_id = Some(id.to_string());
                     }
                 }
@@ -170,10 +180,9 @@ impl SessionManager {
     /// i.e. the allotment is durable in `sessions.json` and must not be
     /// applied a second time.
     pub fn has_grant(&self, mac: &str, grant_id: &str) -> bool {
-        self.sessions
-            .get(mac)
-            .and_then(|s| s.last_grant_id.as_deref())
-            .is_some_and(|id| id == grant_id)
+        self.sessions.get(mac).is_some_and(|s| {
+            s.applied_grants.contains(grant_id) || s.last_grant_id.as_deref() == Some(grant_id)
+        })
     }
 
     /// Grant a session unless this exact grant id is already applied and
@@ -195,8 +204,19 @@ impl SessionManager {
         if self.has_grant(mac, grant_id) {
             return false;
         }
+        // The recreation must not drop EARLIER payments' grant ids from
+        // this MAC's durable idempotency set (allotment additivity for
+        // same-MAC grants remains the #63 design; id recognition is this
+        // method's contract).
+        let prior_grants = self
+            .sessions
+            .get(mac)
+            .map(|s| s.applied_grants.clone())
+            .unwrap_or_default();
         self.create_session(mac, allotment, metric, duration_secs);
         if let Some(session) = self.sessions.get_mut(mac) {
+            session.applied_grants = prior_grants;
+            session.applied_grants.insert(grant_id.to_string());
             session.last_grant_id = Some(grant_id.to_string());
         }
         true
@@ -404,7 +424,13 @@ impl SessionManager {
             Ok(json) => match serde_json::from_str::<Vec<CustomerSession>>(&json) {
                 Ok(sessions) => {
                     let mut mgr = SessionManager::new();
-                    for s in sessions {
+                    for mut s in sessions {
+                        // Legacy files (pre applied_grants) carry only the
+                        // single slot: seed the set so the first load keeps
+                        // the slot id recognizable as an applied grant.
+                        if let Some(id) = s.last_grant_id.clone() {
+                            s.applied_grants.insert(id);
+                        }
                         mgr.sessions.insert(s.mac.clone(), s);
                     }
                     mgr
