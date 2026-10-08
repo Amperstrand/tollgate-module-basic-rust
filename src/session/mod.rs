@@ -60,6 +60,15 @@ pub struct CustomerSession {
 /// Session manager with disk persistence to `sessions.json`.
 pub struct SessionManager {
     pub sessions: HashMap<String, CustomerSession>,
+    /// Grant ids whose SESSION has expired or was removed while the
+    /// payment's journal entry may still be undecided (Codex P1 on #68,
+    /// round 6): the ids outlive their session so a late reconciliation
+    /// pass cannot re-grant a spent token. Persisted in
+    /// `grant-tombstones.json` (separate from sessions.json: old
+    /// binaries keep loading sessions unchanged and simply ignore the
+    /// tombstones). Cleared per-id once the journal terminalizes
+    /// (`forget_grants`) — the set is bounded by in-flight failures.
+    grant_tombstones: std::sync::Mutex<std::collections::HashSet<String>>,
     dirty: AtomicBool,
     /// `Mutex<u64>` rather than `AtomicU64`: mips32 has no native 64-bit
     /// atomics, and epoch-millis overflows 32-bit `AtomicUsize`.
@@ -101,6 +110,7 @@ impl SessionManager {
             dirty: AtomicBool::new(false),
             last_save_ms: Mutex::new(0),
             expired_history: std::sync::Mutex::new(HashMap::new()),
+            grant_tombstones: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -180,9 +190,45 @@ impl SessionManager {
     /// i.e. the allotment is durable in `sessions.json` and must not be
     /// applied a second time.
     pub fn has_grant(&self, mac: &str, grant_id: &str) -> bool {
+        if self
+            .grant_tombstones
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(grant_id)
+        {
+            return true;
+        }
         self.sessions.get(mac).is_some_and(|s| {
             s.applied_grants.contains(grant_id) || s.last_grant_id.as_deref() == Some(grant_id)
         })
+    }
+
+    /// Retire a session's grant ids into the tombstone set — called when
+    /// the session is removed or dropped by the save filter so the ids
+    /// survive their session (see the field doc).
+    fn retire_grants(&self, session: &CustomerSession) {
+        let mut tombs = self
+            .grant_tombstones
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        for id in &session.applied_grants {
+            tombs.insert(id.clone());
+        }
+        if let Some(id) = &session.last_grant_id {
+            tombs.insert(id.clone());
+        }
+    }
+
+    /// Drop tombstones for ids whose journal entries have terminalized —
+    /// bounds the tombstone set to in-flight reconciliation failures.
+    pub fn forget_grants(&self, ids: impl IntoIterator<Item = impl Into<String>>) {
+        let mut tombs = self
+            .grant_tombstones
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        for id in ids {
+            tombs.remove(&id.into());
+        }
     }
 
     /// Grant a session unless this exact grant id is already applied and
@@ -332,6 +378,9 @@ impl SessionManager {
             .collect();
         let count = expired_macs.len();
         for mac in &expired_macs {
+            if let Some(session) = self.sessions.get(mac) {
+                self.retire_grants(session);
+            }
             self.remember_expired(mac);
             self.sessions.remove(mac);
         }
@@ -400,6 +449,11 @@ impl SessionManager {
             .unwrap_or_default()
             .as_secs();
         let path = dir.join("sessions.json");
+        // Sessions dropped by the expiry filter must retire their grant
+        // ids first — the save would otherwise silently discard them.
+        for s in self.sessions.values().filter(|s| s.expiry <= now) {
+            self.retire_grants(s);
+        }
         let data: Vec<&CustomerSession> =
             self.sessions.values().filter(|s| s.expiry > now).collect();
         let json = serde_json::to_string_pretty(&data)?;
@@ -408,6 +462,7 @@ impl SessionManager {
         file.write_all(json.as_bytes())?;
         file.sync_all()?;
         std::fs::rename(&tmp, &path)?;
+        self.save_tombstones(dir)?;
         if let Some(parent) = path.parent() {
             std::fs::File::open(parent)?.sync_all()?;
         }
@@ -418,6 +473,27 @@ impl SessionManager {
 
     /// Load sessions from disk. Returns an empty manager if the file does not
     /// exist or cannot be parsed (a warning is logged in the latter case).
+    fn save_tombstones(&self, dir: &Path) -> io::Result<()> {
+        use std::io::Write;
+        let tombs = self
+            .grant_tombstones
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let path = dir.join("grant-tombstones.json");
+        if tombs.is_empty() {
+            // An empty set needs no file; remove a stale one.
+            let _ = std::fs::remove_file(&path);
+            return Ok(());
+        }
+        let json = serde_json::to_string_pretty(&*tombs)?;
+        let tmp = dir.join("grant-tombstones.json.tmp");
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(json.as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, &path)?;
+        Ok(())
+    }
+
     pub fn load_from_disk(dir: &Path) -> Self {
         let path = dir.join("sessions.json");
         match std::fs::read_to_string(&path) {
@@ -442,6 +518,25 @@ impl SessionManager {
             },
             Err(_) => SessionManager::new(),
         }
+        .load_tombstones(dir)
+    }
+
+    fn load_tombstones(self, dir: &Path) -> Self {
+        let path = dir.join("grant-tombstones.json");
+        if let Ok(json) = std::fs::read_to_string(&path) {
+            match serde_json::from_str::<std::collections::HashSet<String>>(&json) {
+                Ok(set) => {
+                    *self
+                        .grant_tombstones
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner()) = set;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to parse grant-tombstones.json — assuming empty (re-grants of terminalized-but-undecided payments become possible once)");
+                }
+            }
+        }
+        self
     }
 }
 

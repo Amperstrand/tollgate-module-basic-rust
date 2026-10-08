@@ -162,25 +162,37 @@ async fn apply_reconciled_grant(
                 }
             }
         }
-        // Gate handling differs by which side of a restart we are on:
+        // Gate handling differs by which durable state answers:
         // - fresh grant this pass → open the gate (normal path);
-        // - grant already durable (restart case) → the session must be
-        //   preserved untouched, but the captive-portal/nftables state
-        //   died with the old process and nothing re-opens it for
+        // - live session already carries the grant (restart case) → the
+        //   session is preserved untouched, but the portal/nftables
+        //   state died with the old process and nothing re-opens it for
         //   loaded sessions — re-open idempotently (Codex P1 on #68)
-        //   BEFORE the terminal append closes recovery.
+        //   BEFORE the terminal append closes recovery;
+        // - only a TOMBSTONE answers (the session expired while the
+        //   append was broken) → nothing to give access to; retry only
+        //   the append (re-opening the gate would grant free access
+        //   with no session behind it — Codex P1 on #68, round 6).
         // (already_granted from the in-memory set is the same-boot
         // append-only retry: the gate is known open in THIS process.)
-        if let Err(e) = state.portal.grant_access(&entry.mac).await {
-            // A failed gate (re-)open must NOT terminalize: the paid
-            // customer would stay blocked with recovery closed. Return
-            // undecided — the durable grant id makes the next pass safe
-            // (session preserved, only the gate retried). This is the
-            // reconcile-path half of the gate-pending family (#64) and
-            // the live path's own contract (gate failure → re-mark,
-            // never settle).
-            tracing::warn!(mac = %entry.mac, error = %e, "gate open after payment reconcile failed — staying undecided for retry");
-            return;
+        let live_session = state
+            .sessions
+            .lock()
+            .await
+            .get_session(&entry.mac)
+            .is_some();
+        if live_session || grant_applied_durable {
+            if let Err(e) = state.portal.grant_access(&entry.mac).await {
+                // A failed gate (re-)open must NOT terminalize: the paid
+                // customer would stay blocked with recovery closed. Return
+                // undecided — the durable grant id makes the next pass safe
+                // (session preserved, only the gate retried). This is the
+                // reconcile-path half of the gate-pending family (#64) and
+                // the live path's own contract (gate failure → re-mark,
+                // never settle).
+                tracing::warn!(mac = %entry.mac, error = %e, "gate open after payment reconcile failed — staying undecided for retry");
+                return;
+            }
         }
         if grant_applied_durable {
             tracing::info!(
@@ -203,6 +215,10 @@ async fn apply_reconciled_grant(
     ) {
         Ok(()) => {
             granted_pending_terminal.lock().unwrap().remove(&entry.id);
+            // The journal is terminal: the grant tombstone has served its
+            // purpose — drop it so the set stays bounded by in-flight
+            // failures (Codex P1 on #68, round 6).
+            state.sessions.lock().await.forget_grants([&entry.id]);
         }
         Err(e) => {
             granted_pending_terminal
@@ -1089,5 +1105,73 @@ mod tests {
                 "usage survives the first payment's re-reconcile"
             );
         }
+    }
+    /// Codex P1 on #68 (round 6): a grant id must outlive its SESSION —
+    /// if the terminal append stays broken until the session expires,
+    /// the id retires into grant-tombstones.json and the spent token
+    /// still cannot be re-granted after a reload. Once the append lands,
+    /// the tombstone is dropped (bounded by in-flight failures).
+    #[tokio::test]
+    async fn expired_session_keeps_grant_idempotency_across_reload() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let (state, _portal) = test_state(&dir, None);
+        let entry = undecided_entry(
+            "tombstone-test",
+            payment_journal::PaymentPhase::TimeoutUnknown,
+        );
+        payment_journal::append_entry(&dir, &entry).unwrap();
+        let pending = std::sync::Mutex::new(std::collections::HashSet::new());
+
+        // Grant, then let the session EXPIRE before the terminal append
+        // could land (journal stays undecided — append not attempted yet).
+        apply_reconciled_grant(&state, &dir, &entry, 5, &pending).await;
+        {
+            let mut sessions = state.sessions.lock().await;
+            if let Some(s) = sessions.sessions.get_mut("aa:bb:cc:dd:ee:ff") {
+                s.expiry = 1; // far past
+            }
+            sessions.save_now(&dir).unwrap(); // expiry filter retires the ids
+        }
+
+        // Reload from disk: the tombstone must answer has_grant.
+        let (state, portal) =
+            test_state_with_sessions(&dir, None, session::SessionManager::load_from_disk(&dir));
+        {
+            let sessions = state.sessions.lock().await;
+            assert!(
+                sessions.has_grant("aa:bb:cc:dd:ee:ff", "tombstone-test"),
+                "the grant id survives its expired session"
+            );
+        }
+        apply_reconciled_grant(&state, &dir, &entry, 5, &pending).await;
+        assert_eq!(
+            *portal.grants.lock().unwrap(),
+            0,
+            "a spent token must not be re-granted after its session expired"
+        );
+        {
+            let journal = payment_journal::read_journal(&dir);
+            let folded = payment_journal::fold_last(&journal);
+            assert!(matches!(
+                folded["tombstone-test"].phase,
+                payment_journal::PaymentPhase::ReconcileSpent { .. }
+            ));
+        }
+        // Terminalized: the tombstone is forgotten (bounded set).
+        {
+            let sessions = state.sessions.lock().await;
+            sessions.save_now(&dir).unwrap();
+        }
+        assert!(
+            !std::path::Path::new(&dir)
+                .join("grant-tombstones.json")
+                .exists()
+                || {
+                    let reloaded = session::SessionManager::load_from_disk(&dir);
+                    !reloaded.has_grant("aa:bb:cc:dd:ee:ff", "tombstone-test")
+                },
+            "a terminalized grant drops its tombstone"
+        );
     }
 }
