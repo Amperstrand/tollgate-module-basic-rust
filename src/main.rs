@@ -995,8 +995,10 @@ mod tests {
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         apply_reconciled_grant(&state, &dir, &entry, 5, &pending).await;
         assert_eq!(*portal.grants.lock().unwrap(), 1);
+        // Terminalized: the grant id is deliberately forgotten everywhere
+        // (round 7) — it must not linger to resurrect as a tombstone.
         let sessions = state.sessions.lock().await;
-        assert!(sessions.has_grant("aa:bb:cc:dd:ee:ff", "save-rollback-test"));
+        assert!(!sessions.has_grant("aa:bb:cc:dd:ee:ff", "save-rollback-test"));
     }
     /// Codex P1 on #68 (round 4): a FAILED gate (re-)open must not
     /// terminalize the payment — the paid customer would stay blocked
@@ -1043,9 +1045,11 @@ mod tests {
         assert_eq!(*portal.grants.lock().unwrap(), 1);
         {
             let sessions = state.sessions.lock().await;
+            // The session survives; its grant id is forgotten on
+            // terminalization (round 7) — the session itself remains.
             assert!(
-                sessions.has_grant("aa:bb:cc:dd:ee:ff", "gate-retry-test"),
-                "the session survives the gate retry untouched"
+                sessions.get_session("aa:bb:cc:dd:ee:ff").is_some(),
+                "the session survives the gate retry"
             );
         }
         let journal = payment_journal::read_journal(&dir);
@@ -1071,6 +1075,12 @@ mod tests {
         payment_journal::append_entry(&dir, &entry_b).unwrap();
         let pending = std::sync::Mutex::new(std::collections::HashSet::new());
 
+        // Both terminal appends FAIL (journal read-only): both entries
+        // stay undecided — the exact state where the grant ids must
+        // survive each other AND the reload.
+        use std::os::unix::fs::PermissionsExt;
+        let journal_file = dir.join(payment_journal::PAYMENT_JOURNAL_NAME);
+        std::fs::set_permissions(&journal_file, std::fs::Permissions::from_mode(0o444)).unwrap();
         apply_reconciled_grant(&state, &dir, &entry_a, 5, &pending).await;
         apply_reconciled_grant(&state, &dir, &entry_b, 5, &pending).await;
         {
@@ -1078,6 +1088,7 @@ mod tests {
             sessions.update_usage("aa:bb:cc:dd:ee:ff", 250);
             sessions.save_now(&dir).unwrap();
         }
+        std::fs::set_permissions(&journal_file, std::fs::Permissions::from_mode(0o600)).unwrap();
 
         // Reload from disk: BOTH grant ids must be recognized.
         let (state, portal) =
@@ -1105,6 +1116,24 @@ mod tests {
                 "usage survives the first payment's re-reconcile"
             );
         }
+
+        // Terminalize B as well, then let the session expire and reload:
+        // NO id may resurrect as a tombstone (Codex P2 on #68, round 7 —
+        // the tombstone file must stay bounded by undecided payments).
+        apply_reconciled_grant(&state, &dir, &entry_b, 5, &pending).await;
+        {
+            let mut sessions = state.sessions.lock().await;
+            if let Some(s) = sessions.sessions.get_mut("aa:bb:cc:dd:ee:ff") {
+                s.expiry = 1;
+            }
+            sessions.save_now(&dir).unwrap();
+        }
+        let reloaded = session::SessionManager::load_from_disk(&dir);
+        assert!(
+            !reloaded.has_grant("aa:bb:cc:dd:ee:ff", "pay-a")
+                && !reloaded.has_grant("aa:bb:cc:dd:ee:ff", "pay-b"),
+            "terminalized grants must not resurrect as tombstones"
+        );
     }
     /// Codex P1 on #68 (round 6): a grant id must outlive its SESSION —
     /// if the terminal append stays broken until the session expires,
@@ -1123,8 +1152,12 @@ mod tests {
         payment_journal::append_entry(&dir, &entry).unwrap();
         let pending = std::sync::Mutex::new(std::collections::HashSet::new());
 
-        // Grant, then let the session EXPIRE before the terminal append
-        // could land (journal stays undecided — append not attempted yet).
+        // Grant while the terminal append FAILS (journal read-only): the
+        // entry stays undecided — then let the session expire before the
+        // append ever lands.
+        use std::os::unix::fs::PermissionsExt;
+        let journal_file = dir.join(payment_journal::PAYMENT_JOURNAL_NAME);
+        std::fs::set_permissions(&journal_file, std::fs::Permissions::from_mode(0o444)).unwrap();
         apply_reconciled_grant(&state, &dir, &entry, 5, &pending).await;
         {
             let mut sessions = state.sessions.lock().await;
@@ -1135,6 +1168,7 @@ mod tests {
         }
 
         // Reload from disk: the tombstone must answer has_grant.
+        std::fs::set_permissions(&journal_file, std::fs::Permissions::from_mode(0o600)).unwrap();
         let (state, portal) =
             test_state_with_sessions(&dir, None, session::SessionManager::load_from_disk(&dir));
         {

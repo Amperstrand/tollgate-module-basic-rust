@@ -219,15 +219,25 @@ impl SessionManager {
         }
     }
 
-    /// Drop tombstones for ids whose journal entries have terminalized —
-    /// bounds the tombstone set to in-flight reconciliation failures.
-    pub fn forget_grants(&self, ids: impl IntoIterator<Item = impl Into<String>>) {
+    /// Drop every trace of ids whose journal entries have terminalized —
+    /// tombstones AND the live sessions' `applied_grants` (Codex P2 on
+    /// #68, round 7: a lingering id would resurrect as a permanent
+    /// tombstone when its session later expires, growing the rewritten
+    /// file with payment history on flash-constrained routers).
+    pub fn forget_grants(&mut self, ids: impl IntoIterator<Item = impl Into<String>>) {
         let mut tombs = self
             .grant_tombstones
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         for id in ids {
-            tombs.remove(&id.into());
+            let id: String = id.into();
+            tombs.remove(&id);
+            for session in self.sessions.values_mut() {
+                session.applied_grants.remove(&id);
+                if session.last_grant_id.as_deref() == Some(id.as_str()) {
+                    session.last_grant_id = None;
+                }
+            }
         }
     }
 
@@ -454,6 +464,13 @@ impl SessionManager {
         for s in self.sessions.values().filter(|s| s.expiry <= now) {
             self.retire_grants(s);
         }
+        // Tombstones durable BEFORE the sessions rename publishes the
+        // removal (Codex P1 on #68, round 7): a power loss between the
+        // two renames would otherwise leave the id in NEITHER file while
+        // the journal still requests reconciliation — the spent token
+        // would be re-granted. A tombstone without the removal is
+        // harmless (the id IS applied); the reverse is fund loss.
+        self.save_tombstones(dir)?;
         let data: Vec<&CustomerSession> =
             self.sessions.values().filter(|s| s.expiry > now).collect();
         let json = serde_json::to_string_pretty(&data)?;
@@ -462,7 +479,6 @@ impl SessionManager {
         file.write_all(json.as_bytes())?;
         file.sync_all()?;
         std::fs::rename(&tmp, &path)?;
-        self.save_tombstones(dir)?;
         if let Some(parent) = path.parent() {
             std::fs::File::open(parent)?.sync_all()?;
         }
