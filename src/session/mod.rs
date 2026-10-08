@@ -254,7 +254,11 @@ impl SessionManager {
     /// #68, round 7: a lingering id would resurrect as a permanent
     /// tombstone when its session later expires, growing the rewritten
     /// file with payment history on flash-constrained routers).
-    pub fn forget_grants(&mut self, ids: impl IntoIterator<Item = impl Into<String>>) {
+    /// Returns whether ANY durable state changed (a tombstone or a live
+    /// session's id set) — callers save only then, so a sweep over an
+    /// already-clean journal must not rewrite sessions.json every pass
+    /// (Codex P2 on #68, round 13).
+    pub fn forget_grants(&mut self, ids: impl IntoIterator<Item = impl Into<String>>) -> bool {
         let mut tombs = self
             .grant_tombstones
             .lock()
@@ -264,9 +268,10 @@ impl SessionManager {
             let id: String = id.into();
             changed |= tombs.remove(&id);
             for session in self.sessions.values_mut() {
-                session.applied_grants.remove(&id);
+                changed |= session.applied_grants.remove(&id);
                 if session.last_grant_id.as_deref() == Some(id.as_str()) {
                     session.last_grant_id = None;
+                    changed = true;
                 }
             }
         }
@@ -276,6 +281,7 @@ impl SessionManager {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner()) = None;
         }
+        changed
     }
 
     /// Grant a session unless this exact grant id is already applied and

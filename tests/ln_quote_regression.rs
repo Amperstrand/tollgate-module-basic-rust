@@ -594,3 +594,66 @@ async fn undelivered_tombstoned_quote_recreates_the_grant() {
         );
     }
 }
+
+/// Codex P1 on #68 (round 13): the undelivered-grant recreation must
+/// REPLACE an expired-but-still-in-memory session, not extend it —
+/// add_allotment on the dead record doubled the purchased credit.
+#[tokio::test]
+async fn undelivered_recreation_replaces_the_expired_record() {
+    use tollgate_module_basic_rust::lightning_quotes::{settle_quote, SettleOutcome};
+    use tollgate_module_basic_rust::session::SessionManager;
+
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let store = std::sync::Arc::new(QuoteStore::load(dir.path()));
+
+    let mut rec = quote_record("replace-ln");
+    rec.minted = true;
+    rec.allotment = 500;
+    rec.metric = "bytes".to_string();
+    store.upsert(rec).await.unwrap();
+
+    // Expired record STILL IN MEMORY (monitor has not cleaned it yet):
+    // the tombstone id answers has_grant, is_active is false.
+    let mut sm = SessionManager::new();
+    sm.apply_grant_once("aa:bb:cc:dd:ee:ff", 500, "bytes", 3600, "ln:replace-ln");
+    if let Some(s) = sm.sessions.get_mut("aa:bb:cc:dd:ee:ff") {
+        s.expiry = 1;
+    }
+    let sessions = tokio::sync::Mutex::new(sm);
+    let portal = FakePortal {
+        granted: std::sync::Mutex::new(vec![]),
+    };
+
+    let config = tollgate_module_basic_rust::config::Config::default();
+    let wallet = tollgate_module_basic_rust::wallet::TollWallet::new(
+        [0u8; 64],
+        vec![],
+        dir.path().to_path_buf(),
+    );
+    let outcome = settle_quote(
+        store.clone(),
+        &wallet,
+        &sessions,
+        &portal,
+        &config,
+        cfg_dir.path(),
+        store.get("replace-ln").await.unwrap(),
+    )
+    .await;
+
+    assert_eq!(outcome, SettleOutcome::Granted { allotment: 500 });
+    {
+        let sm = sessions.lock().await;
+        let s = sm.get_session("aa:bb:cc:dd:ee:ff").expect("live session");
+        assert_eq!(
+            s.allotment, 500,
+            "the recreated grant must REPLACE the expired record, not extend it"
+        );
+        assert!(sm.is_active("aa:bb:cc:dd:ee:ff"));
+    }
+    assert_eq!(
+        portal.granted.lock().unwrap().as_slice(),
+        ["aa:bb:cc:dd:ee:ff"]
+    );
+}

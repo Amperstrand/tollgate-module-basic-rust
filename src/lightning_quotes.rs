@@ -381,6 +381,14 @@ pub async fn settle_quote(
         tracing::info!(quote = %quote_id, mac = %mac, "lightning quote undelivered (gate failures outlived the session) — recreating the grant");
         let mut sm = sessions.lock().await;
         sm.forget_grants([grant_id.clone()]);
+        // REPLACE, don't extend: an expired-but-not-yet-removed record
+        // would make add_allotment ADD to the dead allotment — twice
+        // the purchased credit, growing with every expiry/gate-failure
+        // race (Codex P1 on #68, round 13). revoke_session retires any
+        // other outstanding ids first.
+        if sm.get_session(&mac).is_some() {
+            sm.revoke_session(&mac);
+        }
         sm.add_allotment(&mac, &metric, allotment, 3600, Some(&grant_id));
         if let Err(e) = sm.save_now(sessions_dir) {
             tracing::warn!(error = %e, "session save after ln-grant recreation failed; retrying next tick");

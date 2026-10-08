@@ -39,9 +39,15 @@ async fn reconcile_payments_once(state: &Arc<http::AppState>) {
             .collect();
         if !terminal_ids.is_empty() {
             let mut sessions = state.sessions.lock().await;
-            sessions.forget_grants(terminal_ids);
-            if let Err(e) = sessions.save_now(&cfg_dir) {
-                tracing::warn!(error = %e, "grant-cleanup sweep save failed; debounced save will retry");
+            // Save only when the sweep actually changed durable state —
+            // a normal journal keeps terminal entries forever, and an
+            // unconditional save would rewrite sessions.json every 60s
+            // for as long as any payment stays undecided (Codex P2 on
+            // #68, round 13).
+            if sessions.forget_grants(terminal_ids) {
+                if let Err(e) = sessions.save_now(&cfg_dir) {
+                    tracing::warn!(error = %e, "grant-cleanup sweep save failed; debounced save will retry");
+                }
             }
         }
         let mut undecided_mints: Vec<String> = folded
