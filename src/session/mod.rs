@@ -69,6 +69,13 @@ pub struct SessionManager {
     /// tombstones). Cleared per-id once the journal terminalizes
     /// (`forget_grants`) — the set is bounded by in-flight failures.
     grant_tombstones: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Last tombstone JSON persisted ("" = file removed for an empty
+    /// set, None = never persisted this process). Saves skip the
+    /// create/write/fsync/rename cycle when nothing changed — the
+    /// monitor's debounced usage saves must not turn one pending
+    /// tombstone into a flash rewrite every few seconds (Codex P2 on
+    /// #68, round 11).
+    tombstones_persisted: std::sync::Mutex<Option<String>>,
     dirty: AtomicBool,
     /// `Mutex<u64>` rather than `AtomicU64`: mips32 has no native 64-bit
     /// atomics, and epoch-millis overflows 32-bit `AtomicUsize`.
@@ -111,11 +118,18 @@ impl SessionManager {
             last_save_ms: Mutex::new(0),
             expired_history: std::sync::Mutex::new(HashMap::new()),
             grant_tombstones: std::sync::Mutex::new(std::collections::HashSet::new()),
+            tombstones_persisted: std::sync::Mutex::new(None),
         }
     }
 
     /// Create and store a new session for the given MAC.
-    /// Overwrites any existing session for the same MAC.
+    /// Overwrites any existing session for the same MAC, PRESERVING the
+    /// prior session's outstanding grant ids (Codex P2 on #68, round
+    /// 11): a direct overwrite caller (e.g. the settled-token replay
+    /// path) must not silently discard an undecided payment's durable
+    /// idempotency key — without it, a restart re-grants the spent
+    /// payment. Preserving is always safe: a preserved id either
+    /// terminalizes (forgotten) or answers a pending reconciliation.
     pub fn create_session(
         &mut self,
         mac: &str,
@@ -127,6 +141,11 @@ impl SessionManager {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
+        let prior_grants = self
+            .sessions
+            .get(mac)
+            .map(|s| s.applied_grants.clone())
+            .unwrap_or_default();
         let session = CustomerSession {
             mac: mac.to_string(),
             allotment,
@@ -134,7 +153,7 @@ impl SessionManager {
             metric: metric.to_string(),
             expiry: now + duration_secs,
             granted_at: now,
-            applied_grants: std::collections::HashSet::new(),
+            applied_grants: prior_grants,
             last_grant_id: None,
         };
         self.sessions.insert(mac.to_string(), session.clone());
@@ -217,6 +236,10 @@ impl SessionManager {
         if let Some(id) = &session.last_grant_id {
             tombs.insert(id.clone());
         }
+        *self
+            .tombstones_persisted
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
     }
 
     /// Drop every trace of ids whose journal entries have terminalized —
@@ -229,15 +252,22 @@ impl SessionManager {
             .grant_tombstones
             .lock()
             .unwrap_or_else(|p| p.into_inner());
+        let mut changed = false;
         for id in ids {
             let id: String = id.into();
-            tombs.remove(&id);
+            changed |= tombs.remove(&id);
             for session in self.sessions.values_mut() {
                 session.applied_grants.remove(&id);
                 if session.last_grant_id.as_deref() == Some(id.as_str()) {
                     session.last_grant_id = None;
                 }
             }
+        }
+        if changed {
+            *self
+                .tombstones_persisted
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = None;
         }
     }
 
@@ -260,18 +290,10 @@ impl SessionManager {
         if self.has_grant(mac, grant_id) {
             return false;
         }
-        // The recreation must not drop EARLIER payments' grant ids from
-        // this MAC's durable idempotency set (allotment additivity for
-        // same-MAC grants remains the #63 design; id recognition is this
-        // method's contract).
-        let prior_grants = self
-            .sessions
-            .get(mac)
-            .map(|s| s.applied_grants.clone())
-            .unwrap_or_default();
+        // create_session preserves the prior session's outstanding ids
+        // (round 11); this method only adds its own.
         self.create_session(mac, allotment, metric, duration_secs);
         if let Some(session) = self.sessions.get_mut(mac) {
-            session.applied_grants = prior_grants;
             session.applied_grants.insert(grant_id.to_string());
             session.last_grant_id = Some(grant_id.to_string());
         }
@@ -515,12 +537,22 @@ impl SessionManager {
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         let path = dir.join("grant-tombstones.json");
+        let mut persisted = self
+            .tombstones_persisted
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         if tombs.is_empty() {
-            // An empty set needs no file; remove a stale one.
-            let _ = std::fs::remove_file(&path);
+            // An empty set needs no file; remove a stale one — once.
+            if persisted.as_deref() != Some("") {
+                let _ = std::fs::remove_file(&path);
+                *persisted = Some(String::new());
+            }
             return Ok(());
         }
         let json = serde_json::to_string_pretty(&*tombs)?;
+        if persisted.as_deref() == Some(json.as_str()) {
+            return Ok(()); // unchanged — no flash rewrite
+        }
         let tmp = dir.join("grant-tombstones.json.tmp");
         let mut file = std::fs::File::create(&tmp)?;
         file.write_all(json.as_bytes())?;
@@ -533,6 +565,7 @@ impl SessionManager {
         if let Some(parent) = path.parent() {
             std::fs::File::open(parent)?.sync_all()?;
         }
+        *persisted = Some(json);
         Ok(())
     }
 

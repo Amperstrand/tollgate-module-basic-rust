@@ -429,3 +429,52 @@ fn failed_save_marks_dirty_for_retry() {
         "the dirty-retry must persist the failed save"
     );
 }
+
+/// Codex P2 on #68 (round 11): a direct create_session overwrite must
+/// preserve the prior session's outstanding grant ids — the replay
+/// path's overwrite cannot discard an undecided payment's idempotency
+/// key.
+#[test]
+fn create_session_preserves_outstanding_grant_ids() {
+    let mut mgr = SessionManager::new();
+    mgr.apply_grant_once("aa:bb:cc:00:00:66", 100, "bytes", 3600, "keep-me");
+    // A direct overwrite (the replay-path shape): fresh session, but the
+    // outstanding id must survive.
+    mgr.create_session("aa:bb:cc:00:00:66", 50, "bytes", 60);
+    assert!(
+        mgr.has_grant("aa:bb:cc:00:00:66", "keep-me"),
+        "an outstanding grant id survives a session overwrite"
+    );
+}
+
+/// Codex P2 on #68 (round 11): while a tombstone is pending, unchanged
+/// saves must not rewrite the tombstone file (the monitor's debounced
+/// usage saves run every few seconds — one pending tombstone must not
+/// become a flash rewrite per tick).
+#[test]
+fn unchanged_tombstone_saves_skip_the_rewrite() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut mgr = SessionManager::new();
+    mgr.apply_grant_once("aa:bb:cc:00:00:55", 100, "bytes", 3600, "pending-1");
+    mgr.revoke_session("aa:bb:cc:00:00:55"); // retire -> tombstone pending
+    mgr.save_now(dir.path()).unwrap();
+
+    let path = dir.path().join("grant-tombstones.json");
+    let mtime = |p: &std::path::Path| {
+        std::fs::metadata(p)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    };
+    let first = mtime(&path);
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    mgr.save_now(dir.path()).unwrap(); // usage-save shape: nothing changed
+    assert_eq!(
+        mtime(&path),
+        first,
+        "an unchanged tombstone set must not be rewritten"
+    );
+}
