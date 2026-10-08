@@ -176,6 +176,43 @@ impl SessionManager {
             .is_some_and(|id| id == grant_id)
     }
 
+    /// Grant a session unless this exact grant id is already applied and
+    /// durable — the single-slot form of grant idempotency (Codex P1 on
+    /// #58, round 2): after a crash between the reconciled grant and its
+    /// terminal journal append, a restart recognizes the applied grant
+    /// from `sessions.json` instead of re-creating the session (which
+    /// would reset `used` and replenish expiry for one token, once per
+    /// restart). Sufficient for one undecided payment per MAC; the
+    /// multi-payment durable grant ledger is #63.
+    pub fn apply_grant_once(
+        &mut self,
+        mac: &str,
+        allotment: u64,
+        metric: &str,
+        duration_secs: u64,
+        grant_id: &str,
+    ) -> bool {
+        if self.has_grant(mac, grant_id) {
+            return false;
+        }
+        self.create_session(mac, allotment, metric, duration_secs);
+        if let Some(session) = self.sessions.get_mut(mac) {
+            session.last_grant_id = Some(grant_id.to_string());
+        }
+        true
+    }
+
+    /// Forget a grant id whose session save FAILED: in-memory state must
+    /// not claim idempotency for a grant that is not durable — otherwise
+    /// later passes skip re-granting while nothing reached disk.
+    pub fn clear_grant(&mut self, mac: &str, grant_id: &str) {
+        if let Some(session) = self.sessions.get_mut(mac) {
+            if session.last_grant_id.as_deref() == Some(grant_id) {
+                session.last_grant_id = None;
+            }
+        }
+    }
+
     /// Restore a previously snapshotted session for `mac` (gate-open
     /// rollback), or remove the session when the snapshot says there was
     /// none.
