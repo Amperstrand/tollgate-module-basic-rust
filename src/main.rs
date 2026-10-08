@@ -200,13 +200,17 @@ async fn apply_reconciled_grant(
         //   with no session behind it — Codex P1 on #68, round 6).
         // (already_granted from the in-memory set is the same-boot
         // append-only retry: the gate is known open in THIS process.)
-        // is_active, not record existence: an expired-but-loaded record
-        // must NOT reopen the gate (the monitor's snapshots exclude it
-        // and cleanup would remove it without revoke_access — an open
-        // gate with no session, indefinitely). Expired records take the
-        // tombstone path: append-only, no gate (Codex P1 on #68, r8).
-        let live_session = state.sessions.lock().await.is_active(&entry.mac);
-        if live_session || grant_applied_durable {
+        // GRANT-level, not MAC-level (round 16, mirroring the Lightning
+        // path's round 14): an active session from a SIBLING payment must
+        // not count as delivery of THIS grant — has_live_grant requires
+        // the live session to carry this entry's id. Expired-but-loaded
+        // records fail it too (r8) and take the tombstone paths below.
+        let this_grant_live = state
+            .sessions
+            .lock()
+            .await
+            .has_live_grant(&entry.mac, &entry.id);
+        if this_grant_live || grant_applied_durable {
             if let Err(e) = state.portal.grant_access(&entry.mac).await {
                 // A failed gate (re-)open must NOT terminalize: the paid
                 // customer would stay blocked with recovery closed. Return
@@ -239,7 +243,10 @@ async fn apply_reconciled_grant(
             let mut sessions = state.sessions.lock().await;
             sessions.forget_grants([&entry.id]);
             let prior = sessions.snapshot_session(&entry.mac);
-            sessions.apply_grant_once(&entry.mac, allotment, &entry.metric, 3600, &entry.id);
+            // add_allotment (not apply_grant_once): a live SIBLING session
+            // is EXTENDED additively — replacing it would discard the
+            // sibling's paid allotment (the Lightning path's shape).
+            sessions.add_allotment(&entry.mac, &entry.metric, allotment, 3600, Some(&entry.id));
             match sessions.save_now(cfg_dir) {
                 Ok(()) => {}
                 Err(e) => {
@@ -1451,6 +1458,62 @@ mod tests {
         let folded = payment_journal::fold_last(&journal);
         assert!(matches!(
             folded["delivered-test"].phase,
+            payment_journal::PaymentPhase::ReconcileSpent { .. }
+        ));
+    }
+    /// Codex P1 on #68 (round 16): an undelivered tombstoned Cashu grant
+    /// sharing its MAC with a SIBLING payment's active session must not
+    /// be treated as delivered — its allotment is recreated additively
+    /// (the grant id is then forgotten on terminalization, per round 7).
+    #[tokio::test]
+    async fn sibling_session_does_not_mask_undelivered_cashu_grant() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let (state, _portal) = test_state(&dir, None);
+
+        // Payment A: granted and delivered (its session is LIVE).
+        let entry_a = undecided_entry("cashu-a", payment_journal::PaymentPhase::TimeoutUnknown);
+        payment_journal::append_entry(&dir, &entry_a).unwrap();
+        let pending = std::sync::Mutex::new(std::collections::HashSet::new());
+        apply_reconciled_grant(&state, &dir, &entry_a, 5, &pending).await;
+        assert!(state.sessions.lock().await.is_active("aa:bb:cc:dd:ee:ff"));
+
+        // Payment B: same MAC, applied once then expired away with A's
+        // session replaced (tombstone-only, never delivered) — while A
+        // stays live on the recreated session.
+        let entry_b = undecided_entry("cashu-b", payment_journal::PaymentPhase::TimeoutUnknown);
+        payment_journal::append_entry(&dir, &entry_b).unwrap();
+        {
+            let mut sessions = state.sessions.lock().await;
+            sessions.apply_grant_once("aa:bb:cc:dd:ee:ff", 5000, "bytes", 3600, "cashu-b");
+            if let Some(s) = sessions.sessions.get_mut("aa:bb:cc:dd:ee:ff") {
+                s.expiry = 1;
+            }
+            sessions.save_now(&dir).unwrap(); // both ids tombstoned, session dropped
+                                              // A comes back live on its own (a later sibling payment —
+                                              // its tombstone is consumed by the fresh grant).
+            sessions.forget_grants(["cashu-a"]);
+            sessions.apply_grant_once("aa:bb:cc:dd:ee:ff", 5000, "bytes", 3600, "cashu-a");
+            sessions.save_now(&dir).unwrap();
+        }
+
+        // B reconciles: the live A session must NOT mask B as delivered —
+        // B's paid allotment is added to the live session.
+        apply_reconciled_grant(&state, &dir, &entry_b, 5, &pending).await;
+        {
+            let sessions = state.sessions.lock().await;
+            let s = sessions.get_session("aa:bb:cc:dd:ee:ff").unwrap();
+            assert_eq!(
+                s.allotment,
+                5000 + 5000,
+                "both payments' allotment is live (sibling extended additively)"
+            );
+            assert!(sessions.is_active("aa:bb:cc:dd:ee:ff"));
+        }
+        let journal = payment_journal::read_journal(&dir);
+        let folded = payment_journal::fold_last(&journal);
+        assert!(matches!(
+            folded["cashu-b"].phase,
             payment_journal::PaymentPhase::ReconcileSpent { .. }
         ));
     }

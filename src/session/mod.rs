@@ -141,9 +141,30 @@ impl SessionManager {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
+        // Preserve the prior ids ONLY when the prior session is LIVE:
+        // a live prior's allotment carries those ids' value. An EXPIRED
+        // prior's ids must retire to tombstones instead — their value is
+        // NOT in the replacement, and a hitchhiking id would make a
+        // sibling grant look delivered (Codex P1 on #68, round 16).
+        if let Some(prior) = self.sessions.get(mac) {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            if prior.expiry <= now || prior.used >= prior.allotment {
+                self.retire_grants(prior);
+            }
+        }
         let prior_grants = self
             .sessions
             .get(mac)
+            .filter(|s| {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                s.expiry > now && s.used < s.allotment
+            })
             .map(|s| s.applied_grants.clone())
             .unwrap_or_default();
         let session = CustomerSession {
