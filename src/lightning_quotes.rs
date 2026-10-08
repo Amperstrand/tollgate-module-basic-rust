@@ -346,6 +346,29 @@ pub async fn settle_quote(
         }
     }
 
+    // A tombstoned ln id means THIS quote's allotment was already
+    // applied and its session has since expired or was revoked — the
+    // allotment skip above is correct idempotency, but the gate must
+    // NOT open: no session remains for the monitor to revoke, and an
+    // open gate with no session is indefinite free access (Codex P1 on
+    // #68, round 10). Terminalize the quote without touching the gate.
+    if !sessions.lock().await.is_active(&record.mac) {
+        let quote_id = record.quote.clone();
+        let mac = record.mac.clone();
+        record.session_granted = true;
+        let grant_id = format!("ln:{}", quote_id);
+        if let Err(e) = store.upsert(record).await {
+            return SettleOutcome::Failed(format!("quote persist failed: {e}"));
+        }
+        let mut sm = sessions.lock().await;
+        sm.forget_grants([grant_id]);
+        if let Err(e) = sm.save_now(sessions_dir) {
+            tracing::warn!(error = %e, "session save after ln-grant cleanup failed; debounced save will retry");
+        }
+        tracing::info!(quote = %quote_id, mac = %mac, "lightning quote settled against an expired session — terminalized without reopening the gate");
+        return SettleOutcome::Granted { allotment };
+    }
+
     if let Err(e) = portal.grant_access(&record.mac).await {
         tracing::warn!(mac = %record.mac, error = %e, "gate open failed for paid lightning quote; retrying next tick");
         return SettleOutcome::GrantFailed;

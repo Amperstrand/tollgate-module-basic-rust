@@ -526,6 +526,13 @@ impl SessionManager {
         file.write_all(json.as_bytes())?;
         file.sync_all()?;
         std::fs::rename(&tmp, &path)?;
+        // The rename itself must be durable BEFORE the sessions rename
+        // publishes the removal (Codex P1 on #68, round 10): a power
+        // loss could otherwise recover the new sessions.json without
+        // the tombstone's directory entry — the id in neither file.
+        if let Some(parent) = path.parent() {
+            std::fs::File::open(parent)?.sync_all()?;
+        }
         Ok(())
     }
 

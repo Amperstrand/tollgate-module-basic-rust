@@ -466,3 +466,63 @@ async fn crash_between_session_flush_and_quote_marker_does_not_double_grant() {
         "recovery must not re-apply an allotment that already reached sessions.json"
     );
 }
+
+/// Codex P1 on #68 (round 10): a tombstoned ln grant id with NO live
+/// session (the allotment was applied, the session then expired) must
+/// settle WITHOUT reopening the gate — an open gate with no session is
+/// indefinite free access.
+#[tokio::test]
+async fn tombstoned_quote_settles_without_reopening_the_gate() {
+    use tollgate_module_basic_rust::lightning_quotes::{settle_quote, SettleOutcome};
+    use tollgate_module_basic_rust::session::SessionManager;
+
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let store = std::sync::Arc::new(QuoteStore::load(dir.path()));
+
+    let mut rec = quote_record("tomb-ln");
+    rec.minted = true;
+    rec.allotment = 500;
+    rec.metric = "bytes".to_string();
+    store.upsert(rec).await.unwrap();
+
+    // The quote's grant was once applied; the session then EXPIRED and
+    // was saved away — only a tombstone carries the id now.
+    {
+        let mut sm = SessionManager::new();
+        sm.apply_grant_once("aa:bb:cc:dd:ee:ff", 500, "bytes", 3600, "ln:tomb-ln");
+        if let Some(s) = sm.sessions.get_mut("aa:bb:cc:dd:ee:ff") {
+            s.expiry = 1;
+        }
+        sm.save_now(cfg_dir.path()).unwrap();
+    }
+    let sessions = tokio::sync::Mutex::new(SessionManager::load_from_disk(cfg_dir.path()));
+    let portal = FakePortal {
+        granted: std::sync::Mutex::new(vec![]),
+    };
+
+    let config = tollgate_module_basic_rust::config::Config::default();
+    let wallet = tollgate_module_basic_rust::wallet::TollWallet::new(
+        [0u8; 64],
+        vec![],
+        dir.path().to_path_buf(),
+    );
+    let outcome = settle_quote(
+        store.clone(),
+        &wallet,
+        &sessions,
+        &portal,
+        &config,
+        cfg_dir.path(),
+        store.get("tomb-ln").await.unwrap(),
+    )
+    .await;
+
+    assert_eq!(outcome, SettleOutcome::Granted { allotment: 500 });
+    assert!(
+        portal.granted.lock().unwrap().is_empty(),
+        "no gate may open for a quote with no live session"
+    );
+    let settled = store.get("tomb-ln").await.unwrap();
+    assert!(settled.session_granted, "the quote still terminalizes");
+}
