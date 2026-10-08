@@ -71,3 +71,15 @@ outcomes and reproduction sketches live next to this file:
 - `docs/audit-s13/verdict-mig.md` — 10 rows, PRs #25/#29/#37
 - `docs/audit-s13/verdict-jrn.md` — 8 rows, PRs #39/#42/#43 (+ #54/#55 family)
 - `docs/audit-s13/verdict-new.md` — 13 rows, PRs #54/#55/#57
+
+## Post-implementation review (added after lane completion)
+
+A 5-lane review (goal / QA-execution / code-quality / security / context)
+ran over all three branches: see `REVIEW.md`. Formal verdict: FAILED on
+the branches as-reviewed (one MAJOR: x509 SEC1 long-form DER misparse),
+with the decisive context that the campaign had already landed as PR #58
+(origin/main `274f001`, superset of these branches) and the MAJOR is
+already fixed in the in-flight PR #68 (`82316ce`). Two MEDIUM residuals
+(InsufficientFunds-definitive provenance; tmp-path O_NOFOLLOW) remain
+documented for the #68 stream. This branch is the durable campaign
+record; the three fix branches are pre-merge lineages of #58.
