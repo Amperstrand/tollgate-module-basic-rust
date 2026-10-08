@@ -346,20 +346,18 @@ pub async fn settle_quote(
         }
     }
 
-    // A tombstoned ln id means THIS quote's allotment was already
-    // applied and its session has since expired or was revoked — the
-    // allotment skip above is correct idempotency, but the gate must
-    // NOT open: no session remains for the monitor to revoke, and an
-    // open gate with no session is indefinite free access (Codex P1 on
-    // #68, round 10). Terminalize the quote without touching the gate.
-    if !sessions.lock().await.is_active(&record.mac) {
-        let quote_id = record.quote.clone();
-        let mac = record.mac.clone();
-        let grant_id = format!("ln:{}", quote_id);
+    // GRANT-level, not MAC-level (Codex P1 on #68, round 14): an active
+    // session from a SIBLING grant must not make this quote look
+    // delivered. The id answers from a tombstone (or nothing) exactly
+    // when this quote's allotment is NOT in the live session.
+    let grant_id = format!("ln:{}", record.quote);
+    if !sessions.lock().await.has_live_grant(&record.mac, &grant_id) {
         if record.session_granted {
             // Delivered, then consumed/expired: terminalize WITHOUT
             // reopening the gate (an open gate with no session is
             // indefinite free access — round 10).
+            let quote_id = record.quote.clone();
+            let mac = record.mac.clone();
             record.session_granted = true;
             if let Err(e) = store.upsert(record).await {
                 return SettleOutcome::Failed(format!("quote persist failed: {e}"));
@@ -373,27 +371,27 @@ pub async fn settle_quote(
             return SettleOutcome::Granted { allotment };
         }
         // UNDELIVERED credit (round 12): the allotment was applied but
-        // the gate never opened (grant_access kept failing) and the
-        // session expired unused — terminalizing would eat the paid
-        // credit. Recreate the grant instead: forget the tombstone,
-        // re-apply the allotment fresh, and let the normal path below
-        // open the gate for it.
-        tracing::info!(quote = %quote_id, mac = %mac, "lightning quote undelivered (gate failures outlived the session) — recreating the grant");
-        let mut sm = sessions.lock().await;
-        sm.forget_grants([grant_id.clone()]);
-        // REPLACE, don't extend: an expired-but-not-yet-removed record
-        // would make add_allotment ADD to the dead allotment — twice
-        // the purchased credit, growing with every expiry/gate-failure
-        // race (Codex P1 on #68, round 13). revoke_session retires any
-        // other outstanding ids first.
-        if sm.get_session(&mac).is_some() {
-            sm.revoke_session(&mac);
-        }
-        sm.add_allotment(&mac, &metric, allotment, 3600, Some(&grant_id));
-        if let Err(e) = sm.save_now(sessions_dir) {
-            tracing::warn!(error = %e, "session save after ln-grant recreation failed; retrying next tick");
-            drop(sm);
-            return SettleOutcome::GrantFailed;
+        // the gate never opened and the session expired unused —
+        // terminalizing would eat the paid credit. Recreate the grant.
+        // A live SIBLING session is extended (additive paid credit); an
+        // expired leftover record is REPLACED, not extended (round 13).
+        // On an undurable save the whole recreation rolls back so the
+        // next pass retries it (round 14).
+        tracing::info!(quote = %record.quote, mac = %record.mac, "lightning quote undelivered — recreating the grant");
+        {
+            let mut sm = sessions.lock().await;
+            sm.forget_grants([grant_id.clone()]);
+            let prior = sm.snapshot_session(&record.mac);
+            if sm.get_session(&record.mac).is_some() && !sm.is_active(&record.mac) {
+                sm.revoke_session(&record.mac);
+            }
+            sm.add_allotment(&record.mac, &metric, allotment, 3600, Some(&grant_id));
+            if let Err(e) = sm.save_now(sessions_dir) {
+                sm.rollback_session(&record.mac, prior);
+                tracing::warn!(error = %e, "session save after ln-grant recreation failed; rolled back, retrying next tick");
+                drop(sm);
+                return SettleOutcome::GrantFailed;
+            }
         }
     }
 

@@ -222,6 +222,25 @@ impl SessionManager {
         })
     }
 
+    /// Whether a LIVE session for `mac` carries this exact grant id —
+    /// grant-level (not MAC-level): an active session from ANOTHER grant
+    /// must not make this grant look delivered (Codex P1 on #68, round
+    /// 14: a recreated sibling made the MAC active and settlement
+    /// terminalized the second undelivered quote without its allotment),
+    /// and an EXPIRED record carrying the id is not a live grant either
+    /// (round 13: it must be replaced, not trusted).
+    pub fn has_live_grant(&self, mac: &str, grant_id: &str) -> bool {
+        self.sessions.get(mac).is_some_and(|s| {
+            s.applied_grants.contains(grant_id) && {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                s.expiry > now && s.used < s.allotment
+            }
+        })
+    }
+
     /// Retire a session's grant ids into the tombstone set — called when
     /// the session is removed or dropped by the save filter so the ids
     /// survive their session (see the field doc).

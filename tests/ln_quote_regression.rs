@@ -657,3 +657,82 @@ async fn undelivered_recreation_replaces_the_expired_record() {
         ["aa:bb:cc:dd:ee:ff"]
     );
 }
+
+/// Codex P1 on #68 (round 14): with TWO undelivered tombstoned quotes
+/// for one MAC, recreating the first makes the MAC active — settling the
+/// second must still deliver ITS allotment (extend the sibling), not
+/// terminalize it as "delivered".
+#[tokio::test]
+async fn second_undelivered_quote_extends_the_recreated_sibling() {
+    use tollgate_module_basic_rust::lightning_quotes::{settle_quote, SettleOutcome};
+    use tollgate_module_basic_rust::session::SessionManager;
+
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let store = std::sync::Arc::new(QuoteStore::load(dir.path()));
+
+    for (q, amt) in [("sib-a", 300u64), ("sib-b", 500u64)] {
+        let mut rec = quote_record(q);
+        rec.minted = true;
+        rec.allotment = amt;
+        rec.metric = "bytes".to_string();
+        store.upsert(rec).await.unwrap();
+    }
+
+    // Both quotes' grants were applied once; both sessions expired away
+    // (tombstones on disk, no live session).
+    {
+        let mut sm = SessionManager::new();
+        sm.apply_grant_once("aa:bb:cc:dd:ee:ff", 300, "bytes", 3600, "ln:sib-a");
+        sm.apply_grant_once("aa:bb:cc:dd:ee:ff", 500, "bytes", 3600, "ln:sib-b");
+        if let Some(s) = sm.sessions.get_mut("aa:bb:cc:dd:ee:ff") {
+            s.expiry = 1;
+        }
+        sm.save_now(cfg_dir.path()).unwrap();
+    }
+    let sessions = tokio::sync::Mutex::new(SessionManager::load_from_disk(cfg_dir.path()));
+    let portal = FakePortal {
+        granted: std::sync::Mutex::new(vec![]),
+    };
+    let config = tollgate_module_basic_rust::config::Config::default();
+    let wallet = tollgate_module_basic_rust::wallet::TollWallet::new(
+        [0u8; 64],
+        vec![],
+        dir.path().to_path_buf(),
+    );
+
+    // Settle A: recreates (replaces) — 300.
+    let out = settle_quote(
+        store.clone(),
+        &wallet,
+        &sessions,
+        &portal,
+        &config,
+        cfg_dir.path(),
+        store.get("sib-a").await.unwrap(),
+    )
+    .await;
+    assert_eq!(out, SettleOutcome::Granted { allotment: 300 });
+
+    // Settle B: the MAC is now ACTIVE from A — B must still deliver its
+    // own allotment (extend the sibling), never terminalize as delivered.
+    let out = settle_quote(
+        store.clone(),
+        &wallet,
+        &sessions,
+        &portal,
+        &config,
+        cfg_dir.path(),
+        store.get("sib-b").await.unwrap(),
+    )
+    .await;
+    assert_eq!(out, SettleOutcome::Granted { allotment: 500 });
+    {
+        let sm = sessions.lock().await;
+        let s = sm.get_session("aa:bb:cc:dd:ee:ff").expect("live session");
+        assert_eq!(
+            s.allotment, 800,
+            "both paid quotes' credit is live (300 + 500)"
+        );
+    }
+}
