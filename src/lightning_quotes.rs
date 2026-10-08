@@ -352,8 +352,20 @@ pub async fn settle_quote(
     }
 
     record.session_granted = true;
+    let grant_id = format!("ln:{}", record.quote);
     if let Err(e) = store.upsert(record).await {
         return SettleOutcome::Failed(format!("quote persist failed: {e}"));
+    }
+    // The settle marker is durable: the grant id's idempotency job is
+    // done — forget it (memory AND disk) so it cannot later resurrect
+    // as a permanent tombstone when the session is removed (Codex P2 on
+    // #68, r8).
+    {
+        let mut sm = sessions.lock().await;
+        sm.forget_grants([grant_id]);
+        if let Err(e) = sm.save_now(sessions_dir) {
+            tracing::warn!(error = %e, "session save after ln-grant cleanup failed; debounced save will retry");
+        }
     }
     SettleOutcome::Granted { allotment }
 }

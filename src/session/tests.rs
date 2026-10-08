@@ -383,3 +383,18 @@ fn session_state_respects_history_ttl_without_later_expiry() {
         "entry inside the TTL still answers expired"
     );
 }
+
+/// Codex P1 on #68 (r8): the monitor's usage-revocation path must retire
+/// grant ids like expiry cleanup does — the payment may still be
+/// undecided and its id must outlive the revoked session.
+#[test]
+fn revoke_session_retires_grant_ids() {
+    let mut mgr = SessionManager::new();
+    mgr.apply_grant_once("aa:bb:cc:00:00:99", 100, "bytes", 3600, "rev-1");
+    mgr.revoke_session("aa:bb:cc:00:00:99");
+    assert!(
+        mgr.has_grant("aa:bb:cc:00:00:99", "rev-1"),
+        "the grant id survives usage revocation"
+    );
+    assert!(mgr.get_session("aa:bb:cc:00:00:99").is_none());
+}

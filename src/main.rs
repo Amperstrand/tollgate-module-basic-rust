@@ -175,12 +175,12 @@ async fn apply_reconciled_grant(
         //   with no session behind it — Codex P1 on #68, round 6).
         // (already_granted from the in-memory set is the same-boot
         // append-only retry: the gate is known open in THIS process.)
-        let live_session = state
-            .sessions
-            .lock()
-            .await
-            .get_session(&entry.mac)
-            .is_some();
+        // is_active, not record existence: an expired-but-loaded record
+        // must NOT reopen the gate (the monitor's snapshots exclude it
+        // and cleanup would remove it without revoke_access — an open
+        // gate with no session, indefinitely). Expired records take the
+        // tombstone path: append-only, no gate (Codex P1 on #68, r8).
+        let live_session = state.sessions.lock().await.is_active(&entry.mac);
         if live_session || grant_applied_durable {
             if let Err(e) = state.portal.grant_access(&entry.mac).await {
                 // A failed gate (re-)open must NOT terminalize: the paid
@@ -218,7 +218,14 @@ async fn apply_reconciled_grant(
             // The journal is terminal: the grant tombstone has served its
             // purpose — drop it so the set stays bounded by in-flight
             // failures (Codex P1 on #68, round 6).
-            state.sessions.lock().await.forget_grants([&entry.id]);
+            let mut sessions = state.sessions.lock().await;
+            sessions.forget_grants([&entry.id]);
+            // Durable now, not debounced: a crash before the next save
+            // would reload the id from sessions.json and later resurrect
+            // it as a permanent tombstone (Codex P2 on #68, r8).
+            if let Err(e) = sessions.save_now(cfg_dir) {
+                tracing::warn!(error = %e, "session save after grant cleanup failed; debounced save will retry");
+            }
         }
         Err(e) => {
             granted_pending_terminal
@@ -1207,5 +1214,53 @@ mod tests {
                 },
             "a terminalized grant drops its tombstone"
         );
+    }
+    /// Codex P1 on #68 (r8): an expired-but-loaded session record must
+    /// NOT reopen the gate — is_active decides, not record existence.
+    /// The entry terminalizes through its tombstone; no free access.
+    #[tokio::test]
+    async fn expired_loaded_record_does_not_reopen_the_gate() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let (state, _portal) = test_state(&dir, None);
+        let entry = undecided_entry(
+            "expired-live-test",
+            payment_journal::PaymentPhase::TimeoutUnknown,
+        );
+        payment_journal::append_entry(&dir, &entry).unwrap();
+        let pending = std::sync::Mutex::new(std::collections::HashSet::new());
+
+        // Pass 1 with a failing terminal append: the entry stays
+        // UNDECIDED (the state where the grant id must survive) while
+        // the session is then expired and reloaded.
+        use std::os::unix::fs::PermissionsExt;
+        let journal_file = dir.join(payment_journal::PAYMENT_JOURNAL_NAME);
+        std::fs::set_permissions(&journal_file, std::fs::Permissions::from_mode(0o444)).unwrap();
+        apply_reconciled_grant(&state, &dir, &entry, 5, &pending).await;
+        std::fs::set_permissions(&journal_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        {
+            // Expire the session WITHOUT cleaning it up — sessions.json
+            // still carries the expired record when the process restarts.
+            let mut sessions = state.sessions.lock().await;
+            if let Some(s) = sessions.sessions.get_mut("aa:bb:cc:dd:ee:ff") {
+                s.expiry = 1;
+            }
+            sessions.save_now(&dir).unwrap();
+        }
+        let (state, portal) =
+            test_state_with_sessions(&dir, None, session::SessionManager::load_from_disk(&dir));
+        let pending = std::sync::Mutex::new(std::collections::HashSet::new());
+        apply_reconciled_grant(&state, &dir, &entry, 5, &pending).await;
+        assert_eq!(
+            *portal.grants.lock().unwrap(),
+            0,
+            "an expired loaded record must not reopen the gate"
+        );
+        let journal = payment_journal::read_journal(&dir);
+        let folded = payment_journal::fold_last(&journal);
+        assert!(matches!(
+            folded["expired-live-test"].phase,
+            payment_journal::PaymentPhase::ReconcileSpent { .. }
+        ));
     }
 }

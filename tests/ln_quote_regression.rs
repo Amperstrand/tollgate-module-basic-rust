@@ -284,6 +284,18 @@ async fn settlement_uses_pricing_terms_frozen_at_creation() {
     let session = guard.get_session("aa:bb:cc:dd:ee:ff").unwrap();
     assert_eq!(session.allotment, 999, "stored allotment must win");
     assert_eq!(session.metric, "bytes", "stored metric must win");
+    // Codex P2 on #68 (r8): the settled grant id is forgotten on the spot
+    // (memory AND disk) so it cannot resurrect as a permanent tombstone.
+    assert!(
+        !guard.has_grant("aa:bb:cc:dd:ee:ff", "ln:priced-then"),
+        "settled ln grant id must be forgotten after the settle marker"
+    );
+    let reloaded =
+        tollgate_module_basic_rust::session::SessionManager::load_from_disk(cfg_dir.path());
+    assert!(
+        !reloaded.has_grant("aa:bb:cc:dd:ee:ff", "ln:priced-then"),
+        "the forget must be durable, not just in-memory"
+    );
 }
 
 /// PR #22 r4070018400 / PR #23 r4070120831: the monitor sweeps every 5s;

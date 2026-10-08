@@ -367,9 +367,14 @@ impl SessionManager {
         }
     }
 
-    /// Remove a session by MAC. No-op if the MAC has no session.
+    /// Remove a session by MAC (usage exhaustion / operator removal).
+    /// No-op if the MAC has no session. Retires the session's grant ids
+    /// first — the payment may still be undecided and its id must
+    /// outlive the session (same contract as expiry cleanup; Codex P1
+    /// on #68, r8: the monitor's usage-revocation path bypassed it).
     pub fn revoke_session(&mut self, mac: &str) {
-        if self.sessions.remove(mac).is_some() {
+        if let Some(session) = self.sessions.remove(mac) {
+            self.retire_grants(&session);
             self.remember_expired(mac);
         }
     }
