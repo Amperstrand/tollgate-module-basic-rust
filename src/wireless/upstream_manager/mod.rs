@@ -75,6 +75,10 @@ pub struct UpstreamManager {
     consecutive_failures: u32,
     last_switch: Option<Instant>,
     sta_interface: Option<String>,
+    /// The netifd L3 device (e.g. `wwan0`) resolved from `sta_interface`
+    /// for signal polling — cached after the first successful resolution
+    /// (`l3_device` is stable per boot).
+    sta_device: Option<String>,
 }
 
 impl UpstreamManager {
@@ -88,6 +92,7 @@ impl UpstreamManager {
             consecutive_failures: 0,
             last_switch: None,
             sta_interface: None,
+            sta_device: None,
         }
     }
 
@@ -272,17 +277,46 @@ impl UpstreamManager {
                 Some(result)
             }
             Err(e) => {
-                // Ambiguous (the token may exist undelivered): journal it
-                // — but we have no token string, so it surfaces via the
-                // saga + the warning below rather than as a recoverable token.
-                tracing::error!(
-                    error = %e,
-                    "upstream wallet.send errored — outcome ambiguous; the send saga reconciles at next recovery; no token string was captured"
-                );
+                // Codex P2 on #54 / P1 on #55: only genuinely ambiguous
+                // outcomes may enter the blocking Ambiguous phase. A
+                // definitive local failure moved no value and holds no
+                // token to recover — journaling it Ambiguous would wedge
+                // undelivered_tokens (and thus every future purchase)
+                // forever. Definitive set: the mint's wallet is not
+                // registered (fails before CDK, no saga exists) and
+                // CDK's InsufficientFunds (escapes the purely local
+                // proof-selection in send's prepare — nothing was signed
+                // or submitted). Everything else (timeouts, transport,
+                // saga-recovery refusals) stays Ambiguous: the token may
+                // exist undelivered.
+                let definitive = matches!(&e, crate::error::WalletError::WalletNotFound(_))
+                    || matches!(
+                        &e,
+                        crate::error::WalletError::Cdk(cdk::Error::InsufficientFunds)
+                    );
+                let phase = if definitive {
+                    tracing::warn!(
+                        error = %e,
+                        "upstream wallet.send failed definitively (no value moved) — journaled retryable-failed, repurchase unblocked"
+                    );
+                    pj::PayoutPhase::Failed {
+                        reason: e.to_string(),
+                    }
+                } else {
+                    // Ambiguous (the token may exist undelivered): journal
+                    // it — but we have no token string, so it surfaces via
+                    // the saga + the warning below rather than as a
+                    // recoverable token.
+                    tracing::error!(
+                        error = %e,
+                        "upstream wallet.send errored — outcome ambiguous; the send saga reconciles at next recovery; no token string was captured"
+                    );
+                    pj::PayoutPhase::Ambiguous
+                };
                 let _ = pj::append_entry(
                     &cfg_dir,
                     &pj::PayoutEntry {
-                        phase: pj::PayoutPhase::Ambiguous,
+                        phase,
                         ..intent.clone()
                     },
                 );
@@ -389,6 +423,12 @@ impl UpstreamManager {
                 // was previously never assigned (None → every purchase
                 // silently skipped).
                 self.sta_interface = Some(sta_iface);
+                // Codex P2 on #58: the cached l3_device belongs to the
+                // PREVIOUS STA section — do_scan_and_connect can select a
+                // different UCI section (multi-radio routers), and netifd
+                // then binds a different l3_device to network.interface.wwan.
+                // Invalidate so the next monitor tick re-resolves.
+                self.sta_device = None;
 
                 // Codex P1 on #52: the gateway IP must come from the STA
                 // route, not the literal host "gateway" (no DNS on normal
@@ -488,7 +528,16 @@ impl UpstreamManager {
             }
         };
 
-        let iface = self.sta_interface.as_deref().unwrap_or("wlan0").to_string();
+        // Codex P2 on #54: `sta_interface` is a UCI wifi-iface section
+        // name, not a kernel device — `iw dev <section> link` always
+        // fails on normal OpenWrt, killing signal polling. Resolve the
+        // netifd l3_device (same helper the gateway-IP path uses) and
+        // cache it; fall back to the section name when ubus is absent.
+        let sta = self.sta_interface.as_deref().unwrap_or("wlan0");
+        if self.sta_device.is_none() {
+            self.sta_device = resolve_l3_device(sta);
+        }
+        let iface = self.sta_device.clone().unwrap_or_else(|| sta.to_string());
         let signal = tokio::task::spawn_blocking(move || Connector::get_signal(&iface))
             .await
             .unwrap_or(None);

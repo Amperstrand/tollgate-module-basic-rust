@@ -185,3 +185,166 @@ fn emergency_penalty_extends_blacklist() {
         "emergency blacklist should be longer than {normal_ttl}s, got {ttl}s"
     );
 }
+
+/// Codex P2 on #54 / P1 on #55: a DEFINITIVE wallet.send failure (mint's
+/// wallet not registered — fails before CDK, no saga, no value moved) must
+/// not journal the blocking Ambiguous phase: no token exists to recover,
+/// and one such entry wedges every future reseller purchase behind
+/// undelivered_tokens forever.
+#[tokio::test]
+#[serial_test::serial]
+async fn definitive_send_failure_does_not_block_repurchase() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    std::env::set_var("TOLLGATE_TEST_CONFIG_DIR", tmp.path());
+    let cfg_dir = tmp.path().to_path_buf();
+
+    // No mint registered: wallet.send fails with WalletNotFound without
+    // touching the network or creating any saga.
+    let mut seed = [0u8; 64];
+    use rand::RngCore;
+    rand::thread_rng().fill_bytes(&mut seed);
+    let wallet = TollWallet::new(seed, vec![], tmp.path().join("db"));
+    let mut session = UpstreamSession::new("10.0.0.1", "wlan0");
+
+    let first =
+        UpstreamManager::journalled_purchase(&wallet, "http://127.0.0.1:1", 1000, &mut session)
+            .await;
+    assert!(first.is_none(), "send must fail (wallet not registered)");
+
+    use crate::payout_journal as pj;
+    let undelivered = pj::undelivered_tokens(&cfg_dir, "reseller-upstream");
+    assert!(
+        undelivered.is_empty(),
+        "a definitive failure has no token to recover and must not block: {undelivered:?}"
+    );
+
+    // And the duplicate-attempt gate lets a second purchase attempt run
+    // (it fails the same way, but is not BLOCKED by the first failure).
+    let second =
+        UpstreamManager::journalled_purchase(&wallet, "http://127.0.0.1:1", 1000, &mut session)
+            .await;
+    assert!(second.is_none());
+    std::env::remove_var("TOLLGATE_TEST_CONFIG_DIR");
+}
+
+/// Codex P2 on #54: `sta_interface` holds the UCI wifi-iface SECTION name
+/// — polling `iw dev <section> link` always fails on normal OpenWrt, so
+/// signal monitoring is dead. do_monitor must resolve the netifd
+/// l3_device (ubus) and pass THAT to `iw`. Verified end-to-end with
+/// PATH-stubbed `ubus` + `iw` binaries.
+#[tokio::test]
+#[serial_test::serial]
+async fn monitor_polls_signal_on_the_resolved_l3_device() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bin = tmp.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+
+    // ubus advertises the wwan netifd interface's l3_device.
+    let ubus = bin.join("ubus");
+    std::fs::write(&ubus, "#!/bin/sh\nprintf '{\"l3_device\":\"wwan0\"}'\n").unwrap();
+
+    // iw records the device it was asked about.
+    let log = tmp.path().join("iw.log");
+    let iw = bin.join("iw");
+    std::fs::write(
+        &iw,
+        format!("#!/bin/sh\nprintf '%s ' \"$@\" >> {}\n", log.display()),
+    )
+    .unwrap();
+    make_executable(ubus);
+    make_executable(iw);
+
+    let old_path = std::env::var("PATH").unwrap_or_default();
+    std::env::set_var("PATH", format!("{}:{}", bin.display(), old_path));
+
+    let mut manager = UpstreamManager::new(test_config());
+    // What Connector::connect actually returns: a UCI section name.
+    manager.sta_interface = Some("wgt0a1b".to_string());
+    manager.current_gateway = Some(test_network("AA:BB:CC:DD:EE:01", "AP", -50).into());
+
+    let _ = manager.do_monitor(None).await;
+
+    let polled = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        polled.contains("dev wwan0 link"),
+        "signal poll must target the resolved l3_device, got: {polled:?}"
+    );
+    assert!(
+        !polled.contains("wgt0a1b"),
+        "the UCI section name is not a kernel device"
+    );
+
+    std::env::set_var("PATH", old_path);
+}
+
+/// Codex P2 on #58: the l3_device cache must not outlive the STA section
+/// it was resolved for. Multi-radio routers can switch sections on
+/// reconnect; netifd then binds a different l3_device, and a stale cache
+/// would poll a dead device forever.
+#[tokio::test]
+async fn monitor_re_resolves_device_after_sta_section_switch() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bin = tmp.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+
+    // resolve_l3_device always queries `network.interface.wwan` — what
+    // changes on a section switch is netifd's ANSWER (it rebinds the
+    // l3_device). The stub is therefore stateful: first call answers
+    // wwan0 (radio0's binding), every later call wlan1 (radio1's).
+    let counter = tmp.path().join("ubus.calls");
+    let ubus = bin.join("ubus");
+    std::fs::write(
+        &ubus,
+        format!(
+            "#!/bin/sh\nn=$(cat {c} 2>/dev/null || echo 0)\nn=$((n+1))\n\
+             echo $n > {c}\n\
+             if [ $n -le 1 ]; then printf '{{\"l3_device\":\"wwan0\"}}'\n\
+             else printf '{{\"l3_device\":\"wlan1\"}}'\nfi\n",
+            c = counter.display()
+        ),
+    )
+    .unwrap();
+
+    let log = tmp.path().join("iw.log");
+    let iw = bin.join("iw");
+    std::fs::write(
+        &iw,
+        format!("#!/bin/sh\nprintf '%s ' \"$@\" >> {}\n", log.display()),
+    )
+    .unwrap();
+    make_executable(ubus);
+    make_executable(iw);
+
+    let old_path = std::env::var("PATH").unwrap_or_default();
+    std::env::set_var("PATH", format!("{}:{}", bin.display(), old_path));
+
+    let mut manager = UpstreamManager::new(test_config());
+    manager.sta_interface = Some("wgt0a1b".to_string());
+    manager.current_gateway = Some(test_network("AA:BB:CC:DD:EE:01", "AP", -50).into());
+    let _ = manager.do_monitor(None).await;
+    assert!(
+        std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .contains("dev wwan0 link"),
+        "first poll resolves radio0's l3_device"
+    );
+
+    // Reconnect selects radio1's section — the cache must invalidate
+    // (production does this in do_scan_and_connect; simulated directly).
+    manager.sta_interface = Some("wgt1a1b".to_string());
+    manager.sta_device = None;
+    let _ = manager.do_monitor(None).await;
+    assert!(
+        std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .contains("dev wlan1 link"),
+        "after a section switch the poll must target the NEW l3_device"
+    );
+
+    std::env::set_var("PATH", old_path);
+}
+
+fn make_executable(path: std::path::PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755));
+}

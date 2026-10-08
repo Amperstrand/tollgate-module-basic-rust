@@ -184,3 +184,60 @@ fn is_active_checks_both_expiry_and_usage() {
     session.expiry = 1;
     assert!(!session.is_active());
 }
+
+/// Codex P1 on #55: Go's kind-1022 (and this repo's, for wire parity)
+/// carries no `expiry` tag. The parser must DERIVE one — left at zero,
+/// `is_expired()` (0 ⇒ expired) makes the monitor discard the paid
+/// session on its first tick and force a re-purchase.
+#[test]
+fn parse_derives_expiry_for_time_metered_grant_without_expiry_tag() {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let grant = format!(
+        r#"{{"kind":1022,"tags":[["allotment","3600000"],["metric","milliseconds"],["start-time","{now}"]]}}"#
+    );
+    let result = UpstreamSession::parse_session_grant(&grant);
+    assert!(result.success, "{:?}", result.error);
+    assert_eq!(
+        result.expiry,
+        now + 3600,
+        "milliseconds allotment IS the duration"
+    );
+
+    let mut session = UpstreamSession::new("10.0.0.1", "wlan0");
+    session.apply_payment(&result);
+    assert!(
+        !session.is_expired(),
+        "a just-paid derived session must survive the monitor's first tick"
+    );
+}
+
+#[test]
+fn parse_derives_default_expiry_for_non_time_grant_without_expiry_tag() {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let grant = format!(
+        r#"{{"kind":1022,"tags":[["allotment","1000000000"],["metric","bytes"],["start-time","{now}"]]}}"#
+    );
+    let result = UpstreamSession::parse_session_grant(&grant);
+    assert!(result.success);
+    assert_eq!(result.expiry, now + 3600);
+}
+
+#[test]
+fn parse_keeps_explicit_expiry_tag_over_derivation() {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let grant = format!(
+        r#"{{"kind":1022,"tags":[["allotment","3600000"],["metric","milliseconds"],["expiry","{}"]]}}"#,
+        now + 7200
+    );
+    let result = UpstreamSession::parse_session_grant(&grant);
+    assert_eq!(result.expiry, now + 7200, "explicit tag must win");
+}

@@ -11,6 +11,11 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
+// Wired here in the S13 NEW-lane audit: the file existed since #54 but
+// was never declared, so none of its tests compiled or ran.
+#[cfg(test)]
+mod tests;
+
 const SAVE_DEBOUNCE_MS: u64 = 5000;
 
 fn epoch_ms() -> u64 {
@@ -243,14 +248,22 @@ impl SessionManager {
         if self.is_active(mac) {
             return SessionState::Active;
         }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let cutoff = now.saturating_sub(EXPIRED_HISTORY_TTL_SECS);
         let hist = self
             .expired_history
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        if hist.contains_key(mac) {
-            return SessionState::Expired;
+        // Codex P2 on #54: the TTL sweep in remember_expired only runs when
+        // another session expires — check the stored timestamp here too, or
+        // a quiet router answers `expired` for a MAC that expired days ago.
+        match hist.get(mac) {
+            Some(when) if *when >= cutoff => SessionState::Expired,
+            _ => SessionState::None,
         }
-        SessionState::None
     }
 
     /// Remove a session by MAC. No-op if the MAC has no session.

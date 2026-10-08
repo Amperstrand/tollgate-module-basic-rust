@@ -14,6 +14,43 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// periodic re-check.
 async fn reconcile_payments_once(state: &Arc<http::AppState>) {
     let cfg_dir = config::config_dir();
+    // Codex P1 on #43 (thread 4141963797): `ensure_mint` can fail at boot
+    // (e.g. saga recovery contacts an unavailable mint), leaving no wallet
+    // registered for the mint — undecided payments for it would then hit
+    // `WalletNotFound` on every pass and stay undecided forever. The 30s
+    // mint-retry loop only covers mints in the CURRENT config and only
+    // while some configured mint is failing; retry wallet init here for
+    // every undecided entry's PERSISTED mint before its proofs are queried
+    // (bounded: one attempt per pass — `ensure_mint` is idempotent and a
+    // map lookup once registered).
+    {
+        let mut undecided_mints: Vec<String> =
+            payment_journal::fold_last(&payment_journal::read_journal(&cfg_dir))
+                .values()
+                .filter(|e| e.phase.needs_reconciliation())
+                .map(|e| e.mint.clone())
+                .collect();
+        undecided_mints.sort();
+        undecided_mints.dedup();
+        if !undecided_mints.is_empty() {
+            let mut w = state.wallet.write().await;
+            if let Some(wallet) = w.as_mut() {
+                for mint in &undecided_mints {
+                    // Failure logs and leaves the entries undecided — the
+                    // next pass retries. MintNotAccepted (the entry's mint
+                    // left the config after intent time) surfaces here
+                    // loudly: that payment needs an operator decision.
+                    if let Err(e) = wallet.ensure_mint(mint).await {
+                        tracing::warn!(
+                            mint,
+                            error = %e,
+                            "payment reconciliation: wallet init retry failed for an undecided entry's mint"
+                        );
+                    }
+                }
+            }
+        }
+    }
     let (report, grants) = {
         let w = state.wallet.read().await;
         let Some(wallet) = w.as_ref() else { return };
@@ -24,23 +61,78 @@ async fn reconcile_payments_once(state: &Arc<http::AppState>) {
         // the wallet via the same saga recovery; the operator sees the
         // balance. Advance the journal and continue.
         if entry.mac == payment_journal::CLI_FUND_MAC {
-            let _ = payment_journal::append_entry(
+            match payment_journal::append_entry(
                 &cfg_dir,
                 &payment_journal::PaymentEntry {
                     phase: payment_journal::PaymentPhase::ReconcileSpent { amount_sat },
                     ..entry.clone()
                 },
-            );
-            tracing::info!(
-                amount_sat,
-                "reconciled CLI fund: value recovered into the wallet (no session owed)"
-            );
+            ) {
+                Ok(()) => tracing::info!(
+                    amount_sat,
+                    "reconciled CLI fund: value recovered into the wallet (no session owed)"
+                ),
+                Err(e) => tracing::error!(
+                    error = %e,
+                    "CRITICAL: terminal journal append failed for a reconciled CLI fund — entry stays undecided and re-reconciles next pass"
+                ),
+            }
             continue;
         }
-        // Grant from the pricing facts frozen at intent time (Codex P2 on
-        // #43), not current config.
-        let steps = amount_sat / entry.price_per_step.max(1);
-        let allotment = steps * entry.step_size.max(1);
+        apply_reconciled_grant(
+            state,
+            &cfg_dir,
+            &entry,
+            amount_sat,
+            granted_pending_terminal(),
+        )
+        .await;
+    }
+    if report.granted_sessions + report.closed_unspent + report.zero_steps + report.undecided > 0 {
+        tracing::info!(
+            granted = report.granted_sessions,
+            closed_unspent = report.closed_unspent,
+            zero_steps = report.zero_steps,
+            undecided = report.undecided,
+            "payment journal reconciled"
+        );
+    }
+}
+
+/// Entry ids whose reconciled grant (session + gate) was applied but whose
+/// terminal `ReconcileSpent` append failed (Codex P1 on #43, thread
+/// 4141963821): later passes re-run ONLY the append — re-granting would
+/// reset the session's usage/expiry on every pass while the append keeps
+/// failing. Process-lifetime, not durable: after a restart at most one
+/// idempotent re-grant happens before the set repopulates; the journal
+/// stays the authority.
+fn granted_pending_terminal() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static SET: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    SET.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Apply one reconciled grant: durable session, gate open, then the
+/// terminal `ReconcileSpent` append — treating an append failure as
+/// actionable instead of discarding it (Codex P1 on #43, thread
+/// 4141963821). A discarded append error would leave the entry undecided
+/// forever while the 60s loop keeps re-granting, resetting the session's
+/// usage/expiry each pass. The first failure records the entry in
+/// `granted_pending_terminal`; later passes skip the session/gate
+/// re-grant and retry ONLY the append until it lands.
+async fn apply_reconciled_grant(
+    state: &Arc<http::AppState>,
+    cfg_dir: &std::path::Path,
+    entry: &payment_journal::PaymentEntry,
+    amount_sat: u64,
+    granted_pending_terminal: &std::sync::Mutex<std::collections::HashSet<String>>,
+) {
+    // Grant from the pricing facts frozen at intent time (Codex P2 on
+    // #43), not current config.
+    let steps = amount_sat / entry.price_per_step.max(1);
+    let allotment = steps * entry.step_size.max(1);
+    let already_granted = granted_pending_terminal.lock().unwrap().contains(&entry.id);
+    if !already_granted {
         {
             let mut sessions = state.sessions.lock().await;
             sessions.create_session(&entry.mac, allotment, &entry.metric, 3600);
@@ -48,10 +140,9 @@ async fn reconcile_payments_once(state: &Arc<http::AppState>) {
             // advance — debounced save returns Ok without writing (Codex
             // P1 on #43). On failure the entry stays undecided and is
             // retried on the next pass.
-            if let Err(e) = sessions.save_now(&config::config_dir()) {
+            if let Err(e) = sessions.save_now(cfg_dir) {
                 tracing::error!(mac = %entry.mac, error = %e, "CRITICAL: reconciled session not durable — leaving payment undecided for retry");
-                drop(sessions);
-                continue;
+                return;
             }
         }
         if let Err(e) = state.portal.grant_access(&entry.mac).await {
@@ -63,25 +154,32 @@ async fn reconcile_payments_once(state: &Arc<http::AppState>) {
             amount_sat,
             "reconciled payment: session granted for a previously-undecided outcome"
         );
-        // Terminal append AFTER the granted session is durable (Codex P1
-        // on #43): a crash before this leaves the entry reconcilable again
-        // — the same-MAC session overwrite makes the re-grant idempotent.
-        let _ = payment_journal::append_entry(
-            &cfg_dir,
-            &payment_journal::PaymentEntry {
-                phase: payment_journal::PaymentPhase::ReconcileSpent { amount_sat },
-                ..entry.clone()
-            },
-        );
     }
-    if report.granted_sessions + report.closed_unspent + report.zero_steps + report.undecided > 0 {
-        tracing::info!(
-            granted = report.granted_sessions,
-            closed_unspent = report.closed_unspent,
-            zero_steps = report.zero_steps,
-            undecided = report.undecided,
-            "payment journal reconciled"
-        );
+    // Terminal append AFTER the granted session is durable (Codex P1 on
+    // #43): a crash before this leaves the entry reconcilable again —
+    // the same-MAC session overwrite makes the re-grant idempotent.
+    match payment_journal::append_entry(
+        cfg_dir,
+        &payment_journal::PaymentEntry {
+            phase: payment_journal::PaymentPhase::ReconcileSpent { amount_sat },
+            ..entry.clone()
+        },
+    ) {
+        Ok(()) => {
+            granted_pending_terminal.lock().unwrap().remove(&entry.id);
+        }
+        Err(e) => {
+            granted_pending_terminal
+                .lock()
+                .unwrap()
+                .insert(entry.id.clone());
+            tracing::error!(
+                id = %entry.id,
+                mac = %entry.mac,
+                error = %e,
+                "CRITICAL: terminal journal append failed after the reconciled grant was applied — retrying the append only (no session reset) on the next pass"
+            );
+        }
     }
 }
 
@@ -537,4 +635,175 @@ async fn main() {
     #[cfg(feature = "embedded-portal")]
     watchdog_handle.abort();
     tracing::info!("shutdown complete");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    /// Offline gate double: counts grant_access calls, never fails.
+    struct FakePortal {
+        grants: std::sync::Mutex<u32>,
+    }
+
+    #[async_trait::async_trait]
+    impl portal::CaptivePortal for FakePortal {
+        async fn grant_access(
+            &self,
+            _mac: &str,
+        ) -> Result<(), tollgate_module_basic_rust::error::AppError> {
+            *self.grants.lock().unwrap() += 1;
+            Ok(())
+        }
+        async fn revoke_access(
+            &self,
+            _mac: &str,
+        ) -> Result<(), tollgate_module_basic_rust::error::AppError> {
+            Ok(())
+        }
+        async fn poll_usage(
+            &self,
+            _mac: &str,
+        ) -> Result<(u64, u64), tollgate_module_basic_rust::error::AppError> {
+            Ok((0, 0))
+        }
+        async fn is_authenticated(&self, _mac: &str) -> bool {
+            true
+        }
+    }
+
+    fn test_state(
+        dir: &Path,
+        wallet: Option<wallet::TollWallet>,
+    ) -> (Arc<http::AppState>, Arc<FakePortal>) {
+        let portal = Arc::new(FakePortal {
+            grants: std::sync::Mutex::new(0),
+        });
+        let identity =
+            Arc::new(identity::MerchantIdentity::from_privkey_hex(&"01".repeat(32)).unwrap());
+        let state = Arc::new(http::AppState {
+            config: Arc::new(config::Config::new_default()),
+            identity,
+            wallet: Arc::new(tokio::sync::RwLock::new(wallet)),
+            sessions: Arc::new(tokio::sync::Mutex::new(session::SessionManager::new())),
+            portal: portal.clone(),
+            verifier: Arc::new(wallet::verify::TokenVerifier::new(vec![])),
+            rate_limiter: Arc::new(tollgate_module_basic_rust::rate_limiter::RateLimiter::new(
+                1000,
+            )),
+            ln_quotes: Arc::new(lightning_quotes::QuoteStore::load(dir)),
+        });
+        (state, portal)
+    }
+
+    fn undecided_entry(
+        id: &str,
+        phase: payment_journal::PaymentPhase,
+    ) -> payment_journal::PaymentEntry {
+        payment_journal::PaymentEntry {
+            id: id.to_string(),
+            ts: 1,
+            token: "not-a-cashu-token".to_string(),
+            mac: "aa:bb:cc:dd:ee:ff".to_string(),
+            mint: "https://test-mint.example".to_string(),
+            price_per_step: 1,
+            step_size: 1000,
+            metric: "bytes".to_string(),
+            phase,
+        }
+    }
+
+    /// Codex P1 on #43 (thread 4141963797): when boot's `ensure_mint`
+    /// failed for an undecided payment's mint, the reconciliation pass
+    /// must retry wallet init for that persisted mint instead of hitting
+    /// `WalletNotFound` forever. The unparseable token keeps the entry
+    /// undecided via a LOCAL parse error (no network), so the wallet
+    /// registration is the pass's only assertable effect.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn reconcile_pass_registers_wallet_for_undecided_entries_mints() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        std::env::set_var("TOLLGATE_TEST_CONFIG_DIR", &dir);
+        let w = wallet::TollWallet::new(
+            [7u8; 64],
+            vec!["https://test-mint.example".to_string()],
+            dir.clone(),
+        );
+        let (state, _portal) = test_state(&dir, Some(w));
+        payment_journal::append_entry(
+            &dir,
+            &undecided_entry("reg-retry-test", payment_journal::PaymentPhase::Intent),
+        )
+        .unwrap();
+
+        reconcile_payments_once(&state).await;
+
+        let guard = state.wallet.read().await;
+        let registered = guard.as_ref().unwrap().get_balance_by_mint().await.unwrap();
+        std::env::remove_var("TOLLGATE_TEST_CONFIG_DIR");
+        assert!(
+            registered.iter().any(|(m, _)| m == "https://test-mint.example"),
+            "reconciler must (re-)initialize the wallet for an undecided entry's persisted mint, got {registered:?}"
+        );
+    }
+
+    /// Codex P1 on #43 (thread 4141963821): a terminal-append failure
+    /// after the grant was applied must not be discarded — while the
+    /// append keeps failing, later passes retry ONLY the append; the
+    /// session (usage/expiry) is never reset and the gate is not
+    /// re-opened. Once the append lands, the entry terminalizes and the
+    /// pending tracking clears. The journal file is made read-only for
+    /// one pass (uid != 0) to inject exactly one append failure.
+    #[tokio::test]
+    async fn terminal_append_failure_retries_append_without_resetting_session() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let (state, portal) = test_state(&dir, None);
+        let entry = undecided_entry(
+            "append-retry-test",
+            payment_journal::PaymentPhase::TimeoutUnknown,
+        );
+        payment_journal::append_entry(&dir, &entry).unwrap();
+        let journal_file = dir.join(payment_journal::PAYMENT_JOURNAL_NAME);
+        let pending = std::sync::Mutex::new(std::collections::HashSet::new());
+
+        // Pass 1: the terminal append fails (journal read-only), after the
+        // session + gate were applied.
+        std::fs::set_permissions(&journal_file, std::fs::Permissions::from_mode(0o444)).unwrap();
+        apply_reconciled_grant(&state, &dir, &entry, 5, &pending).await;
+        assert!(pending.lock().unwrap().contains("append-retry-test"));
+        assert_eq!(*portal.grants.lock().unwrap(), 1);
+        {
+            let mut sessions = state.sessions.lock().await;
+            assert!(sessions.get_session("aa:bb:cc:dd:ee:ff").is_some());
+            sessions.update_usage("aa:bb:cc:dd:ee:ff", 400);
+        }
+
+        // Pass 2: the append heals — ONLY the append re-runs.
+        std::fs::set_permissions(&journal_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        apply_reconciled_grant(&state, &dir, &entry, 5, &pending).await;
+        {
+            let sessions = state.sessions.lock().await;
+            assert_eq!(
+                sessions.get_session("aa:bb:cc:dd:ee:ff").unwrap().used,
+                400,
+                "a terminal-append retry must not recreate (reset) the session"
+            );
+        }
+        assert_eq!(
+            *portal.grants.lock().unwrap(),
+            1,
+            "the gate is not re-opened on an append-only retry"
+        );
+        assert!(pending.lock().unwrap().is_empty());
+        let journal = payment_journal::read_journal(&dir);
+        let folded = payment_journal::fold_last(&journal);
+        assert!(matches!(
+            folded["append-retry-test"].phase,
+            payment_journal::PaymentPhase::ReconcileSpent { .. }
+        ));
+    }
 }

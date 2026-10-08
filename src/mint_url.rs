@@ -120,4 +120,49 @@ mod tests {
     fn no_scheme_lowercases_whole() {
         assert_eq!(canonicalize_mint_url("Mint.Example"), "mint.example");
     }
+
+    /// Codex P2 on #55 (r4186082594) claimed `http://[::1]` canonicalizes
+    /// to `http://[:::1]`. It does not: rsplit_once's reassembly always
+    /// reconstructs the authority and the `]` keeps the default-port drop
+    /// from firing on address components. These tests pin that invariant
+    /// (IPv6 authorities stable, canonicalization idempotent) so a future
+    /// rewrite cannot silently regress it.
+    #[test]
+    fn ipv6_authorities_stay_stable() {
+        assert_eq!(canonicalize_mint_url("http://[::1]"), "http://[::1]");
+        assert_eq!(
+            canonicalize_mint_url("http://[::1]:8338/"),
+            "http://[::1]:8338"
+        );
+        assert_eq!(
+            canonicalize_mint_url("HTTP://[2001:DB8::1]"),
+            "http://[2001:db8::1]"
+        );
+        assert_eq!(
+            canonicalize_mint_url("http://[2001:db8::1]:3338/path/"),
+            "http://[2001:db8::1]:3338/path"
+        );
+        // An explicit default port on a bracketed host drops like any
+        // default port, leaving the address untouched.
+        assert_eq!(canonicalize_mint_url("http://[::1]:80"), "http://[::1]");
+    }
+
+    #[test]
+    fn canonicalization_is_idempotent() {
+        for url in [
+            "HTTP://Mint.Example/",
+            "http://10.99.99.2:8383/",
+            "http://[::1]",
+            "http://[::1]:8338",
+            "http://[2001:db8::1]:3338/path/",
+            "https://mint.example:443/custom/",
+        ] {
+            let once = canonicalize_mint_url(url);
+            assert_eq!(
+                once,
+                canonicalize_mint_url(&once),
+                "canonical form of {url} must be a fixed point"
+            );
+        }
+    }
 }

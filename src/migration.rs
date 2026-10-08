@@ -657,10 +657,35 @@ impl FirstBootMigration {
                 .unwrap_or_default()
                 .as_secs(),
         );
-        let mut f = File::create(&self.marker).map_err(MigrationError::Io)?;
-        f.write_all(marker_body.as_bytes())
-            .map_err(MigrationError::Io)?;
-        f.sync_all().map_err(MigrationError::Io)?;
+        // Atomic marker write (Codex P1 on #29): an in-place
+        // `File::create` truncates the marker before the new body is
+        // durable, so a crash mid-write leaves an empty file — which
+        // `marker_is_complete` honors as the operator's manual `touch`
+        // and the migration is skipped forever. Write the body to a tmp
+        // file, fsync, rename, then fsync the directory: a crash leaves
+        // either the previous marker or the new complete one, never a
+        // torn empty one.
+        let marker_tmp = self.marker.with_extension("tmp");
+        {
+            let mut f = File::create(&marker_tmp).map_err(MigrationError::Io)?;
+            f.write_all(marker_body.as_bytes())
+                .map_err(MigrationError::Io)?;
+            f.sync_all().map_err(MigrationError::Io)?;
+        }
+        std::fs::rename(&marker_tmp, &self.marker).map_err(MigrationError::Io)?;
+        // Best-effort (unlike the wallet-identity write): the marker is
+        // atomically in place and the journal converges a lost rename on
+        // the next re-run, so a dir-sync failure after the rename is
+        // logged, not fatal.
+        if let Some(parent) = self.marker.parent() {
+            match std::fs::File::open(parent).and_then(|dir| dir.sync_all()) {
+                Ok(()) => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, "migration: marker dir fsync failed (marker is atomically in place)"
+                    );
+                }
+            }
+        }
 
         Ok(finish)
     }
@@ -732,6 +757,21 @@ pub fn summarize_state(db_dir: &Path) -> MigrationState {
             .lines()
             .find_map(|l| l.trim().strip_prefix("state="))
             .map(str::to_string);
+        // Codex P2 on #37: a legacy marker (no `state=` line) with
+        // `failed=N` describes an incomplete migration — startup's
+        // `marker_is_complete` retries it — but its failures predate the
+        // journal, so journal-only counts would report settled. Fold the
+        // marker's count in; it disappears once the converging re-run
+        // finishes and writes a `state=` marker.
+        if marker_state.is_none() {
+            if let Some(failed) = body
+                .lines()
+                .find_map(|l| l.trim().strip_prefix("failed="))
+                .and_then(|v| v.parse::<u64>().ok())
+            {
+                state.failed += failed;
+            }
+        }
         state.marker = Some(marker_state.unwrap_or_else(|| "legacy".into()));
     }
     for outcome in fold_last_outcomes(&read_journal(&m.journal)).into_values() {
@@ -968,6 +1008,42 @@ mod tests {
     }
 
     #[test]
+    fn finish_replaces_marker_atomically_never_in_place() {
+        // Codex P1 on #29: a crash between an in-place marker truncation
+        // and its body write leaves an empty marker, which
+        // `marker_is_complete` reads as the operator's manual `touch` —
+        // the migration is then skipped forever. Contract: the new body
+        // must be fully written + fsynced at a tmp path and only then
+        // renamed over the marker. A tmp path that cannot be created (a
+        // directory stands in for any pre-rename failure) proves the
+        // ordering: the existing marker survives the failed attempt.
+        let dir = tempfile::tempdir().unwrap();
+        let m = setup(dir.path(), &["cashuAtoken1"], &[]);
+        let prior = "state=partial\nfailed=1\n";
+        std::fs::write(&m.marker, prior).unwrap();
+        std::fs::create_dir(m.marker.with_extension("tmp")).unwrap();
+
+        let result = m.finish(MigrationSummary {
+            imported: 0,
+            failed: 1,
+            skipped_already_imported: 0,
+            pending: 0,
+            spent: 0,
+            spent_sat: 0,
+            partially_spent: 0,
+            partially_spent_unspent_sat: 0,
+            remainder_recovered_sat: 0,
+        });
+
+        assert!(result.is_err(), "an unwritable tmp must abort the finish");
+        assert_eq!(
+            std::fs::read_to_string(&m.marker).unwrap(),
+            prior,
+            "the existing marker must not be touched before its replacement is durable"
+        );
+    }
+
+    #[test]
     fn unsettled_pending_blocks_rename_and_completion() {
         let dir = tempfile::tempdir().unwrap();
         let m = setup(dir.path(), &["cashuAtoken1"], &[]);
@@ -1019,6 +1095,55 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let m = FirstBootMigration::new(dir.path());
         assert!(!m.should_run());
+    }
+
+    #[test]
+    fn legacy_marker_failure_counts_keep_state_unsettled() {
+        // Codex P2 on #37: the legacy format (`failed=N`, no `state=`)
+        // predates the journal — its failures must surface in the status
+        // surface, which otherwise reports `settled: true` while startup
+        // still treats the migration as incomplete and retries it.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(MARKER_NAME),
+            "imported=10\nfailed=2\ndate=1759000000\n",
+        )
+        .unwrap();
+
+        let state = summarize_state(dir.path());
+        assert_eq!(state.marker.as_deref(), Some("legacy"));
+        assert_eq!(state.failed, 2);
+        assert!(!state.is_settled());
+    }
+
+    #[test]
+    fn current_marker_failures_are_not_double_counted() {
+        // Journal-backed failures plus a CURRENT marker (has `state=`):
+        // the marker's counts are a snapshot of the same journal, so only
+        // the journal is counted.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(MARKER_NAME),
+            "state=partial\nfailed=1\npending=0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join(JOURNAL_NAME),
+            format!(
+                "{}\n",
+                serde_json::to_string(&JournalEntry {
+                    token: "t1".to_string(),
+                    outcome: TokenOutcome::Failed { reason: "x".into() },
+                })
+                .unwrap()
+            ),
+        )
+        .unwrap();
+
+        let state = summarize_state(dir.path());
+        assert_eq!(state.marker.as_deref(), Some("partial"));
+        assert_eq!(state.failed, 1);
+        assert!(!state.is_settled());
     }
 
     /// Fakes the mint side and records, at the moment `receive` runs,
