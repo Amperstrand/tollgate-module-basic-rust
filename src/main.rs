@@ -172,7 +172,15 @@ async fn apply_reconciled_grant(
         // (already_granted from the in-memory set is the same-boot
         // append-only retry: the gate is known open in THIS process.)
         if let Err(e) = state.portal.grant_access(&entry.mac).await {
-            tracing::warn!(mac = %entry.mac, error = %e, "gate open after payment reconcile failed");
+            // A failed gate (re-)open must NOT terminalize: the paid
+            // customer would stay blocked with recovery closed. Return
+            // undecided — the durable grant id makes the next pass safe
+            // (session preserved, only the gate retried). This is the
+            // reconcile-path half of the gate-pending family (#64) and
+            // the live path's own contract (gate failure → re-mark,
+            // never settle).
+            tracing::warn!(mac = %entry.mac, error = %e, "gate open after payment reconcile failed — staying undecided for retry");
+            return;
         }
         if grant_applied_durable {
             tracing::info!(
@@ -673,6 +681,16 @@ mod tests {
     /// Offline gate double: counts grant_access calls, never fails.
     struct FakePortal {
         grants: std::sync::Mutex<u32>,
+        grant_fails: std::sync::atomic::AtomicBool,
+    }
+
+    impl FakePortal {
+        fn counting() -> Self {
+            Self {
+                grants: std::sync::Mutex::new(0),
+                grant_fails: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
     }
 
     #[async_trait::async_trait]
@@ -681,6 +699,11 @@ mod tests {
             &self,
             _mac: &str,
         ) -> Result<(), tollgate_module_basic_rust::error::AppError> {
+            if self.grant_fails.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(tollgate_module_basic_rust::error::AppError::Internal(
+                    "injected gate failure".to_string(),
+                ));
+            }
             *self.grants.lock().unwrap() += 1;
             Ok(())
         }
@@ -705,9 +728,7 @@ mod tests {
         dir: &Path,
         wallet: Option<wallet::TollWallet>,
     ) -> (Arc<http::AppState>, Arc<FakePortal>) {
-        let portal = Arc::new(FakePortal {
-            grants: std::sync::Mutex::new(0),
-        });
+        let portal = Arc::new(FakePortal::counting());
         let identity =
             Arc::new(identity::MerchantIdentity::from_privkey_hex(&"01".repeat(32)).unwrap());
         let state = Arc::new(http::AppState {
@@ -944,5 +965,62 @@ mod tests {
         assert_eq!(*portal.grants.lock().unwrap(), 1);
         let sessions = state.sessions.lock().await;
         assert!(sessions.has_grant("aa:bb:cc:dd:ee:ff", "save-rollback-test"));
+    }
+    /// Codex P1 on #68 (round 4): a FAILED gate (re-)open must not
+    /// terminalize the payment — the paid customer would stay blocked
+    /// with recovery closed. The entry stays undecided; the next pass
+    /// preserves the durable session (grant id) and retries only the
+    /// gate, then terminalizes once it opens.
+    #[tokio::test]
+    async fn failed_gate_open_keeps_the_payment_reconcilable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let (state, portal) = test_state(&dir, None);
+        let entry = undecided_entry(
+            "gate-retry-test",
+            payment_journal::PaymentPhase::TimeoutUnknown,
+        );
+        payment_journal::append_entry(&dir, &entry).unwrap();
+        let pending = std::sync::Mutex::new(std::collections::HashSet::new());
+
+        // Pass 1: the gate is down — the grant must not terminalize.
+        portal
+            .grant_fails
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        apply_reconciled_grant(&state, &dir, &entry, 5, &pending).await;
+        {
+            let sessions = state.sessions.lock().await;
+            assert!(sessions.has_grant("aa:bb:cc:dd:ee:ff", "gate-retry-test"));
+        }
+        let journal = payment_journal::read_journal(&dir);
+        let folded = payment_journal::fold_last(&journal);
+        assert!(
+            !matches!(
+                folded["gate-retry-test"].phase,
+                payment_journal::PaymentPhase::ReconcileSpent { .. }
+            ),
+            "a failed gate must keep the payment undecided"
+        );
+
+        // Pass 2: the gate heals — session preserved, gate retried,
+        // terminal append lands.
+        portal
+            .grant_fails
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        apply_reconciled_grant(&state, &dir, &entry, 5, &pending).await;
+        assert_eq!(*portal.grants.lock().unwrap(), 1);
+        {
+            let sessions = state.sessions.lock().await;
+            assert!(
+                sessions.has_grant("aa:bb:cc:dd:ee:ff", "gate-retry-test"),
+                "the session survives the gate retry untouched"
+            );
+        }
+        let journal = payment_journal::read_journal(&dir);
+        let folded = payment_journal::fold_last(&journal);
+        assert!(matches!(
+            folded["gate-retry-test"].phase,
+            payment_journal::PaymentPhase::ReconcileSpent { .. }
+        ));
     }
 }
