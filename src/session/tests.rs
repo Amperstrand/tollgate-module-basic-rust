@@ -342,6 +342,7 @@ fn cleanup_expired_records_history_for_session_state() {
             metric: "milliseconds".into(),
             expiry: past,
             granted_at: past - 60,
+            applied_grants: std::collections::HashSet::new(),
             last_grant_id: None,
         },
     );
@@ -380,5 +381,100 @@ fn session_state_respects_history_ttl_without_later_expiry() {
         mgr.session_state("aa:bb:cc:00:00:bb"),
         SessionState::Expired,
         "entry inside the TTL still answers expired"
+    );
+}
+
+/// Codex P1 on #68 (r8): the monitor's usage-revocation path must retire
+/// grant ids like expiry cleanup does — the payment may still be
+/// undecided and its id must outlive the revoked session.
+#[test]
+fn revoke_session_retires_grant_ids() {
+    let mut mgr = SessionManager::new();
+    mgr.apply_grant_once("aa:bb:cc:00:00:99", 100, "bytes", 3600, "rev-1");
+    mgr.revoke_session("aa:bb:cc:00:00:99");
+    assert!(
+        mgr.has_grant("aa:bb:cc:00:00:99", "rev-1"),
+        "the grant id survives usage revocation"
+    );
+    assert!(mgr.get_session("aa:bb:cc:00:00:99").is_none());
+}
+
+/// Codex P2 on #68 (round 9): a FAILED durable write must leave the
+/// manager dirty so the monitor's flush_if_dirty retries it — a cleanup
+/// save failing after an earlier success used to stay clean, and a
+/// restart reloaded the stale file (grant ids resurrecting).
+#[test]
+fn failed_save_marks_dirty_for_retry() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let mut mgr = SessionManager::new();
+    mgr.create_session("aa:bb:cc:00:00:77", 10, "bytes", 3600);
+    mgr.save_now(dir.path()).unwrap(); // baseline success clears dirty
+
+    mgr.apply_grant_once("aa:bb:cc:00:00:78", 10, "bytes", 3600, "retry-1");
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+    let failed = mgr.save_now(dir.path());
+    assert!(
+        failed.is_err(),
+        "the save must fail against a read-only dir"
+    );
+
+    // Heal: the retry MUST fire (previously dirty stayed clear and
+    // flush_if_dirty no-oped — the grant never reached disk).
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    mgr.flush_if_dirty(dir.path()).unwrap();
+    let reloaded = SessionManager::load_from_disk(dir.path());
+    assert!(
+        reloaded.get_session("aa:bb:cc:00:00:78").is_some(),
+        "the dirty-retry must persist the failed save"
+    );
+}
+
+/// Codex P2 on #68 (round 11): a direct create_session overwrite must
+/// preserve the prior session's outstanding grant ids — the replay
+/// path's overwrite cannot discard an undecided payment's idempotency
+/// key.
+#[test]
+fn create_session_preserves_outstanding_grant_ids() {
+    let mut mgr = SessionManager::new();
+    mgr.apply_grant_once("aa:bb:cc:00:00:66", 100, "bytes", 3600, "keep-me");
+    // A direct overwrite (the replay-path shape): fresh session, but the
+    // outstanding id must survive.
+    mgr.create_session("aa:bb:cc:00:00:66", 50, "bytes", 60);
+    assert!(
+        mgr.has_grant("aa:bb:cc:00:00:66", "keep-me"),
+        "an outstanding grant id survives a session overwrite"
+    );
+}
+
+/// Codex P2 on #68 (round 11): while a tombstone is pending, unchanged
+/// saves must not rewrite the tombstone file (the monitor's debounced
+/// usage saves run every few seconds — one pending tombstone must not
+/// become a flash rewrite per tick).
+#[test]
+fn unchanged_tombstone_saves_skip_the_rewrite() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut mgr = SessionManager::new();
+    mgr.apply_grant_once("aa:bb:cc:00:00:55", 100, "bytes", 3600, "pending-1");
+    mgr.revoke_session("aa:bb:cc:00:00:55"); // retire -> tombstone pending
+    mgr.save_now(dir.path()).unwrap();
+
+    let path = dir.path().join("grant-tombstones.json");
+    let mtime = |p: &std::path::Path| {
+        std::fs::metadata(p)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    };
+    let first = mtime(&path);
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    mgr.save_now(dir.path()).unwrap(); // usage-save shape: nothing changed
+    assert_eq!(
+        mtime(&path),
+        first,
+        "an unchanged tombstone set must not be rewritten"
     );
 }
