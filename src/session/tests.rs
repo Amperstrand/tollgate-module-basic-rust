@@ -398,3 +398,34 @@ fn revoke_session_retires_grant_ids() {
     );
     assert!(mgr.get_session("aa:bb:cc:00:00:99").is_none());
 }
+
+/// Codex P2 on #68 (round 9): a FAILED durable write must leave the
+/// manager dirty so the monitor's flush_if_dirty retries it — a cleanup
+/// save failing after an earlier success used to stay clean, and a
+/// restart reloaded the stale file (grant ids resurrecting).
+#[test]
+fn failed_save_marks_dirty_for_retry() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let mut mgr = SessionManager::new();
+    mgr.create_session("aa:bb:cc:00:00:77", 10, "bytes", 3600);
+    mgr.save_now(dir.path()).unwrap(); // baseline success clears dirty
+
+    mgr.apply_grant_once("aa:bb:cc:00:00:78", 10, "bytes", 3600, "retry-1");
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+    let failed = mgr.save_now(dir.path());
+    assert!(
+        failed.is_err(),
+        "the save must fail against a read-only dir"
+    );
+
+    // Heal: the retry MUST fire (previously dirty stayed clear and
+    // flush_if_dirty no-oped — the grant never reached disk).
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    mgr.flush_if_dirty(dir.path()).unwrap();
+    let reloaded = SessionManager::load_from_disk(dir.path());
+    assert!(
+        reloaded.get_session("aa:bb:cc:00:00:78").is_some(),
+        "the dirty-retry must persist the failed save"
+    );
+}

@@ -456,7 +456,21 @@ impl SessionManager {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// A FAILED durable write must leave `dirty` set so the monitor's
+    /// `flush_if_dirty` retries it (Codex P2 on #68, round 9: a cleanup
+    /// save failing after a previous success left dirty clear — nothing
+    /// retried, and a restart reloaded the stale file).
     fn do_save(&self, dir: &Path) -> io::Result<()> {
+        match self.do_save_inner(dir) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.dirty.store(true, Ordering::Release);
+                Err(e)
+            }
+        }
+    }
+
+    fn do_save_inner(&self, dir: &Path) -> io::Result<()> {
         use std::io::Write;
 
         let now = std::time::SystemTime::now()
