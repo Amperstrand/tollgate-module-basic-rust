@@ -201,18 +201,6 @@ impl SessionManager {
         }
         true
     }
-
-    /// Forget a grant id whose session save FAILED: in-memory state must
-    /// not claim idempotency for a grant that is not durable — otherwise
-    /// later passes skip re-granting while nothing reached disk.
-    pub fn clear_grant(&mut self, mac: &str, grant_id: &str) {
-        if let Some(session) = self.sessions.get_mut(mac) {
-            if session.last_grant_id.as_deref() == Some(grant_id) {
-                session.last_grant_id = None;
-            }
-        }
-    }
-
     /// Restore a previously snapshotted session for `mac` (gate-open
     /// rollback), or remove the session when the snapshot says there was
     /// none.

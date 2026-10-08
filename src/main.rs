@@ -133,8 +133,15 @@ async fn apply_reconciled_grant(
     let allotment = steps * entry.step_size.max(1);
     let already_granted = granted_pending_terminal.lock().unwrap().contains(&entry.id);
     if !already_granted {
-        let applied_this_pass = {
+        let grant_applied_durable;
+        {
             let mut sessions = state.sessions.lock().await;
+            // Snapshot BEFORE granting: on a failed durable save the
+            // ENTIRE prior state is restored (Codex P1 on #68) — leaving
+            // the granted session in memory without its idempotency key
+            // would let the monitor's next usage-tick persist it keyless,
+            // and a restart would replenish it again.
+            let prior = sessions.snapshot_session(&entry.mac);
             // apply_grant_once (Codex P1 on #58, round 2): the grant id
             // is durable in sessions.json, so a restart between the
             // grant and the terminal append recognizes the applied
@@ -142,26 +149,32 @@ async fn apply_reconciled_grant(
             // expiry — repeated restarts replenished one token's
             // access). Boundary: multiple undecided payments for one MAC
             // need the durable multi-grant ledger (#63).
-            if !sessions.apply_grant_once(&entry.mac, allotment, &entry.metric, 3600, &entry.id) {
-                false
-            } else {
+            grant_applied_durable =
+                sessions.apply_grant_once(&entry.mac, allotment, &entry.metric, 3600, &entry.id);
+            if grant_applied_durable {
                 // save_now: durable before the terminal journal append may
                 // advance — debounced save returns Ok without writing (Codex
-                // P1 on #43). On failure the in-memory grant id is cleared
-                // (memory must not claim idempotency for an unsaved grant)
-                // and the entry stays undecided for the next pass.
+                // P1 on #43).
                 if let Err(e) = sessions.save_now(cfg_dir) {
-                    sessions.clear_grant(&entry.mac, &entry.id);
-                    tracing::error!(mac = %entry.mac, error = %e, "CRITICAL: reconciled session not durable — leaving payment undecided for retry");
+                    sessions.rollback_session(&entry.mac, prior);
+                    tracing::error!(mac = %entry.mac, error = %e, "CRITICAL: reconciled session not durable — rolled back, leaving payment undecided for retry");
                     return;
                 }
-                true
             }
-        };
-        if applied_this_pass {
-            if let Err(e) = state.portal.grant_access(&entry.mac).await {
-                tracing::warn!(mac = %entry.mac, error = %e, "gate open after payment reconcile failed");
-            }
+        }
+        // Gate handling differs by which side of a restart we are on:
+        // - fresh grant this pass → open the gate (normal path);
+        // - grant already durable (restart case) → the session must be
+        //   preserved untouched, but the captive-portal/nftables state
+        //   died with the old process and nothing re-opens it for
+        //   loaded sessions — re-open idempotently (Codex P1 on #68)
+        //   BEFORE the terminal append closes recovery.
+        // (already_granted from the in-memory set is the same-boot
+        // append-only retry: the gate is known open in THIS process.)
+        if let Err(e) = state.portal.grant_access(&entry.mac).await {
+            tracing::warn!(mac = %entry.mac, error = %e, "gate open after payment reconcile failed");
+        }
+        if grant_applied_durable {
             tracing::info!(
                 mac = %entry.mac,
                 allotment,
@@ -869,8 +882,10 @@ mod tests {
         }
         assert_eq!(
             *portal.grants.lock().unwrap(),
-            1,
-            "the gate is not re-opened after a restart for an already-applied grant"
+            2,
+            "the session is preserved but the gate is idempotently RE-OPENED \
+             after a restart (portal state died with the old process — \
+             Codex P1 on #68)"
         );
 
         // Heal: the append lands and terminalizes.
@@ -882,5 +897,52 @@ mod tests {
             folded["restart-replenish-test"].phase,
             payment_journal::PaymentPhase::ReconcileSpent { .. }
         ));
+    }
+    /// Codex P1 on #68: when the durable session save fails, the ENTIRE
+    /// prior state is restored — a granted session left in memory
+    /// without its idempotency key could be persisted keyless by the
+    /// monitor's next usage tick, and a restart would replenish it.
+    #[tokio::test]
+    async fn failed_session_save_rolls_the_grant_back_entirely() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let (state, portal) = test_state(&dir, None);
+        let entry = undecided_entry(
+            "save-rollback-test",
+            payment_journal::PaymentPhase::TimeoutUnknown,
+        );
+        payment_journal::append_entry(&dir, &entry).unwrap();
+        let pending = std::sync::Mutex::new(std::collections::HashSet::new());
+
+        // The config dir is read-only: the grant applies in memory, the
+        // durable save fails, the whole grant must roll back.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        apply_reconciled_grant(&state, &dir, &entry, 5, &pending).await;
+        {
+            let sessions = state.sessions.lock().await;
+            assert!(
+                sessions.get_session("aa:bb:cc:dd:ee:ff").is_none(),
+                "the granted session must not survive a failed durable save"
+            );
+        }
+        assert_eq!(*portal.grants.lock().unwrap(), 0);
+        assert!(pending.lock().unwrap().is_empty());
+        let journal = payment_journal::read_journal(&dir);
+        let folded = payment_journal::fold_last(&journal);
+        assert!(
+            !matches!(
+                folded["save-rollback-test"].phase,
+                payment_journal::PaymentPhase::ReconcileSpent { .. }
+            ),
+            "the entry must stay undecided while its grant is not durable"
+        );
+
+        // Heal: the next pass grants fresh and lands everything.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        apply_reconciled_grant(&state, &dir, &entry, 5, &pending).await;
+        assert_eq!(*portal.grants.lock().unwrap(), 1);
+        let sessions = state.sessions.lock().await;
+        assert!(sessions.has_grant("aa:bb:cc:dd:ee:ff", "save-rollback-test"));
     }
 }
