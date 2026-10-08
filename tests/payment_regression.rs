@@ -22,6 +22,7 @@ fn entry(_dir: &std::path::Path, id: &str, phase: PaymentPhase) -> PaymentEntry 
         step_size: 5000,
         metric: "milliseconds".into(),
         phase,
+        gate_opened: false,
     }
 }
 

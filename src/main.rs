@@ -218,6 +218,48 @@ async fn apply_reconciled_grant(
                 tracing::warn!(mac = %entry.mac, error = %e, "gate open after payment reconcile failed — staying undecided for retry");
                 return;
             }
+            if !entry.gate_opened {
+                // Durably record DELIVERY (Codex P1 on #68, round 15):
+                // if gate failures later outlive the session, the
+                // tombstone path must distinguish delivered-then-expired
+                // (terminalize) from UNDELIVERED credit (recreate).
+                let _ = payment_journal::append_entry(
+                    cfg_dir,
+                    &payment_journal::PaymentEntry {
+                        gate_opened: true,
+                        ..entry.clone()
+                    },
+                );
+            }
+        } else if !entry.gate_opened {
+            // Tombstone-only AND never delivered: the grant expired while
+            // the gate kept failing — recreate it (same contract as the
+            // Lightning path, round 14/15): fresh session carrying the id,
+            // durable, gate opened, and only then terminalize.
+            let mut sessions = state.sessions.lock().await;
+            sessions.forget_grants([&entry.id]);
+            let prior = sessions.snapshot_session(&entry.mac);
+            sessions.apply_grant_once(&entry.mac, allotment, &entry.metric, 3600, &entry.id);
+            match sessions.save_now(cfg_dir) {
+                Ok(()) => {}
+                Err(e) => {
+                    sessions.rollback_session(&entry.mac, prior);
+                    tracing::warn!(mac = %entry.mac, error = %e, "undelivered-grant recreation not durable; retrying next pass");
+                    return;
+                }
+            }
+            if let Err(e) = state.portal.grant_access(&entry.mac).await {
+                tracing::warn!(mac = %entry.mac, error = %e, "gate open for the recreated grant failed; retrying next pass");
+                return;
+            }
+            let _ = payment_journal::append_entry(
+                cfg_dir,
+                &payment_journal::PaymentEntry {
+                    gate_opened: true,
+                    ..entry.clone()
+                },
+            );
+            tracing::info!(mac = %entry.mac, "recreated an undelivered grant that expired during gate failures");
         }
         if grant_applied_durable {
             tracing::info!(
@@ -816,6 +858,7 @@ mod tests {
             step_size: 1000,
             metric: "bytes".to_string(),
             phase,
+            gate_opened: false,
         }
     }
 
@@ -1276,10 +1319,18 @@ mod tests {
             test_state_with_sessions(&dir, None, session::SessionManager::load_from_disk(&dir));
         let pending = std::sync::Mutex::new(std::collections::HashSet::new());
         apply_reconciled_grant(&state, &dir, &entry, 5, &pending).await;
+        // Delivery was never DURABLY proven (the gate-opened marker
+        // write failed with the read-only journal), so the recreation
+        // fires: gate opened WITH a fresh durable session — the paid
+        // outcome, not free access (round 15's contract).
         assert_eq!(
             *portal.grants.lock().unwrap(),
-            0,
-            "an expired loaded record must not reopen the gate"
+            1,
+            "unproven delivery recreates the grant (gate with a session)"
+        );
+        assert!(
+            state.sessions.lock().await.is_active("aa:bb:cc:dd:ee:ff"),
+            "the recreated grant is a live session"
         );
         let journal = payment_journal::read_journal(&dir);
         let folded = payment_journal::fold_last(&journal);
@@ -1346,5 +1397,61 @@ mod tests {
                 None => std::env::remove_var("TOLLGATE_TEST_CONFIG_DIR"),
             }
         }
+    }
+    /// Codex P1 on #68 (round 15), delivered half: when delivery IS
+    /// durably proven (gate_opened), a grant that expired during later
+    /// gate failures terminalizes WITHOUT recreating — the customer
+    /// already had their access.
+    #[tokio::test]
+    async fn delivered_grant_that_expired_terminalizes_without_recreation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let (state, _portal) = test_state(&dir, None);
+        let entry = undecided_entry(
+            "delivered-test",
+            payment_journal::PaymentPhase::TimeoutUnknown,
+        );
+        payment_journal::append_entry(&dir, &entry).unwrap();
+        let pending = std::sync::Mutex::new(std::collections::HashSet::new());
+
+        use std::os::unix::fs::PermissionsExt;
+        let journal_file = dir.join(payment_journal::PAYMENT_JOURNAL_NAME);
+        std::fs::set_permissions(&journal_file, std::fs::Permissions::from_mode(0o444)).unwrap();
+        apply_reconciled_grant(&state, &dir, &entry, 5, &pending).await;
+        std::fs::set_permissions(&journal_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        // The gate-opened marker could not persist (journal was
+        // read-only) — write it now, mirroring a pass where it did.
+        let mut delivered = entry.clone();
+        delivered.gate_opened = true;
+        payment_journal::append_entry(&dir, &delivered).unwrap();
+
+        {
+            let mut sessions = state.sessions.lock().await;
+            if let Some(s) = sessions.sessions.get_mut("aa:bb:cc:dd:ee:ff") {
+                s.expiry = 1;
+            }
+            sessions.save_now(&dir).unwrap();
+        }
+        let (state, portal) =
+            test_state_with_sessions(&dir, None, session::SessionManager::load_from_disk(&dir));
+        let pending = std::sync::Mutex::new(std::collections::HashSet::new());
+        // The reconciler passes the FOLDED entry (gate_opened=true) —
+        // mirror that here.
+        apply_reconciled_grant(&state, &dir, &delivered, 5, &pending).await;
+        assert_eq!(
+            *portal.grants.lock().unwrap(),
+            0,
+            "a DELIVERED grant that expired must not recreate or reopen"
+        );
+        assert!(
+            !state.sessions.lock().await.is_active("aa:bb:cc:dd:ee:ff"),
+            "no session is recreated for a delivered grant"
+        );
+        let journal = payment_journal::read_journal(&dir);
+        let folded = payment_journal::fold_last(&journal);
+        assert!(matches!(
+            folded["delivered-test"].phase,
+            payment_journal::PaymentPhase::ReconcileSpent { .. }
+        ));
     }
 }

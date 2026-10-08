@@ -244,6 +244,7 @@ async fn handle_wallet_fund(state: &AppState, token: &str) -> String {
             step_size: 1,
             metric: "cli".to_string(),
             phase: crate::payment_journal::PaymentPhase::Intent,
+            gate_opened: false,
         };
         if let Err(e) = crate::payment_journal::append_entry(&cfg_dir, &entry) {
             tracing::error!(error = %e, "CRITICAL: payment journal unavailable — refusing to move value with no recovery record");

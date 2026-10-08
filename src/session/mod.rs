@@ -574,10 +574,27 @@ impl SessionManager {
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         if tombs.is_empty() {
-            // An empty set needs no file; remove a stale one — once.
+            // An empty set needs no file; remove a stale one — ONCE and
+            // durably (Codex P2 on #68, round 15): a failed unlink must
+            // NOT mark the cache empty (this process would never retry,
+            // and the stale file accumulates settled ids), and a
+            // successful unlink must be dir-fsynced before the cache
+            // updates so power loss cannot resurrect it.
             if persisted.as_deref() != Some("") {
-                let _ = std::fs::remove_file(&path);
-                *persisted = Some(String::new());
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {
+                        if let Some(parent) = path.parent() {
+                            if let Ok(dir) = std::fs::File::open(parent) {
+                                let _ = dir.sync_all();
+                            }
+                        }
+                        *persisted = Some(String::new());
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        *persisted = Some(String::new());
+                    }
+                    Err(e) => return Err(e),
+                }
             }
             return Ok(());
         }
