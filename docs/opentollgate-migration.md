@@ -162,9 +162,12 @@ upstream PR #7 (draft, 61 files, pay/session/config/Cargo).
 
 **Wave 2 — wallet robustness:**
 
-- [ ] PR-7 keyset hygiene (#57). [ ] PR-8 NUT-13 backstop + restore (#37).
-  [ ] PR-9 P2PK/HTLC rejection + `MintUrl` canonicalization reconcile.
-  [ ] PR-10 notice taxonomy reconciliation vs Go corpus.
+- [x] P2PK/HTLC spending-condition rejection → **OpenTollGate#14** (parse-time refusal via cashu `token_secrets` + `SpendingConditions`; pinned by real cashuB wire-format fixtures; 198 tests).
+- [x] Hermetic test state-db (unplanned, incident-driven) → **OpenTollGate#15** — the CLI test harness derived its store from a hardcoded `/etc/tollgate/tollgate.db`, which opened/migrated the bench host's real state (see the ops#42 incident note); tests now derive it from the redirected config dir.
+- [ ] Keyset hygiene (#57 — mirrors open Go #417): expiry warnings + proactive same-mint rotation; boot + periodic sweep.
+- [ ] NUT-13 seed backstop + `wallet restore` (#37; independent of their NIP-06 identity work): BIP39 mnemonic beside the seed, crash-safe write ordering, mismatch refusal, restore loop per mint.
+- [ ] `MintUrl` canonicalization reconcile: adopt CDK's `MintUrl` at both compare + wallet-map sites (their `select.rs` lowercases inconsistently; our dot-segment gaps #59/#76).
+- [ ] Notice-taxonomy tail vs Go corpus (below-minimum/below-swap-fee/outcome-unknown landed with #8/#12; remaining: `mint-rate-limited` vs `payment-error-mint-unreachable` split, `payment-error-keyset-expired`).
 
 **Wave 3 — CLI + migration (owner decisions):**
 
