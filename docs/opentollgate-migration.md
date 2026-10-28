@@ -179,6 +179,12 @@ MIPS+ipk infra PRs, portal micro-fixes.
 
 **Sunset (per §7 template), after final parity gate.**
 
+## 5b. Gate result and landing (2026-10-28)
+
+**All eight PRs (#8–#15) MERGED to upstream main at 3550101** after the PRTA-first gate: full rust-basic suite (100 files) in the virtualized venue against integration build e40be61 (237/237 offline). Failure taxonomy: 22 failing tests, zero attributable to the PRs — 16× upstream's silent-`Config::default()`-on-load-failure defect (control-proven on main; new PR candidate: fail-closed config), 3× lightning-backoff gap, 1× framework test bug, 2× NUT-24 product gap, 2× CLI protocol gap. Full report: ops#42 comments; run log preserved at /tmp/opencode/reports/prta-run1.log.
+
+**PR-5 disposition (owner decision):** melt-loop port shelved — ecosystem norm is manual withdrawal; ecash-send distribution removes the LN-melt hazard class by construction. Next: withdrawal-intents port + distribution-design research issue.
+
 ## 6. Verification and testing plan
 
 Per-PR gates (device-free, tonight's bar): `cargo fmt --check` +
