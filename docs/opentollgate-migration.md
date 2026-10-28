@@ -145,41 +145,28 @@ solution stands, we drop ours) · **RECONCILE** (both have one; merge semantics)
 Per-PR card: scope · source (Amperstrand commits) · conflict surface with
 upstream PR #7 (draft, 61 files, pay/session/config/Cargo).
 
-**Wave 0 — tonight, device-free (this session starts it):**
+**Wave 0 — landed 2026-10-27/28:**
 
-- [ ] **PR-1 `fix(pay): validate and price before receive`** — move client-MAC
-  resolution + pricing + `purchase_min_steps` enforcement **before**
-  `wallet.receive()`; Go-parity `payment-error-below-minimum` rejection code;
-  stop returning 200 when session persist fails. Source: #20 (`014db67`) +
-  upstream-reported defects (§1/§2 of upstream inventory). Tests: upstream
-  `pay_body_test.rs` contract patterns + our precheck cases. Conflict: pay.rs
-  (also touched by #7 — small reorder, easy rebase).
-- [ ] Issue filed in `Amperstrand/ops` (this plan, condensed) + evidence
-  reports committed under `docs/migration-evidence/`.
+- [x] Plan committed + pushed (Amperstrand main `5f44731`; branch `audit/s13-codex-feedback` pushed as backup)
+- [x] Tracker: Amperstrand/ops#42
+- [x] **PR-1 → OpenTollGate#8** `fix(pay): validate and price before receive` — pre-receive price gate (Go-message parity), MAC before receive, no-200-on-persist-failure, below-swap-fee re-key. 201 tests (194→201).
+- [x] **keep.d → OpenTollGate#9** sysupgrade keeps `/etc/tollgate` (tollgate.db + per-mint wallet *.sqlite were dropped = silent balance loss).
+- [x] **PR-6 → OpenTollGate#10** rate limiting (Go wire parity: 429/Retry-After 6/default 10 rpm) + 2 MiB pre-buffer DefaultBodyLimit + 35 s TimeoutLayer→504. 201 tests (194→201).
+- [x] **PR-4 → OpenTollGate#11** durable ln-quotes: creation persists into the quotes table, GET rehydrates from store (restart no longer 404s a paid quote), durable issued-mark, boot value settlement of PAID quotes (single-mint; multi-mint needs schema work). 197 tests (194→197).
+- [x] **PR-3 → OpenTollGate#12** timeout = unknown outcome: detached in-session `recover_incomplete_sagas` on every op timeout arm + 504 `payment-outcome-unknown` mapping. 196 tests (194→196).
 
-**Wave 1 — fund-safety core (device-free + CI + conformance runner):**
+**Wave 1 — remaining (execution notes for the next session):**
 
-- [ ] **PR-2 `feat(pay): durable payment journal + idempotent replay + boot
-  reconcile`** — SQLite table in `tollgate.db` (follow ADR-0001; NOT JSONL);
-  intent before receive, terminal after; NUT-07 decides undecided entries at
-  boot (spent ⇒ grant, unspent ⇒ close, unreachable ⇒ retry); duplicate POST
-  of settled token re-grants. Source: #43 `87d7df9`, #44 `3837911`, #58 fixes,
-  **+#68 content** (decision: port into this PR rather than finishing review on
-  the dying repo). Conflict: pay.rs + session store (high — sequence after #7
-  or rebase).
-- [ ] **PR-3 `fix(wallet): reconcile sagas in-session after timeouts`** —
-  timeout-triggered `recover_incomplete_sagas` + `recover_before_op` preflight;
-  504 `payment-outcome-unknown`. Source: #39 `2dc87f5`, #42 `07bba55`.
-- [ ] **PR-4 `fix(ln): wire the durable quote store`** — switch `/ln-invoice`
-  onto the existing `quotes` table, boot-time settle of paid quotes, crash
-  window tests from #22/#25. Conflict: ln_invoice.rs (moderate).
-- [ ] **PR-5 `feat(payout): durable payout journal`** — `journalled_melt`
-  decision table; ambiguous melt never blocks maintainers. Source: #45
-  `5e8ebb1`. Scope note: profit-share *execution* doesn't exist upstream —
-  journal first, loop behind config (coordinate with #7).
-- [ ] **PR-6 `fix(http): rate limiting + pre-buffered body caps + global
-  timeout`** — `DefaultBodyLimit`, per-IP limiter, `TimeoutLayer`. Source: our
-  `rate_limiter.rs` (40 LOC) + audit SEC fixes.
+- [ ] **PR-2 payment journal + idempotent replay + boot reconcile** — the flagship. Design settled:
+  new table in `tollgate.db` (follow ADR-0001; `payments(id TEXT PK = sha256(token), token TEXT, mac TEXT, mint TEXT, amount_sat INTEGER, price_per_step INTEGER, phase TEXT)` with
+  phases `intent → received | timeout-unknown | rejected | reconcile-spent | reconcile-unspent | reconcile-zero-steps`);
+  intent row written BEFORE `wallet.receive()` (Amperstrand #43's crash-window table: intent-before-value-moves);
+  boot reconcile walks `intent`/`timeout-unknown` rows: NUT-07 spent ⇒ grant session + open gate (journaled `reconcile-spent` AFTER the session row is durable — compose with #8's sentinel semantics), unspent ⇒ close, unreachable ⇒ undecided/next boot;
+  duplicate POST of a settled token re-grants idempotently (lookup by token hash);
+  fold Amperstrand PR #68's durable grant-idempotency (per-payment grant ids, not the single-slot `last_grant_id` — see their issue #60) so a restart between grant and terminal-append cannot double-grant;
+  source material: Amperstrand `src/payment_journal.rs` (317 LOC + crash-window table) + `tests/payment_regression.rs` (7 cases) + main.rs reconcile fns; adapt JSONL→SQLite (their ADR-0001 stands).
+  Red-proofs: restart-mid-receive grants on boot; duplicate POST 200s with re-grant.
+- [ ] **PR-5 payout journal** — after PR-2 (same patterns): Amperstrand `src/payout_journal.rs` `journalled_melt` decision table (ambiguous+unresolved-saga ⇒ skip+surface; literal bolt11 never re-melted; ambiguous owner never blocks maintainers). Note upstream has no payout loop yet (#72-class decision: journal + loop behind config).
 
 **Wave 2 — wallet robustness:**
 
