@@ -157,16 +157,8 @@ upstream PR #7 (draft, 61 files, pay/session/config/Cargo).
 
 **Wave 1 — remaining (execution notes for the next session):**
 
-- [ ] **PR-2 payment journal + idempotent replay + boot reconcile** — the flagship. Design settled:
-  new table in `tollgate.db` (follow ADR-0001; `payments(id TEXT PK = sha256(token), token TEXT, mac TEXT, mint TEXT, amount_sat INTEGER, price_per_step INTEGER, phase TEXT)` with
-  phases `intent → received | timeout-unknown | rejected | reconcile-spent | reconcile-unspent | reconcile-zero-steps`);
-  intent row written BEFORE `wallet.receive()` (Amperstrand #43's crash-window table: intent-before-value-moves);
-  boot reconcile walks `intent`/`timeout-unknown` rows: NUT-07 spent ⇒ grant session + open gate (journaled `reconcile-spent` AFTER the session row is durable — compose with #8's sentinel semantics), unspent ⇒ close, unreachable ⇒ undecided/next boot;
-  duplicate POST of a settled token re-grants idempotently (lookup by token hash);
-  fold Amperstrand PR #68's durable grant-idempotency (per-payment grant ids, not the single-slot `last_grant_id` — see their issue #60) so a restart between grant and terminal-append cannot double-grant;
-  source material: Amperstrand `src/payment_journal.rs` (317 LOC + crash-window table) + `tests/payment_regression.rs` (7 cases) + main.rs reconcile fns; adapt JSONL→SQLite (their ADR-0001 stands).
-  Red-proofs: restart-mid-receive grants on boot; duplicate POST 200s with re-grant.
-- [ ] **PR-5 payout journal** — after PR-2 (same patterns): Amperstrand `src/payout_journal.rs` `journalled_melt` decision table (ambiguous+unresolved-saga ⇒ skip+surface; literal bolt11 never re-melted; ambiguous owner never blocks maintainers). Note upstream has no payout loop yet (#72-class decision: journal + loop behind config).
+- [x] **PR-2 → OpenTollGate#13** durable payment journal + boot reconciliation + idempotent replay — schema v2 with in-place v1→v2 migration; intent-before-receive with frozen pricing terms; NUT-07 boot reconcile (terminal only after the durable grant); settled-token replay to the original buyer's MAC; persist-failure rollback to intent. 214 tests (194→214). Deliberate follow-up: the per-payment durable grant-id ledger (our unmerged #68 / issue #60 — additive same-MAC grants) needs its own upstream schema discussion.
+- [ ] **PR-5 payout journal — OWNER DECISION before porting.** Upstream has no payout execution path at all (config parsed, no loop, no `send()` caller; their open PR #7 adds a different payment rail). Porting our `journalled_melt` decision table means introducing payout execution to a repo that deliberately lacks it — that is a product decision (their reviewers' call), not a mechanical port. Recommended framing when the owner returns: offer the journal + loop behind config as one PR, explicitly coordinated with PR #7's rail, or defer until #7 resolves. Source material if green-lit: Amperstrand `src/payout_journal.rs` (358 LOC, decision table unit-tested without network) + `tests/payout_regression.rs` (14 cases).
 
 **Wave 2 — wallet robustness:**
 
