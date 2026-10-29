@@ -199,6 +199,10 @@ Fork-side closure: **#68 MERGED** after a 17th Codex round (tombstone-survives-r
 
 Upstream: **#24** CDK-canonical mint-URL form at every key site (fork #76 closed) · **#25** additive reconciled grants + granted-awaiting-gate phase with gate-only retry (fork #63/#64 closed) · **#26** Go-parity receive-error taxonomy · **#27** wallet restore (NUT-13 spend side; live venue proof) · **#28** .ipk CI (opkg lane; 25.12+ apk-native boundary live-verified — SDK feed is that path). **PRTA#329 merged** (atomic config writes + is_rust family — framework canon). Regression gates: 8/8 payment core green on merged main at every checkpoint. Session total: **21 upstream PRs + PRTA#329 + fork #68.**
 
+## 5e. Audit-disposition sweep (2026-10-29, post-window)
+
+Upstream #29 (ndsctl serialization + monotonic usage) and upstream issue #30 (the one live finding: AppState wallet lock across network legs). The fork's issue tracker is now EMPTY — all 16 open issues dispositioned with per-close evidence (fixed-upstream / already-clean / owner-gated / not-portable). Sunset §7's remaining steps: banner + archive, owner-gated on the final parity review; the issue-migration step is moot (tracker emptied with references rather than migrated).
+
 ## 6. Verification and testing plan
 
 Per-PR gates (device-free, tonight's bar): `cargo fmt --check` +
