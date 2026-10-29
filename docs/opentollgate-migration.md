@@ -193,6 +193,12 @@ PRTA framework fixes filed: OpenTollGate/physical-router-test-automation#329 (at
 
 **PR-5 disposition (owner decision):** melt-loop port shelved — ecosystem norm is manual withdrawal; ecash-send distribution removes the LN-melt hazard class by construction. Next: withdrawal-intents port + distribution-design research issue.
 
+## 5d. Supervisor window 2026-10-29 (12:30–22:00 CET)
+
+Fork-side closure: **#68 MERGED** after a 17th Codex round (tombstone-survives-rollback, terminal ln-grant sweep, fsync propagation — all red-proven; the fork's last open review debt cleared).
+
+Upstream: **#24** CDK-canonical mint-URL form at every key site (fork #76 closed) · **#25** additive reconciled grants + granted-awaiting-gate phase with gate-only retry (fork #63/#64 closed) · **#26** Go-parity receive-error taxonomy · **#27** wallet restore (NUT-13 spend side; live venue proof) · **#28** .ipk CI (opkg lane; 25.12+ apk-native boundary live-verified — SDK feed is that path). **PRTA#329 merged** (atomic config writes + is_rust family — framework canon). Regression gates: 8/8 payment core green on merged main at every checkpoint. Session total: **21 upstream PRs + PRTA#329 + fork #68.**
+
 ## 6. Verification and testing plan
 
 Per-PR gates (device-free, tonight's bar): `cargo fmt --check` +
