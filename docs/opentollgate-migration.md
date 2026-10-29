@@ -179,6 +179,14 @@ MIPS+ipk infra PRs, portal micro-fixes.
 
 **Sunset (per §7 template), after final parity gate.**
 
+## 5c. Follow-on wave (2026-10-29, unattended stretch)
+
+All merged to upstream main (@291bf7b): #17 CLI test open-race serialization · #18 /balance no-session corpus zero-fields · #19 CLI test state fully env-independent (the host-migration mechanism eliminated for good) · #20 Go-nanosecond duration fields parse (restores the drop-in config promise; live-proven) · #21 withdrawal intents — wallet fund (cli-fund journal marker, reconciler owes no session) + wallet drain (store schema v3, bearer-token second copy, CDK send-saga double-send gate) · #22 keyset hygiene (held-keyset expiry warnings + retired-keyset rotation, boot+6h) · #23 NUT-13 seed backstop (24-word mnemonic, crash-safe ordering, mismatch/wrong-size hard refusal replacing silent regen).
+
+PRTA framework fixes filed: OpenTollGate/physical-router-test-automation#329 (atomic same-dir config writes + is_rust family fix) — open for review; the local branch carries them for venue runs.
+
+**Final gate on fully-merged main:** 8/8 payment-core files, zero failures, on the upgraded venue (OpenWrt 25.12.6 + cdk-mintd 0.18.2). The coinos class is extinct: module fail-closed (#16) + duration parse (#20) + framework atomic writes (#329).
+
 ## 5b. Gate result and landing (2026-10-28)
 
 **All eight PRs (#8–#15) MERGED to upstream main at 3550101** after the PRTA-first gate: full rust-basic suite (100 files) in the virtualized venue against integration build e40be61 (237/237 offline). Failure taxonomy: 22 failing tests, zero attributable to the PRs — 16× upstream's silent-`Config::default()`-on-load-failure defect (control-proven on main; new PR candidate: fail-closed config), 3× lightning-backoff gap, 1× framework test bug, 2× NUT-24 product gap, 2× CLI protocol gap. Full report: ops#42 comments; run log preserved at /tmp/opencode/reports/prta-run1.log.
