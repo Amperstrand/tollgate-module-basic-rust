@@ -282,6 +282,7 @@ async fn monitor_polls_signal_on_the_resolved_l3_device() {
 /// reconnect; netifd then binds a different l3_device, and a stale cache
 /// would poll a dead device forever.
 #[tokio::test]
+#[serial_test::serial]
 async fn monitor_re_resolves_device_after_sta_section_switch() {
     let tmp = tempfile::TempDir::new().unwrap();
     let bin = tmp.path().join("bin");
