@@ -447,6 +447,7 @@ pub async fn handle_pay(
         step_size: state.config.step_size,
         metric: state.config.metric.clone(),
         phase: payment_journal::PaymentPhase::Intent,
+        gate_opened: false,
     };
     if let Err(e) = payment_journal::append_entry(&cfg_dir, &intent) {
         tracing::error!(error = %e, "CRITICAL: could not persist payment intent; refusing to move value with no recovery record");

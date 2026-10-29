@@ -149,3 +149,21 @@ fn key_pair_check_rejects_garbage_keys() {
         Err(KeyPairError::Key(_))
     ));
 }
+
+const EC_P521_CERT: &str = include_str!("../../../tests/fixtures/ssl/ec-p521.crt");
+const EC_P521_KEY_PKCS8: &str = include_str!("../../../tests/fixtures/ssl/ec-p521.key");
+const EC_P521_KEY_SEC1: &str = include_str!("../../../tests/fixtures/ssl/ec-p521-sec1.key");
+
+/// Codex P2 on #58 (round 2): a P-521 point makes the SEC1 `[1]`
+/// publicKey wrapper exceed 127 content bytes, so its DER header is
+/// long-form (3+ bytes). The old fixed `raw[2..]` skip misparsed the
+/// valid key as lacking the embedded public point. Both the SEC1 and
+/// the PKCS#8 form (which wraps the same SEC1 structure) must pair.
+#[test]
+fn key_pair_check_accepts_p521_long_form_sec1_wrapper() {
+    let cert = der_of(EC_P521_CERT, "CERTIFICATE");
+    let sec1 = der_of(EC_P521_KEY_SEC1, "EC PRIVATE KEY");
+    let pkcs8 = der_of(EC_P521_KEY_PKCS8, "PRIVATE KEY");
+    private_key_matches_certificate(&cert, &sec1).expect("P-521 SEC1 pair must match");
+    private_key_matches_certificate(&cert, &pkcs8).expect("P-521 PKCS#8 pair must match");
+}

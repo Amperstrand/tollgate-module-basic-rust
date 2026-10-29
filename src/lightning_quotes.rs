@@ -118,6 +118,21 @@ impl QuoteStore {
             .collect()
     }
 
+    /// All fully-settled records (session granted) — the monitor's
+    /// grant-id sweep uses them: terminal quotes' `ln:<id>` grants must
+    /// be forgotten even after a crash between the settle marker and
+    /// the cleanup write (Codex P2 on #68, round 17 — ungranted()
+    /// excludes them, so nothing else retried the forget).
+    pub async fn settled(&self) -> Vec<LightningQuoteRecord> {
+        self.quotes
+            .read()
+            .await
+            .values()
+            .filter(|q| q.session_granted)
+            .cloned()
+            .collect()
+    }
+
     /// Drop expired/stale settled records; called by the monitor's janitor
     /// pass. Ungranted records are never dropped here — settlement owns
     /// their terminal transition.
@@ -346,14 +361,78 @@ pub async fn settle_quote(
         }
     }
 
+    // GRANT-level, not MAC-level (Codex P1 on #68, round 14): an active
+    // session from a SIBLING grant must not make this quote look
+    // delivered. The id answers from a tombstone (or nothing) exactly
+    // when this quote's allotment is NOT in the live session.
+    let grant_id = format!("ln:{}", record.quote);
+    if !sessions.lock().await.has_live_grant(&record.mac, &grant_id) {
+        if record.session_granted {
+            // Delivered, then consumed/expired: terminalize WITHOUT
+            // reopening the gate (an open gate with no session is
+            // indefinite free access — round 10).
+            let quote_id = record.quote.clone();
+            let mac = record.mac.clone();
+            record.session_granted = true;
+            if let Err(e) = store.upsert(record).await {
+                return SettleOutcome::Failed(format!("quote persist failed: {e}"));
+            }
+            let mut sm = sessions.lock().await;
+            sm.forget_grants([grant_id]);
+            if let Err(e) = sm.save_now(sessions_dir) {
+                tracing::warn!(error = %e, "session save after ln-grant cleanup failed; debounced save will retry");
+            }
+            tracing::info!(quote = %quote_id, mac = %mac, "lightning quote settled against an expired session — terminalized without reopening the gate");
+            return SettleOutcome::Granted { allotment };
+        }
+        // UNDELIVERED credit (round 12): the allotment was applied but
+        // the gate never opened and the session expired unused —
+        // terminalizing would eat the paid credit. Recreate the grant.
+        // A live SIBLING session is extended (additive paid credit); an
+        // expired leftover record is REPLACED, not extended (round 13).
+        // On an undurable save the whole recreation rolls back so the
+        // next pass retries it (round 14).
+        tracing::info!(quote = %record.quote, mac = %record.mac, "lightning quote undelivered — recreating the grant");
+        {
+            let mut sm = sessions.lock().await;
+            // The tombstone is deliberately NOT forgotten upfront: it
+            // survives a failed (rolled-back) recreation so the retry
+            // still recognizes the quote as applied (Codex P1 on #68,
+            // r17); the terminal forget clears it once durable.
+            let prior = sm.snapshot_session(&record.mac);
+            if sm.get_session(&record.mac).is_some() && !sm.is_active(&record.mac) {
+                sm.revoke_session(&record.mac);
+            }
+            sm.add_allotment(&record.mac, &metric, allotment, 3600, Some(&grant_id));
+            if let Err(e) = sm.save_now(sessions_dir) {
+                sm.rollback_session(&record.mac, prior);
+                tracing::warn!(error = %e, "session save after ln-grant recreation failed; rolled back, retrying next tick");
+                drop(sm);
+                return SettleOutcome::GrantFailed;
+            }
+        }
+    }
+
     if let Err(e) = portal.grant_access(&record.mac).await {
         tracing::warn!(mac = %record.mac, error = %e, "gate open failed for paid lightning quote; retrying next tick");
         return SettleOutcome::GrantFailed;
     }
 
     record.session_granted = true;
+    let grant_id = format!("ln:{}", record.quote);
     if let Err(e) = store.upsert(record).await {
         return SettleOutcome::Failed(format!("quote persist failed: {e}"));
+    }
+    // The settle marker is durable: the grant id's idempotency job is
+    // done — forget it (memory AND disk) so it cannot later resurrect
+    // as a permanent tombstone when the session is removed (Codex P2 on
+    // #68, r8).
+    {
+        let mut sm = sessions.lock().await;
+        sm.forget_grants([grant_id]);
+        if let Err(e) = sm.save_now(sessions_dir) {
+            tracing::warn!(error = %e, "session save after ln-grant cleanup failed; debounced save will retry");
+        }
     }
     SettleOutcome::Granted { allotment }
 }
@@ -367,6 +446,25 @@ pub async fn run_monitor(
     let mut ticker = tokio::time::interval(poll_interval);
     loop {
         ticker.tick().await;
+        // Grant-id sweep for TERMINAL quotes (round 17): a crash between
+        // the durable settle marker and the forget/save left the ln id
+        // behind — ungranted() excludes terminal records, so nothing
+        // retried. Change-tracked + conditional save: no-op when clean.
+        {
+            let settled = store.settled().await;
+            if !settled.is_empty() {
+                let ids = settled
+                    .iter()
+                    .map(|q| format!("ln:{}", q.quote))
+                    .collect::<Vec<_>>();
+                let mut sm = state.sessions.lock().await;
+                if sm.forget_grants(ids) {
+                    if let Err(e) = sm.save_now(&crate::config::config_dir()) {
+                        tracing::warn!(error = %e, "ln grant-id sweep save failed; next tick retries");
+                    }
+                }
+            }
+        }
         let records = store.ungranted().await;
         if records.is_empty() {
             store.sweep().await;

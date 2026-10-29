@@ -473,10 +473,14 @@ fn sec1_public_key(sec1_der: &[u8]) -> Result<KeyPublicMaterial<'_>, KeyPairErro
     let parts = children_raw(body);
     // Go's x509.ParseECPrivateKey requires the embedded public key; a key
     // without it cannot be paired against a certificate here either.
+    // The [1] context element's CONTENT is the BIT STRING TLV — parse it
+    // directly rather than skipping a fixed 2-byte header (long-form
+    // lengths on P-521 keys make the [1] header 3+ bytes; slicing
+    // raw[2..] would then misparse a valid key — Codex P2 on #58).
     let (_, bit_content, _) = parts
         .iter()
         .find(|(t, _, _)| *t == TAG_CONTEXT_1)
-        .and_then(|(_, _, raw)| read_tlv_raw(&raw[2..]))
+        .and_then(|(_, content, _)| read_tlv_raw(content))
         .filter(|(t, _, _)| *t == TAG_BIT_STRING)
         .ok_or_else(|| err("EC key carries no embedded public point"))?;
     bit_content

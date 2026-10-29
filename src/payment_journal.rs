@@ -91,6 +91,16 @@ pub struct PaymentEntry {
     pub step_size: u64,
     pub metric: String,
     pub phase: PaymentPhase,
+    /// Whether the captive-portal gate was ever successfully opened for
+    /// this payment (serde-defaulted: absent in older journal files =
+    /// false... unless the phase is terminal, which only append after a
+    /// successful gate open pre-dates this flag — those are delivered by
+    /// construction). Distinguishes DELIVERED-then-expired (terminalize,
+    /// no gate) from UNDELIVERED credit (recreate the grant) when a
+    /// reconciled grant's session expires while gate failures persist
+    /// (Codex P1 on #68, round 15).
+    #[serde(default)]
+    pub gate_opened: bool,
 }
 
 pub fn journal_path(dir: &Path) -> PathBuf {
