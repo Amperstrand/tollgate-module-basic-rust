@@ -478,3 +478,68 @@ fn unchanged_tombstone_saves_skip_the_rewrite() {
         "an unchanged tombstone set must not be rewritten"
     );
 }
+
+/// Codex P1 on #68, round 17: the tombstone must SURVIVE a failed
+/// (rolled-back) recreation. The pre-fix flow forgot the id upfront, so a
+/// save failure + rollback made the retry treat the payment as NEW and
+/// REPLACE the live sibling's session (losing its paid allotment). With
+/// the tombstone retained, the retry still sees has_grant => true and
+/// takes the additive recreation path.
+#[test]
+fn tombstone_survives_a_rolled_back_recreation() {
+    let mut mgr = crate::session::SessionManager::new();
+    // A live sibling session paid by another grant.
+    mgr.create_session("aa:bb:cc:dd:ee:10", 1000, "bytes", 3600);
+    // The undecided payment's id sits in the tombstone set (its session
+    // expired earlier; the reconciler is recreating it).
+    mgr.retire_grants_for_test("aa:bb:cc:dd:ee:10", &["pay-undelivered"]);
+    assert!(mgr.has_grant("aa:bb:cc:dd:ee:10", "pay-undelivered"));
+
+    // The recreation attempt: additive grant, then a failed save, then
+    // rollback (exactly the main.rs recreation path's failure arm).
+    let snapshot = mgr.snapshot_session("aa:bb:cc:dd:ee:10");
+    mgr.add_allotment(
+        "aa:bb:cc:dd:ee:10",
+        "bytes",
+        500,
+        3600,
+        Some("pay-undelivered"),
+    );
+    mgr.rollback_session("aa:bb:cc:dd:ee:10", snapshot);
+
+    // The contract: the id is still recognized as applied — the retry
+    // takes the tombstone (additive) path, never the new-payment path.
+    assert!(
+        mgr.has_grant("aa:bb:cc:dd:ee:10", "pay-undelivered"),
+        "the tombstone must survive the rollback so the retry stays on the additive path"
+    );
+}
+
+/// Codex P2 on #68, round 17 (fsync propagation): a failure to fsync the
+/// tombstone-file deletion must surface — silently accepting it would let
+/// power loss resurrect the deleted file while the cache says empty.
+#[test]
+fn tombstone_deletion_fsync_failure_propagates() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let mut mgr = crate::session::SessionManager::new();
+    // One tombstone + the persisted marker at non-empty so the removal path runs.
+    mgr.retire_grants_for_test("aa:bb:cc:dd:ee:20", &["ln:q1"]);
+    mgr.save_tombstones(dir.path()).unwrap(); // file exists now
+    mgr.forget_grants(["ln:q1"]); // set now empty; cache invalidated
+
+    // Break the parent directory so File::open(parent) fails.
+    let mut perms = std::fs::metadata(dir.path()).unwrap().permissions();
+    perms.set_mode(0o600); // owner loses +x => cannot open entries inside
+    std::fs::set_permissions(dir.path(), perms).unwrap();
+    let result = mgr.save_tombstones(dir.path());
+    // Restore first so tempdir cleanup works even on assertion failure.
+    let mut perms = std::fs::metadata(dir.path()).unwrap().permissions();
+    perms.set_mode(0o700);
+    std::fs::set_permissions(dir.path(), perms).unwrap();
+
+    assert!(
+        result.is_err(),
+        "the dir-fsync failure must propagate, not be swallowed: got {result:?}"
+    );
+}

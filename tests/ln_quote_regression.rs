@@ -736,3 +736,48 @@ async fn second_undelivered_quote_extends_the_recreated_sibling() {
         );
     }
 }
+
+/// Codex P2 on #68, round 17: the terminal sweep needs `settled()` to
+/// expose session_granted records — `ungranted()` excludes them, so a
+/// crash between the durable settle marker and the forget left the ln
+/// grant id behind forever (a permanent flash-rewritten tombstone).
+#[tokio::test]
+async fn settled_exposes_terminal_quotes_for_the_grant_sweep() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    let store = QuoteStore::load(tmp.path());
+    let granted = LightningQuoteRecord {
+        quote: "q-granted".to_string(),
+        mint_url: "https://m.example".to_string(),
+        mac: "aa:bb:cc:dd:ee:30".to_string(),
+        amount_sat: 5,
+        created_at: 1,
+        expiry: 1_800_000_000,
+        minted: true,
+        allotment: 5000,
+        metric: "bytes".to_string(),
+        allotment_added: true,
+        session_granted: true,
+    };
+    let open = LightningQuoteRecord {
+        quote: "q-open".to_string(),
+        mint_url: "https://m.example".to_string(),
+        mac: "aa:bb:cc:dd:ee:31".to_string(),
+        amount_sat: 5,
+        created_at: 1,
+        expiry: 1_800_000_000,
+        minted: false,
+        allotment: 0,
+        metric: "bytes".to_string(),
+        allotment_added: false,
+        session_granted: false,
+    };
+    store.upsert(granted).await.expect("seed granted");
+    store.upsert(open).await.expect("seed open");
+    let settled = store.settled().await;
+    let ids: Vec<&str> = settled.iter().map(|q| q.quote.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec!["q-granted"],
+        "only terminal records — the sweep must not touch open quotes"
+    );
+}

@@ -241,11 +241,15 @@ async fn apply_reconciled_grant(
             // Lightning path, round 14/15): fresh session carrying the id,
             // durable, gate opened, and only then terminalize.
             let mut sessions = state.sessions.lock().await;
-            sessions.forget_grants([&entry.id]);
             let prior = sessions.snapshot_session(&entry.mac);
             // add_allotment (not apply_grant_once): a live SIBLING session
             // is EXTENDED additively — replacing it would discard the
-            // sibling's paid allotment (the Lightning path's shape).
+            // sibling's paid allotment. The tombstone is deliberately NOT
+            // forgotten upfront: it survives a failed (rolled-back)
+            // recreation so the next pass still recognizes the payment
+            // as applied — an upfront forget made the retry path treat
+            // it as new and REPLACE the sibling (Codex P1 on #68, r17).
+            // The terminal forget below clears it once durable.
             sessions.add_allotment(&entry.mac, &entry.metric, allotment, 3600, Some(&entry.id));
             match sessions.save_now(cfg_dir) {
                 Ok(()) => {}

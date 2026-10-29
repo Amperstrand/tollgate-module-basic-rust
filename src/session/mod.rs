@@ -289,6 +289,23 @@ impl SessionManager {
         }
     }
 
+    /// Test seam for `retire_grants` (private because production callers
+    /// only retire through removal paths).
+    #[cfg(test)]
+    pub fn retire_grants_for_test(&mut self, mac: &str, ids: &[&str]) {
+        let session = CustomerSession {
+            mac: mac.to_string(),
+            allotment: 1,
+            used: 0,
+            metric: "bytes".to_string(),
+            expiry: 1,
+            granted_at: 1,
+            applied_grants: ids.iter().map(|s| s.to_string()).collect(),
+            last_grant_id: None,
+        };
+        self.retire_grants(&session);
+    }
+
     /// Drop every trace of ids whose journal entries have terminalized —
     /// tombstones AND the live sessions' `applied_grants` (Codex P2 on
     /// #68, round 7: a lingering id would resurrect as a permanent
@@ -605,9 +622,7 @@ impl SessionManager {
                 match std::fs::remove_file(&path) {
                     Ok(()) => {
                         if let Some(parent) = path.parent() {
-                            if let Ok(dir) = std::fs::File::open(parent) {
-                                let _ = dir.sync_all();
-                            }
+                            std::fs::File::open(parent)?.sync_all()?;
                         }
                         *persisted = Some(String::new());
                     }

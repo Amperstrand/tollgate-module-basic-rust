@@ -118,6 +118,21 @@ impl QuoteStore {
             .collect()
     }
 
+    /// All fully-settled records (session granted) — the monitor's
+    /// grant-id sweep uses them: terminal quotes' `ln:<id>` grants must
+    /// be forgotten even after a crash between the settle marker and
+    /// the cleanup write (Codex P2 on #68, round 17 — ungranted()
+    /// excludes them, so nothing else retried the forget).
+    pub async fn settled(&self) -> Vec<LightningQuoteRecord> {
+        self.quotes
+            .read()
+            .await
+            .values()
+            .filter(|q| q.session_granted)
+            .cloned()
+            .collect()
+    }
+
     /// Drop expired/stale settled records; called by the monitor's janitor
     /// pass. Ungranted records are never dropped here — settlement owns
     /// their terminal transition.
@@ -380,7 +395,10 @@ pub async fn settle_quote(
         tracing::info!(quote = %record.quote, mac = %record.mac, "lightning quote undelivered — recreating the grant");
         {
             let mut sm = sessions.lock().await;
-            sm.forget_grants([grant_id.clone()]);
+            // The tombstone is deliberately NOT forgotten upfront: it
+            // survives a failed (rolled-back) recreation so the retry
+            // still recognizes the quote as applied (Codex P1 on #68,
+            // r17); the terminal forget clears it once durable.
             let prior = sm.snapshot_session(&record.mac);
             if sm.get_session(&record.mac).is_some() && !sm.is_active(&record.mac) {
                 sm.revoke_session(&record.mac);
@@ -428,6 +446,25 @@ pub async fn run_monitor(
     let mut ticker = tokio::time::interval(poll_interval);
     loop {
         ticker.tick().await;
+        // Grant-id sweep for TERMINAL quotes (round 17): a crash between
+        // the durable settle marker and the forget/save left the ln id
+        // behind — ungranted() excludes terminal records, so nothing
+        // retried. Change-tracked + conditional save: no-op when clean.
+        {
+            let settled = store.settled().await;
+            if !settled.is_empty() {
+                let ids = settled
+                    .iter()
+                    .map(|q| format!("ln:{}", q.quote))
+                    .collect::<Vec<_>>();
+                let mut sm = state.sessions.lock().await;
+                if sm.forget_grants(ids) {
+                    if let Err(e) = sm.save_now(&crate::config::config_dir()) {
+                        tracing::warn!(error = %e, "ln grant-id sweep save failed; next tick retries");
+                    }
+                }
+            }
+        }
         let records = store.ungranted().await;
         if records.is_empty() {
             store.sweep().await;
