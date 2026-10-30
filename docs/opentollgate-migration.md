@@ -203,6 +203,10 @@ Upstream: **#24** CDK-canonical mint-URL form at every key site (fork #76 closed
 
 Upstream #29 (ndsctl serialization + monotonic usage) and upstream issue #30 (the one live finding: AppState wallet lock across network legs). The fork's issue tracker is now EMPTY — all 16 open issues dispositioned with per-close evidence (fixed-upstream / already-clean / owner-gated / not-portable). Sunset §7's remaining steps: banner + archive, owner-gated on the final parity review; the issue-migration step is moot (tracker emptied with references rather than migrated).
 
+## 5f. Five-hour window (2026-10-29 evening)
+
+[#31] ln quote monitor + exponential backoff/jitter (background settlement — no more stranded paid invoices) · [#32] Go CLI JSON-envelope socket compat (mint_health class extinct). Spilman #7 reviewed (posted): real pre-merge blocker = the rail's session-store v2 migration targets the wrong base (main is at v3 — needs a v4 renumber); B downgraded, C confirmed fixed. Upstream issue #30 detailed with fix sketch. Hardware answer: x1860-1/2 (mipsel/mt7621) are the cutover drill seats. Final gate 8/8 green incl. both parity-tail files. **Session grand total: 24 upstream PRs + PRTA#329 + fork #68.**
+
 ## 6. Verification and testing plan
 
 Per-PR gates (device-free, tonight's bar): `cargo fmt --check` +
