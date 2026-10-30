@@ -211,6 +211,10 @@ Upstream #29 (ndsctl serialization + monotonic usage) and upstream issue #30 (th
 
 [#33] wallet lock granularity: AppState.wallet holds Option<Arc<TollWallet>>; all four background passes with network legs clone-and-release before talking to the mint. One hung mint no longer blocks every payment handler. Upstream tracker now at ZERO open issues. **Session grand total: 25 upstream PRs + PRTA#329 + fork #68.**
 
+## 5h. Grand final gate + hardware accessibility (2026-10-30)
+
+12/12 payment-core files GREEN on fully-merged main 732dc0c (all 25 PRs) — the most comprehensive virtualized run of the session. x1860-1/2 documented as unreachable from ai-legion (bench AP network down); nr7101 still dark. The cutover decision's one remaining input is hardware evidence, blocked on device accessibility.
+
 ## 6. Verification and testing plan
 
 Per-PR gates (device-free, tonight's bar): `cargo fmt --check` +
