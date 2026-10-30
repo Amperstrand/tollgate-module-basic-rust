@@ -207,6 +207,10 @@ Upstream #29 (ndsctl serialization + monotonic usage) and upstream issue #30 (th
 
 [#31] ln quote monitor + exponential backoff/jitter (background settlement — no more stranded paid invoices) · [#32] Go CLI JSON-envelope socket compat (mint_health class extinct). Spilman #7 reviewed (posted): real pre-merge blocker = the rail's session-store v2 migration targets the wrong base (main is at v3 — needs a v4 renumber); B downgraded, C confirmed fixed. Upstream issue #30 detailed with fix sketch. Hardware answer: x1860-1/2 (mipsel/mt7621) are the cutover drill seats. Final gate 8/8 green incl. both parity-tail files. **Session grand total: 24 upstream PRs + PRTA#329 + fork #68.**
 
+## 5g. Issue #30 implementation (2026-10-30)
+
+[#33] wallet lock granularity: AppState.wallet holds Option<Arc<TollWallet>>; all four background passes with network legs clone-and-release before talking to the mint. One hung mint no longer blocks every payment handler. Upstream tracker now at ZERO open issues. **Session grand total: 25 upstream PRs + PRTA#329 + fork #68.**
+
 ## 6. Verification and testing plan
 
 Per-PR gates (device-free, tonight's bar): `cargo fmt --check` +
