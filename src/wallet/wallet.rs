@@ -1702,7 +1702,7 @@ mod tests {
             "fixture must be a legacy spelling"
         );
 
-        let mut wallet = make_test_wallet(tmp.path(), vec![legacy_spelling.to_string()]);
+        let wallet = make_test_wallet(tmp.path(), vec![legacy_spelling.to_string()]);
 
         let sanitized = |u: &str| -> String {
             u.chars()
