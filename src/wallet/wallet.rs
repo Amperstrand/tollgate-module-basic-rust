@@ -203,6 +203,11 @@ impl TollWallet {
             return Ok(());
         }
 
+        // #78: bring any legacy-spelled DB to the canonical name before
+        // the open — otherwise the open creates a fresh empty DB and the
+        // legacy proofs are orphaned.
+        self.migrate_legacy_db_files(&normalized).await;
+
         let db_path = self.db_path_for_mint(&normalized);
         if let Some(parent) = db_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
@@ -235,6 +240,49 @@ impl TollWallet {
         self.wallets
             .insert(normalized.to_string(), Arc::new(Mutex::new(wallet)));
         Ok(())
+    }
+
+    /// #78: migrate legacy-spelled proof DBs to the canonical filename.
+    ///
+    /// Prior releases derived the DB filename from the RAW accepted-mint
+    /// spelling; canonicalization moved the filename without moving the
+    /// file, orphaning funds for mints whose operator spelling differs
+    /// from the canonical form (case, default port, trailing slash).
+    /// Before opening the canonical DB, probe every accepted-mint raw
+    /// spelling (plus the requested URL itself): if only the legacy file
+    /// exists, rename it to the canonical path. Never clobbers an
+    /// existing canonical DB; a no-op when nothing to migrate.
+    pub(crate) async fn migrate_legacy_db_files(&self, canonical: &str) {
+        let canonical_path = self.db_path_for_mint(canonical);
+        if canonical_path.exists() {
+            return; // nothing to do — canonical already present (no clobber)
+        }
+        let mut candidates: Vec<String> = self.accepted_mints.clone();
+        candidates.push(canonical.to_string());
+        for raw in candidates {
+            if crate::mint_url::mint_urls_equal(&raw, canonical) {
+                let legacy = self.db_path_for_mint(&raw);
+                if legacy.exists() && legacy != canonical_path {
+                    match tokio::fs::rename(&legacy, &canonical_path).await {
+                        Ok(()) => {
+                            tracing::info!(
+                                from = %legacy.display(),
+                                to = %canonical_path.display(),
+                                "migrated legacy-spelled proofs DB to canonical filename"
+                            );
+                            return;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                from = %legacy.display(),
+                                error = %e,
+                                "legacy DB migration failed — continuing with fresh open"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn db_path_for_mint(&self, mint_url: &str) -> PathBuf {
@@ -1638,6 +1686,68 @@ mod tests {
 
     fn spent_all(ys: &[cdk::nuts::PublicKey]) -> std::collections::HashSet<cdk::nuts::PublicKey> {
         ys.iter().copied().collect()
+    }
+
+    /// #78: a proofs DB stored under a legacy (non-canonical) spelling
+    /// must be migrated to the canonical filename before open —
+    /// canonicalization without migration orphans the proofs (invisible
+    /// funds). Unit-tests the migration seam directly.
+    #[tokio::test]
+    async fn legacy_spelled_db_migrates_to_canonical_path() {
+        let tmp = TempDir::new().unwrap();
+        let legacy_spelling = "HTTPS://Mint.Example:443";
+        let canonical = crate::mint_url::canonicalize_mint_url(legacy_spelling);
+        assert_ne!(
+            legacy_spelling, canonical,
+            "fixture must be a legacy spelling"
+        );
+
+        let mut wallet = make_test_wallet(tmp.path(), vec![legacy_spelling.to_string()]);
+
+        let sanitized = |u: &str| -> String {
+            u.chars()
+                .map(|c| {
+                    if c.is_alphanumeric() || c == '.' || c == '-' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect()
+        };
+        let legacy_path = tmp
+            .path()
+            .join(format!("{}.sqlite", sanitized(legacy_spelling)));
+        std::fs::write(&legacy_path, b"legacy-proofs").unwrap();
+
+        wallet.migrate_legacy_db_files(&canonical).await;
+
+        let canonical_path = tmp.path().join(format!("{}.sqlite", sanitized(&canonical)));
+        assert!(!legacy_path.exists(), "legacy file must be renamed away");
+        assert!(
+            canonical_path.exists(),
+            "canonical DB must exist after migration"
+        );
+        assert_eq!(
+            std::fs::read(&canonical_path).unwrap(),
+            b"legacy-proofs",
+            "migrated bytes must be the legacy DB's"
+        );
+
+        // Idempotence + no-clobber: an existing canonical DB is never
+        // overwritten by a legacy leftover.
+        std::fs::write(&legacy_path, b"stale-leftover").unwrap();
+        std::fs::write(&canonical_path, b"current-proofs").unwrap();
+        wallet.migrate_legacy_db_files(&canonical).await;
+        assert_eq!(
+            std::fs::read(&canonical_path).unwrap(),
+            b"current-proofs",
+            "existing canonical DB must not be clobbered"
+        );
+        assert!(
+            legacy_path.exists(),
+            "when canonical exists, leftover is left in place"
+        );
     }
 
     fn make_test_wallet(dir: &Path, accepted_mints: Vec<String>) -> TollWallet {
