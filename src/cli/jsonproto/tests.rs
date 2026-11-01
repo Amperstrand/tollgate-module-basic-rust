@@ -299,12 +299,52 @@ async fn config_save_validates_required_fields_and_persists() {
     .to_string();
     let resp = dispatch_line(&line, &state).await;
     assert_eq!(resp["success"], false);
-    assert!(resp["error"]
-        .as_str()
-        .unwrap()
-        .contains("Invalid profit_share"));
+    assert!(resp["error"].as_str().unwrap().contains("Invalid config"));
 
     std::env::remove_var("TOLLGATE_TEST_CONFIG_DIR");
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn config_save_rejects_full_validation_failures() {
+    // #79: config save must run the FULL Config::validate(), not only
+    // profit_share — an invalid metric (not bytes/milliseconds) with a
+    // VALID profit_share must be refused before persisting.
+    let dir = tempfile::TempDir::new().unwrap();
+    std::env::set_var("TOLLGATE_TEST_CONFIG_DIR", dir.path());
+    let state = make_test_state();
+
+    let mut bad_metric =
+        serde_json::from_str::<serde_json::Value>(&minimal_valid_config_json()).unwrap();
+    bad_metric["metric"] = serde_json::json!("furlongs");
+    let line = serde_json::json!({
+        "command": "config",
+        "args": ["save", bad_metric.to_string()],
+    })
+    .to_string();
+    let resp = dispatch_line(&line, &state).await;
+    assert_eq!(
+        resp["success"], false,
+        "invalid metric must be rejected: {resp}"
+    );
+
+    let mut zero_step =
+        serde_json::from_str::<serde_json::Value>(&minimal_valid_config_json()).unwrap();
+    zero_step["step_size"] = serde_json::json!(0);
+    let line = serde_json::json!({
+        "command": "config",
+        "args": ["save", zero_step.to_string()],
+    })
+    .to_string();
+    let resp = dispatch_line(&line, &state).await;
+    assert_eq!(
+        resp["success"], false,
+        "zero step_size must be rejected: {resp}"
+    );
+    assert!(
+        crate::config::load_config().unwrap().is_none(),
+        "nothing may be persisted by a rejected save"
+    );
 }
 
 #[tokio::test]

@@ -540,8 +540,12 @@ async fn handle_config_save(json_str: &str) -> CliResponse {
         Ok(c) => c,
         Err(e) => return CliResponse::error(format!("Invalid JSON: {e}")),
     };
-    if let Err(e) = config.validate_profit_share() {
-        return CliResponse::error(format!("Invalid profit_share: {e}"));
+    // #79: run the FULL validation, not only profit_share — validate()
+    // also rejects invalid metrics, zero step sizes, empty mint lists,
+    // malformed mint URLs, invalid price units and out-of-range margins,
+    // any of which would otherwise persist and break the next boot/load.
+    if let Err(errors) = config.validate() {
+        return CliResponse::error(format!("Invalid config: {}", errors.join("; ")));
     }
     if let Err(e) = crate::config::save_config(&config) {
         return CliResponse::error(format!("Failed to save config: {e}"));
