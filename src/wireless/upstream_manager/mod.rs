@@ -150,10 +150,7 @@ impl UpstreamManager {
     }
 
     fn should_scan(&self) -> bool {
-        if self.consecutive_failures >= self.config.max_consecutive_failures {
-            return false;
-        }
-        true
+        self.consecutive_failures < self.config.max_consecutive_failures
     }
 
     fn switch_cooldown_elapsed(&self) -> bool {
