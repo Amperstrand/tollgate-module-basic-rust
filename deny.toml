@@ -25,3 +25,26 @@ ignore = [
     # remote. Revisit when cdk / cdk-sqlite moves to rusqlite >= 0.41.
     "RUSTSEC-2026-0459",
 ]
+
+# License gate (tollgate-s3-rs #14 precedent): standard permissive core
+# + the specialty entries the cdk/rust-bitcoin chain needs. Copyleft is
+# NOT allowed wholesale — any new copyleft dependency hard-fails here.
+[licenses]
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "0BSD",
+    "Zlib",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "MITNFA",
+    "CDLA-Permissive-2.0",
+    "BlueOak-1.0.0",
+]
+confidence-threshold = 0.8
