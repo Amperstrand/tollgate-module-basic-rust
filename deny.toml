@@ -1,0 +1,50 @@
+# cargo-deny configuration — advisory lane bring-up (ops session
+# amperstrand-ops#49, tollgate-s3-rs #14 precedent).
+#
+# Policy: unmaintained crates are handled via explicit dated ignore
+# entries below (NOT `unmaintained = "none"`): we want each
+# unmaintained dependency visible with a reason and revisit condition.
+
+[advisories]
+ignore = [
+    # (2026-11-17) lane bring-up (ops#49, tollgate-s3-rs #14 precedent):
+    # chrono unmaintained (RUSTSEC-2026-0543): upstream archived; no
+    # maintained 0.4.x drop-in. Revisit if time ships a fork adopted
+    # by the ecosystem.
+    "RUSTSEC-2026-0543",
+    # (2026-11-17) lane bring-up: paste unmaintained
+    # (RUSTSEC-2024-0436): pulled in by cdk-common 0.18.x. No safe
+    # upgrade; pastey fork swap is upstream cdk's call. Revisit when
+    # cdk drops paste or adopts pastey.
+    "RUSTSEC-2024-0436",
+    # (2026-11-17) lane bring-up: libsqlite3-sys 0.28.0 bundles
+    # SQLite < 3.54.0 (RUSTSEC-2026-0459, CVE-2026-119375 WAL
+    # uninitialized-memory read). Fix requires libsqlite3-sys 0.39 /
+    # rusqlite 0.41 — a MAJOR bump reachable only through cdk-sqlite
+    # 0.18.x. Exposure is local-file (crafted db + sibling -wal), not
+    # remote. Revisit when cdk / cdk-sqlite moves to rusqlite >= 0.41.
+    "RUSTSEC-2026-0459",
+]
+
+# License gate (tollgate-s3-rs #14 precedent): standard permissive core
+# + the specialty entries the cdk/rust-bitcoin chain needs. Copyleft is
+# NOT allowed wholesale — any new copyleft dependency hard-fails here.
+[licenses]
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "0BSD",
+    "Zlib",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "MITNFA",
+    "CDLA-Permissive-2.0",
+    "BlueOak-1.0.0",
+]
+confidence-threshold = 0.8
